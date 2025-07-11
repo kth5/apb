@@ -1,6 +1,6 @@
 # APB - Arch Package Builder
 
-APB is a distributed Arch Linux package building system that provides automated, multi-architecture package compilation across multiple build servers. It consists of three main components that work together to efficiently build and distribute Arch Linux packages.
+APB is a distributed Arch Linux package building system that provides automated, multi-architecture package compilation across multiple build servers. It consists of three main components that work together to efficiently build and distribute building pacman packages.
 
 ## What is APB?
 
@@ -14,7 +14,7 @@ APB (Arch Package Builder) is designed to solve the challenges of building Arch 
 - **Resource Management**: Intelligent load balancing and concurrent build limiting
 
 APB is particularly useful for:
-- Arch Linux package maintainers building for multiple architectures
+- package maintainers building pacman packages for multiple architectures
 - Organizations maintaining private package repositories
 - Developers needing consistent, isolated build environments
 - Projects requiring automated CI/CD package building
@@ -337,4 +337,4 @@ For development or testing, see `requirements.txt` for the complete dependency l
    python3 apb.py /path/to/package/
    ```
 
-For more detailed information, see the documentation in the `doc/` directory. 
+For more detailed information, see the documentation in the `doc/` directory.
