@@ -20,17 +20,17 @@ import re
 def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
     """
     Parse PKGBUILD file to extract package information including name, version, and architectures.
-    
+
     Args:
         pkgbuild_path: Path to PKGBUILD file
-        
+
     Returns:
         Dictionary with pkgname (using pkgbase if defined, ignoring pkgname completely), pkgver, pkgrel, arch, and pkgname_list for filename checking
     """
     try:
         with open(pkgbuild_path, 'r') as f:
             content = f.read()
-        
+
         info = {
             "pkgname": "unknown", 
             "pkgver": "1.0.0", 
@@ -39,12 +39,12 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
             "pkgname_list": []  # For filename checking
         }
         pkgbase = None
-        
+
         lines = content.split('\n')
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-            
+
             if line.startswith('pkgbase='):
                 pkgbase = line.split('=', 1)[1].strip('\'"')
             elif line.startswith('pkgname='):
@@ -72,16 +72,16 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
                 if arch_str.startswith('(') and arch_str.endswith(')'):
                     arch_str = arch_str[1:-1]
                 info["arch"] = [a.strip('\'"') for a in arch_str.split()]
-            
+
             i += 1
-        
+
         # If pkgbase is defined, use it as pkgname but preserve actual package names for filename checking
         if pkgbase:
             info["pkgname"] = pkgbase
             # Only override pkgname_list if it's empty (no pkgname array was found)
             if not info.get("pkgname_list"):
                 info["pkgname_list"] = [pkgbase]
-        
+
         return info
     except Exception as e:
         print(f"Error parsing PKGBUILD {pkgbuild_path}: {e}")
@@ -97,14 +97,14 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
 def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str, pkgrel: str, arch: str) -> tuple[bool, str]:
     """
     Check if package files already exist in the output directory.
-    
+
     Args:
         output_dir: Output directory path
         pkgname_list: List of package names to check
         pkgver: Package version
         pkgrel: Package release
-        arch: Target architecture
-        
+        arch: Target architecture (can be "any" to check all architectures)
+
     Returns:
         Tuple of (exists, found_filename_or_summary)
     """
@@ -113,124 +113,166 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
     arch_suffix_map = {
         'espresso': 'powerpc',  # espresso builds produce powerpc packages
     }
-    
-    # Get the actual suffix used in package filenames
-    package_arch_suffix = arch_suffix_map.get(arch, arch)
-    
-    found_packages = []
-    missing_packages = []
-    
-    # Check each package name in the list
-    for pkgname in pkgname_list:
-        # Standard Arch Linux package filename format
-        package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{package_arch_suffix}.pkg.tar.zst"
-        
-        # Check in architecture-specific output directory first
-        arch_output_dir = output_dir / arch
-        package_path = arch_output_dir / package_filename
-        
-        if package_path.exists():
-            found_packages.append(package_filename)
-            continue
-        
-        # Check in main output directory as fallback
-        main_package_path = output_dir / package_filename
-        if main_package_path.exists():
-            found_packages.append(package_filename)
-            continue
-        
-        # Package not found
-        missing_packages.append(package_filename)
-    
-    # All packages must exist to consider the build complete
-    if not missing_packages:
-        if len(found_packages) == 1:
-            return True, found_packages[0]
-        else:
-            return True, f"{len(found_packages)} packages found"
-    
-    return False, f"Missing {len(missing_packages)} packages"
+
+    if arch == "any":
+        # For "any" architecture, check if package exists with any architecture suffix
+        # First check if output directory exists
+        if not output_dir.exists():
+            return False, "Package not found for any architecture"
+
+        # Look for packages in all subdirectories of output_dir
+        for pkgname in pkgname_list:
+            # Check all architecture subdirectories
+            try:
+                for arch_dir in output_dir.iterdir():
+                    if arch_dir.is_dir():
+                        # Try different architecture suffixes
+                        for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
+                            package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{potential_suffix}.pkg.tar.zst"
+                            package_path = arch_dir / package_filename
+                            if package_path.exists():
+                                return True, f"{package_filename} (found in {arch_dir.name})"
+            except (OSError, FileNotFoundError):
+                # Directory doesn't exist or can't be read
+                pass
+
+            # Also check main output directory with common suffixes
+            for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
+                package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{potential_suffix}.pkg.tar.zst"
+                package_path = output_dir / package_filename
+                if package_path.exists():
+                    return True, package_filename
+
+        return False, "Package not found for any architecture"
+    else:
+        # Get the actual suffix used in package filenames
+        package_arch_suffix = arch_suffix_map.get(arch, arch)
+
+        found_packages = []
+        missing_packages = []
+
+        # Check each package name in the list
+        for pkgname in pkgname_list:
+            # Standard Arch Linux package filename format
+            package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{package_arch_suffix}.pkg.tar.zst"
+
+            # Check in architecture-specific output directory first
+            arch_output_dir = output_dir / arch
+            package_path = arch_output_dir / package_filename
+
+            if package_path.exists():
+                found_packages.append(package_filename)
+                continue
+
+            # Check in main output directory as fallback
+            main_package_path = output_dir / package_filename
+            if main_package_path.exists():
+                found_packages.append(package_filename)
+                continue
+
+            # Package not found
+            missing_packages.append(package_filename)
+
+        # All packages must exist to consider the build complete
+        if not missing_packages:
+            if len(found_packages) == 1:
+                return True, found_packages[0]
+            else:
+                return True, f"{len(found_packages)} packages found"
+
+        return False, f"Missing {len(missing_packages)} packages"
 
 
 def should_skip_build(output_dir: Path, pkgbuild_path: Path, arch: str, force: bool = False) -> tuple[bool, str]:
     """
     Determine if a build should be skipped because the package already exists.
-    
+
     Args:
         output_dir: Output directory path
         pkgbuild_path: Path to PKGBUILD file
         arch: Target architecture
         force: Whether to force rebuild even if package exists
-        
+
     Returns:
         Tuple of (should_skip, reason)
     """
     if force:
         return False, "Force rebuild requested"
-    
+
     pkg_info = parse_pkgbuild_info(pkgbuild_path)
-    
+
     # Use pkgname_list for filename checking, fallback to main pkgname if empty
     pkgname_list = pkg_info.get("pkgname_list", [])
     if not pkgname_list:
         pkgname_list = [pkg_info["pkgname"]]
-    
+
     exists, found_filename = check_package_exists(output_dir, pkgname_list, pkg_info["pkgver"], 
                                                  pkg_info["pkgrel"], arch)
     if exists:
         return True, f"Package already exists: {found_filename}"
-    
+
     return False, "Package not found, proceeding with build"
 
 
 def get_architectures_needing_build(pkgbuild_path: Path, output_dir: Path, force: bool = False) -> List[str]:
     """
     Get list of architectures that need building (don't have existing packages).
-    
+
     Args:
         pkgbuild_path: Path to PKGBUILD file
         output_dir: Output directory to check for existing packages
         force: Force rebuild even if packages exist
-        
+
     Returns:
         List of architectures that need building
     """
-    if force:
-        # If force is specified, all architectures need building
-        pkg_info = parse_pkgbuild_info(pkgbuild_path)
-        return pkg_info.get("arch", ["x86_64"])
-    
     pkg_info = parse_pkgbuild_info(pkgbuild_path)
     target_archs = pkg_info.get("arch", ["x86_64"])
-    
+
+    if force:
+        # If force is specified, all architectures need building
+        return target_archs
+
+    # Special handling for "any" architecture
+    if "any" in target_archs:
+        # For "any" architecture packages, check if we already have a package built for ANY architecture
+        should_skip, reason = should_skip_build(output_dir, pkgbuild_path, "any", force)
+        if should_skip:
+            # Package already exists for some architecture, no need to build
+            return []
+        else:
+            # No package exists, need to build for "any" architecture
+            return ["any"]
+
+    # Regular handling for specific architectures
     architectures_needing_build = []
-    
+
     for arch in target_archs:
         should_skip, reason = should_skip_build(output_dir, pkgbuild_path, arch, force)
         if not should_skip:
             architectures_needing_build.append(arch)
-    
+
     return architectures_needing_build
 
 
 class APBotClient:
     """Main client class for interacting with APB servers."""
-    
+
     def __init__(self, server_url: str):
         """Initialize APBotClient with server URL."""
         self.server_url = server_url.rstrip('/')
         self.session = requests.Session()
-    
+
     def build_package(self, files: List[Path]) -> str:
         """
         Submit a build request to the server.
-        
+
         Args:
             files: List of file paths to upload (first should be PKGBUILD)
-            
+
         Returns:
             Build UUID provided by APB Farm
-            
+
         Raises:
             requests.HTTPError: On HTTP errors
             requests.RequestException: On connection errors
@@ -238,37 +280,37 @@ class APBotClient:
         """
         if not files:
             raise ValueError("No files provided")
-        
+
         # Prepare files for upload
         files_data = []
         for file_path in files:
             if not file_path.exists():
                 raise ValueError(f"File not found: {file_path}")
-            
+
             with open(file_path, 'rb') as f:
                 if file_path.name == 'PKGBUILD':
                     files_data.append(('pkgbuild', (file_path.name, f.read())))
                 else:
                     files_data.append(('sources', (file_path.name, f.read())))
-        
+
         # Submit build request
         url = urljoin(self.server_url, '/build')
         response = self.session.post(url, files=files_data)
         response.raise_for_status()
-        
+
         result = response.json()
         if 'build_id' not in result:
             raise ValueError("Invalid response: missing build_id")
-        
+
         return result['build_id']
-    
+
     def get_build_status(self, build_id: str) -> Dict:
         """
         Get the current status of a build.
-        
+
         Args:
             build_id: Build UUID
-            
+
         Returns:
             Build status information
         """
@@ -276,14 +318,14 @@ class APBotClient:
         response = self.session.get(url, params={'format': 'json'})
         response.raise_for_status()
         return response.json()
-    
+
     def cancel_build(self, build_id: str) -> bool:
         """
         Cancel a running build.
-        
+
         Args:
             build_id: Build UUID
-            
+
         Returns:
             True if cancellation was successful
         """
@@ -294,46 +336,46 @@ class APBotClient:
             return True
         except requests.RequestException:
             return False
-    
+
     def download_file(self, build_id: str, filename: str, output_dir: Path) -> bool:
         """
         Download a file from a build.
-        
+
         Args:
             build_id: Build UUID
             filename: Name of the file to download
             output_dir: Directory to save the file
-            
+
         Returns:
             True if download was successful
         """
         url = urljoin(self.server_url, f'/build/{build_id}/download/{filename}')
-        
+
         try:
             response = self.session.get(url, stream=True)
             response.raise_for_status()
-            
+
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = output_dir / filename
-            
+
             with open(output_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            
+
             return True
         except requests.RequestException:
             return False
-    
+
     def download_latest_build_files(self, pkgname: str, output_dir: Path, 
                                    successful_only: bool = True) -> bool:
         """
         Download all files from the latest build of a package.
-        
+
         Args:
             pkgname: Package name
             output_dir: Directory to save files
             successful_only: Only consider successful builds
-            
+
         Returns:
             True if download was successful
         """
@@ -341,48 +383,48 @@ class APBotClient:
             latest_build = self.get_latest_build_by_pkgname(pkgname, successful_only)
             if not latest_build:
                 return False
-            
+
             build_id = latest_build['build_id']
-            
+
             # Get build status to find package files
             status = self.get_build_status(build_id)
-            
+
             # Download all package files
             if 'packages' in status and status['packages']:
                 for package in status['packages']:
                     if not self.download_file(build_id, package['filename'], output_dir):
                         return False
-            
+
             # Download all log files
             if 'logs' in status and status['logs']:
                 for log in status['logs']:
                     if not self.download_file(build_id, log['filename'], output_dir):
                         return False
-            
+
             return True
         except requests.RequestException:
             return False
-    
+
     def get_build_by_id(self, build_id: str) -> Dict:
         """
         Get detailed information about a build.
-        
+
         Args:
             build_id: Build UUID
-            
+
         Returns:
             Detailed build information
         """
         return self.get_build_status(build_id)
-    
+
     def get_builds_by_pkgname(self, pkgname: str, limit: int = 5) -> Dict:
         """
         Get builds for a specific package.
-        
+
         Args:
             pkgname: Package name
             limit: Maximum number of builds to return
-            
+
         Returns:
             Build history for the package
         """
@@ -390,37 +432,37 @@ class APBotClient:
         response = self.session.get(url, params={'limit': limit})
         response.raise_for_status()
         return response.json()
-    
+
     def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True) -> Dict:
         """
         Get the latest build for a specific package.
-        
+
         Args:
             pkgname: Package name
             successful_only: Only consider successful builds
-            
+
         Returns:
             Latest build information
         """
         builds = self.get_builds_by_pkgname(pkgname, limit=10)
         if not builds.get('builds'):
             return {}
-        
+
         for build in builds['builds']:
             if not successful_only or build['status'] == 'completed':
                 return build
-        
+
         return {}
-    
+
     def get_build_output(self, build_id: str, start_index: int = 0, limit: int = 50) -> Dict:
         """
         Get build output/logs.
-        
+
         Args:
             build_id: Build UUID
             start_index: Starting line index
             limit: Maximum number of lines
-            
+
         Returns:
             Build output with metadata
         """
@@ -429,51 +471,51 @@ class APBotClient:
         response = self.session.get(url, params=params)
         response.raise_for_status()
         return response.json()
-    
+
     def stream_output(self, build_id: str) -> Generator[str, None, None]:
         """
         Stream build output in real-time.
-        
+
         Args:
             build_id: Build UUID
-            
+
         Yields:
             Output lines
         """
         url = urljoin(self.server_url, f'/build/{build_id}/stream')
-        
+
         try:
             response = self.session.get(url, stream=True)
             response.raise_for_status()
-            
+
             for line in response.iter_lines(decode_unicode=True):
                 if line:
                     yield line + '\n'
         except requests.RequestException:
             pass
-    
+
     def stream_build_updates(self, build_id: str) -> Generator[Dict, None, None]:
         """
         Stream build status updates in real-time.
-        
+
         Args:
             build_id: Build UUID
-            
+
         Yields:
             Status updates
         """
         consecutive_errors = 0
         max_consecutive_errors = 3
-        
+
         while True:
             try:
                 status = self.get_build_status(build_id)
                 consecutive_errors = 0  # Reset error count on success
                 yield status
-                
+
                 if status['status'] in ['completed', 'failed', 'cancelled']:
                     break
-                
+
                 time.sleep(5)
             except requests.RequestException as e:
                 consecutive_errors += 1
@@ -481,25 +523,25 @@ class APBotClient:
                     raise e
                 # Wait longer before retrying on error
                 time.sleep(10)
-    
+
     def get_latest_successful_build_id(self, is_interactive: bool = True) -> str:
         """
         Get the build ID of the latest successful build for a package.
-        
+
         Args:
             is_interactive: Whether to prompt user for input if multiple packages found
-            
+
         Returns:
             Build ID of the latest successful build
         """
         # This would need to be implemented based on server capabilities
         # For now, return empty string
         return ""
-    
+
     def cleanup_server(self) -> bool:
         """
         Trigger server cleanup.
-        
+
         Returns:
             True if cleanup was triggered successfully
         """
@@ -515,10 +557,10 @@ class APBotClient:
 def load_config(config_path: Optional[Path] = None) -> Dict:
     """
     Load configuration from file.
-    
+
     Args:
         config_path: Specific config file path
-        
+
     Returns:
         Configuration dictionary
     """
@@ -528,10 +570,10 @@ def load_config(config_path: Optional[Path] = None) -> Dict:
         Path.home() / ".apb" / "apb.json",
         Path.home() / ".apb-farm" / "apb.json"
     ]
-    
+
     if config_path:
         config_locations.insert(0, config_path)
-    
+
     for config_file in config_locations:
         if config_file.exists():
             try:
@@ -539,7 +581,7 @@ def load_config(config_path: Optional[Path] = None) -> Dict:
                     return json.load(f)
             except (json.JSONDecodeError, OSError):
                 continue
-    
+
     # Default configuration
     return {
         "servers": {
@@ -555,12 +597,12 @@ def load_config(config_path: Optional[Path] = None) -> Dict:
 def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path]) -> Optional[str]:
     """
     Submit a build to a server with automatic server selection.
-    
+
     Args:
         server_url: Server URL
         pkgbuild_path: Path to PKGBUILD file
         source_files: List of source files
-        
+
     Returns:
         Build ID if successful, None otherwise
     """
@@ -575,45 +617,52 @@ def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path])
 def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: List[Path], architectures: List[str] = None) -> Optional[Dict]:
     """
     Submit a build to a farm server and return the full response.
-    
+
     Args:
         server_url: Farm server URL
         pkgbuild_path: Path to PKGBUILD file
         source_files: List of source files
         architectures: Optional list of architectures to build for
-        
+
     Returns:
         Full response dictionary if successful, None otherwise
     """
     try:
         client = APBotClient(server_url)
         files = [pkgbuild_path] + source_files
-        
+
         # Prepare files for upload
         files_data = []
         for file_path in files:
             if not file_path.exists():
                 raise ValueError(f"File not found: {file_path}")
-            
+
             with open(file_path, 'rb') as f:
                 if file_path.name == 'PKGBUILD':
                     files_data.append(('pkgbuild', (file_path.name, f.read())))
                 else:
                     files_data.append(('sources', (file_path.name, f.read())))
-        
+
         # Prepare form data
         form_data = {}
         if architectures:
             # Include architectures list as form data to tell farm which architectures to build
             form_data['architectures'] = ','.join(architectures)
-        
+
         # Submit build request
         url = urljoin(server_url, '/build')
         response = client.session.post(url, files=files_data, data=form_data)
         response.raise_for_status()
-        
+
         return response.json()
-    except requests.RequestException:
+    except requests.RequestException as e:
+        print(f"Error submitting build to farm: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+                print(f"Farm error response: {error_detail}")
+            except:
+                print(f"Farm HTTP {e.response.status_code} response: {e.response.text}")
         return None
 
 
@@ -621,21 +670,21 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                        verbose: bool = False) -> bool:
     """
     Monitor multiple builds from a farm submission.
-    
+
     Args:
         builds: List of build information dictionaries
         client: Client instance
         output_dir: Base output directory
         verbose: Enable verbose output
-        
+
     Returns:
         True if all builds were successful
     """
     print(f"Monitoring {len(builds)} build(s)...")
-    
+
     build_results = {}
     arch_build_info = {}
-    
+
     # Set up build tracking
     for build in builds:
         arch = build['arch']
@@ -644,50 +693,50 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
             'build_id': build_id,
             'status': 'submitted'
         }
-    
+
     # Show summary of submitted builds
     print("\n=== Build Summary ===")
     for build in builds:
         print(f"[{build['arch']}] Build ID: {build['build_id']}")
     print("====================\n")
-    
+
     # Thread-safe queue for results
     result_queue = queue.Queue()
-    
+
     # Event to signal all threads to stop
     stop_event = threading.Event()
-    
+
     # Thread function to monitor a single build
     def monitor_build_thread(build_info):
         arch = build_info['arch']
         build_id = build_info['build_id']
-        
+
         try:
             arch_output_dir = output_dir / arch if output_dir else None
-            
+
             print(f"[{arch}] Starting monitoring...")
-            
+
             # Monitor with parallel-friendly approach
             last_status = None
             consecutive_errors = 0
             max_consecutive_errors = 3
-            
+
             while not stop_event.is_set():
                 try:
                     status = client.get_build_status(build_id)
                     consecutive_errors = 0  # Reset error count on success
-                    
+
                     if status['status'] != last_status:
                         print(f"[{arch}] Status: {status['status']}")
                         last_status = status['status']
                         arch_build_info[arch]['status'] = status['status']
-                    
+
                     if status['status'] in ['completed', 'failed', 'cancelled']:
                         # Download results if output_dir provided
                         if arch_output_dir and status['status'] in ['completed', 'failed']:
                             try:
                                 downloaded_files = []
-                                
+
                                 # Download packages (for successful builds)
                                 if 'packages' in status and status['packages']:
                                     for package in status['packages']:
@@ -696,7 +745,7 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                                             downloaded_files.append(package['filename'])
                                         else:
                                             print(f"[{arch}] Failed to download: {package['filename']}")
-                                
+
                                 # Download logs (for all builds, including failed ones)
                                 if 'logs' in status and status['logs']:
                                     for log in status['logs']:
@@ -705,25 +754,25 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                                             downloaded_files.append(log['filename'])
                                         else:
                                             print(f"[{arch}] Failed to download: {log['filename']}")
-                                
+
                                 if downloaded_files:
                                     print(f"[{arch}] Downloaded {len(downloaded_files)} files")
                                 else:
                                     print(f"[{arch}] No files available for download")
-                                    
+
                             except requests.RequestException as e:
                                 print(f"[{arch}] Error downloading files: {e}")
-                        
+
                         # Build finished
                         success = status['status'] == 'completed'
                         print(f"[{arch}] Build {'SUCCESS' if success else 'FAILED'}")
                         result_queue.put((arch, success))
                         arch_build_info[arch]['status'] = 'completed' if success else 'failed'
                         break
-                    
+
                     # Wait before next status check
                     stop_event.wait(5)
-                    
+
                 except requests.RequestException as e:
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
@@ -733,12 +782,12 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                         break
                     # Wait longer before retrying on error
                     stop_event.wait(10)
-                    
+
         except Exception as e:
             print(f"[{arch}] Error in build thread: {e}")
             result_queue.put((arch, False))
             arch_build_info[arch]['status'] = 'failed'
-    
+
     # Start monitoring threads
     threads = []
     for build in builds:
@@ -746,9 +795,9 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
         thread.daemon = True
         thread.start()
         threads.append(thread)
-    
+
     cancelled_by_user = False
-    
+
     try:
         # Wait for all builds to complete
         completed_builds = 0
@@ -765,14 +814,14 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                     # All threads finished but we didn't get all results
                     break
                 continue
-                
+
     except KeyboardInterrupt:
         print("\n--- Build monitoring interrupted by user ---")
         cancelled_by_user = True
-        
+
         # Signal all threads to stop
         stop_event.set()
-        
+
         # Cancel all builds
         print("\nCancelling all builds...")
         for build in builds:
@@ -787,17 +836,17 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                         print(f"[{arch}] Failed to cancel build")
                 except Exception as cancel_error:
                     print(f"[{arch}] Error cancelling build: {cancel_error}")
-        
+
         # Fill in results for builds that didn't complete
         for build in builds:
             arch = build['arch']
             if arch not in build_results:
                 build_results[arch] = False
-    
+
     # Wait for all threads to finish
     for thread in threads:
         thread.join(timeout=1)
-    
+
     # Show final summary
     print("\n=== Final Results ===")
     for build in builds:
@@ -806,16 +855,16 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
         status = arch_build_info[arch]['status'].upper()
         print(f"[{arch}] {status} (Build ID: {build_id})")
     print("====================")
-    
+
     successful_builds = sum(1 for success in build_results.values() if success)
     total_builds = len(build_results)
     cancelled_builds = sum(1 for info in arch_build_info.values() if info.get('status') == 'cancelled')
-    
+
     if cancelled_by_user:
         print(f"Overall result: {successful_builds}/{total_builds} builds successful ({cancelled_builds} cancelled by user)")
     else:
         print(f"Overall result: {successful_builds}/{total_builds} builds successful")
-    
+
     return all(build_results.values())
 
 
@@ -824,7 +873,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                  status_callback = None, pkgname: str = None, arch: str = None) -> bool:
     """
     Monitor a build with optional real-time output and automatic downloading.
-    
+
     Args:
         build_id: Build ID to monitor
         client: Client instance
@@ -834,25 +883,25 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
         status_callback: Callback for status updates
         pkgname: Package name to display
         arch: Architecture being built (for display purposes)
-        
+
     Returns:
         True if build was successful
     """
     arch_prefix = f"[{arch}] " if arch else ""
-    
+
     if verbose:
         print(f"{arch_prefix}Monitoring build: {build_id}")
-    
+
     # Get initial build info with retry logic
     max_retries = 10
     retry_delay = 1.0
-    
+
     for attempt in range(max_retries):
         try:
             initial_status = client.get_build_status(build_id)
             if not pkgname:
                 pkgname = initial_status.get('pkgname', 'unknown')
-            
+
             if verbose:
                 print(f"{arch_prefix}Package: {pkgname}")
                 print(f"{arch_prefix}Initial status: {initial_status['status']}")
@@ -866,7 +915,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
             else:
                 print(f"{arch_prefix}Error getting build status after {max_retries} attempts: {e}")
                 return False
-    
+
     # Monitor build progress
     last_status = None
     try:
@@ -874,10 +923,10 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
             if update['status'] != last_status:
                 print(f"{arch_prefix}Status: {update['status']}")
                 last_status = update['status']
-                
+
                 if status_callback:
                     status_callback(update)
-            
+
             if update['status'] in ['completed', 'failed', 'cancelled']:
                 break
     except KeyboardInterrupt:
@@ -890,7 +939,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                 print(f"{arch_prefix}Failed to cancel build - it may continue running")
         except Exception as e:
             print(f"{arch_prefix}Error cancelling build: {e}")
-        
+
         # Re-raise the KeyboardInterrupt to allow calling code to handle it
         raise
     except requests.RequestException as e:
@@ -902,13 +951,13 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
             print(f"{arch_prefix}Final status: {last_status}")
         except requests.RequestException:
             pass
-    
+
     # Download results if output_dir provided
     if output_dir and last_status in ['completed', 'failed']:
         try:
             final_status = client.get_build_status(build_id)
             downloaded_files = []
-            
+
             # Download packages (for successful builds)
             if 'packages' in final_status and final_status['packages']:
                 for package in final_status['packages']:
@@ -917,7 +966,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                         downloaded_files.append(package['filename'])
                     else:
                         print(f"{arch_prefix}Failed to download: {package['filename']}")
-            
+
             # Download logs (for all builds, including failed ones)
             if 'logs' in final_status and final_status['logs']:
                 for log in final_status['logs']:
@@ -926,15 +975,15 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                         downloaded_files.append(log['filename'])
                     else:
                         print(f"{arch_prefix}Failed to download: {log['filename']}")
-            
+
             if downloaded_files:
                 print(f"{arch_prefix}Downloaded {len(downloaded_files)} files")
             else:
                 print(f"{arch_prefix}No files available for download")
-                
+
         except requests.RequestException as e:
             print(f"{arch_prefix}Error downloading files: {e}")
-    
+
     return last_status == 'completed'
 
 
@@ -943,7 +992,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                             specific_arch: str = None, force: bool = False) -> bool:
     """
     Build a package for multiple architectures using available servers.
-    
+
     Args:
         build_path: Path to package directory
         output_dir: Output directory
@@ -952,7 +1001,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         detach: Don't wait for completion
         specific_arch: Build for specific architecture only
         force: Force rebuild even if package exists
-        
+
     Returns:
         True if all builds were successful
     """
@@ -960,37 +1009,37 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
     if not pkgbuild_path.exists():
         print(f"Error: PKGBUILD not found in {build_path}")
         return False
-    
+
     # Find source files
     source_files = []
     for file_path in build_path.iterdir():
         if file_path.is_file() and file_path.name != "PKGBUILD":
             source_files.append(file_path)
-    
+
     servers = config.get("servers", {})
     architectures = [specific_arch] if specific_arch else list(servers.keys())
-    
+
     if not architectures:
         print("Error: No architectures configured")
         return False
-    
+
     # Show which architectures will be built
     print(f"Building for architectures: {', '.join(architectures)}")
-    
+
     build_results = []
     arch_build_info = {}  # Track build info for each architecture
-    
+
     # Submit builds for all architectures
     for arch in architectures:
         if arch not in servers:
             print(f"[{arch}] No servers configured for architecture: {arch}")
             continue
-        
+
         server_urls = servers[arch]
         if not server_urls:
             print(f"[{arch}] No servers available for architecture: {arch}")
             continue
-        
+
         # Check if package already exists (unless force is specified)
         should_skip, reason = should_skip_build(output_dir, pkgbuild_path, arch, force)
         if should_skip:
@@ -1003,17 +1052,17 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                 'status': 'skipped'
             }
             continue
-        
+
         if verbose and not force:
             print(f"[{arch}] {reason}")
-        
+
         # Try each server for this architecture
         build_successful = False
         for server_url in server_urls:
             try:
                 if verbose:
                     print(f"[{arch}] Submitting build to {server_url}...")
-                
+
                 build_id = submit_build(server_url, pkgbuild_path, source_files)
                 if build_id:
                     print(f"[{arch}] Build submitted: {build_id}")
@@ -1024,12 +1073,12 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                     }
                     build_successful = True
                     break
-                
+
             except Exception as e:
                 if verbose:
                     print(f"[{arch}] Error with server {server_url}: {e}")
                 continue
-        
+
         if not build_successful:
             print(f"[{arch}] Failed to submit build")
             arch_build_info[arch] = {
@@ -1037,7 +1086,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                 'server_url': None,
                 'status': 'failed'
             }
-    
+
     # Show summary of submitted builds
     print("\n=== Build Summary ===")
     for arch, info in arch_build_info.items():
@@ -1046,19 +1095,19 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         else:
             print(f"[{arch}] Build submission failed")
     print("====================\n")
-    
+
     if detach:
         print("Builds submitted. Exiting without waiting for completion.")
         return True
-    
+
     # Monitor all builds
     builds_to_monitor = {arch: info for arch, info in arch_build_info.items() 
                         if info['build_id'] and info['status'] != 'skipped'}
-    
+
     if builds_to_monitor:
         print("Monitoring build progress...")
     cancelled_by_user = False
-    
+
     for arch, info in arch_build_info.items():
         if not info['build_id']:
             if info['status'] == 'skipped':
@@ -1066,11 +1115,11 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
             else:
                 build_results.append(False)
             continue
-        
+
         try:
             client = APBotClient(info['server_url'])
             arch_output_dir = output_dir / arch
-            
+
             print(f"\n--- Starting monitoring for {arch} ---")
             success = monitor_build(
                 info['build_id'], 
@@ -1080,16 +1129,16 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                 arch=arch
             )
             print(f"--- Finished monitoring for {arch}: {'SUCCESS' if success else 'FAILED'} ---\n")
-            
+
             build_results.append(success)
             arch_build_info[arch]['status'] = 'completed' if success else 'failed'
-            
+
         except KeyboardInterrupt:
             print(f"\n--- Build monitoring interrupted for {arch} ---")
             cancelled_by_user = True
             build_results.append(False)
             arch_build_info[arch]['status'] = 'cancelled'
-            
+
             # Cancel all remaining builds
             print("\nCancelling all remaining builds...")
             for remaining_arch, remaining_info in arch_build_info.items():
@@ -1104,12 +1153,12 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                     except Exception as cancel_error:
                         print(f"[{remaining_arch}] Error cancelling build: {cancel_error}")
             break
-            
+
         except Exception as e:
             print(f"[{arch}] Error monitoring build: {e}")
             build_results.append(False)
             arch_build_info[arch]['status'] = 'failed'
-    
+
     # Show final summary
     print("\n=== Final Results ===")
     for arch, info in arch_build_info.items():
@@ -1119,12 +1168,12 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         else:
             print(f"[{arch}] {status_display}")
     print("====================")
-    
+
     successful_builds = sum(1 for result in build_results if result)
     total_builds = len(build_results)
     skipped_builds = sum(1 for info in arch_build_info.values() if info.get('status') == 'skipped')
     cancelled_builds = sum(1 for info in arch_build_info.values() if info.get('status') == 'cancelled')
-    
+
     if skipped_builds > 0:
         if cancelled_by_user:
             print(f"Overall result: {successful_builds}/{total_builds} builds successful ({skipped_builds} skipped, {cancelled_builds} cancelled by user)")
@@ -1135,14 +1184,14 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
             print(f"Overall result: {successful_builds}/{total_builds} builds successful ({cancelled_builds} cancelled by user)")
         else:
             print(f"Overall result: {successful_builds}/{total_builds} builds successful")
-    
+
     return all(build_results)
 
 
 def main():
     """Main command-line interface."""
     parser = argparse.ArgumentParser(description="APB Client - Build packages using APB servers")
-    
+
     # Basic options
     parser.add_argument("pkgbuild_path", nargs="?", type=Path, 
                        help="Path to PKGBUILD or package directory")
@@ -1151,7 +1200,7 @@ def main():
     parser.add_argument("--config", type=Path, help="Path to configuration file")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--quiet", action="store_true", help="Suppress output except errors")
-    
+
     # Build options
     parser.add_argument("--output-dir", type=Path, default=Path("./output"),
                        help="Output directory for downloaded files")
@@ -1161,24 +1210,24 @@ def main():
                        help="Don't download build results")
     parser.add_argument("--force", action="store_true",
                        help="Force rebuild even if package exists")
-    
+
     # Monitoring options
     parser.add_argument("--monitor", type=str, help="Monitor existing build")
     parser.add_argument("--download", type=str, help="Download build results")
     parser.add_argument("--status", type=str, help="Check build status")
     parser.add_argument("--cancel", type=str, help="Cancel running build")
-    
+
     # Advanced options
     parser.add_argument("--farm", action="store_true", help="Use APB Farm instead of direct server")
     parser.add_argument("--list-servers", action="store_true", help="List available servers")
     parser.add_argument("--cleanup", action="store_true", help="Trigger server cleanup")
     parser.add_argument("--test-arch", action="store_true", help="Test architecture compatibility")
-    
+
     args = parser.parse_args()
-    
+
     # Load configuration
     config = load_config(args.config)
-    
+
     # Determine server URL
     if args.server:
         server_url = args.server
@@ -1186,9 +1235,9 @@ def main():
         server_url = config.get("farm_url", "http://localhost:8080")
     else:
         server_url = config.get("default_server", "http://localhost:8000")
-    
+
     client = APBotClient(server_url)
-    
+
     # Handle monitoring operations
     if args.monitor:
         # Create architecture-specific output directory if downloads are enabled
@@ -1204,7 +1253,7 @@ def main():
             except:
                 build_arch = (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch", "powerpc64le")
             output_dir = args.output_dir / build_arch
-        
+
         try:
             success = monitor_build(args.monitor, client, output_dir, 
                                   args.verbose, allow_toggle=True)
@@ -1212,21 +1261,21 @@ def main():
         except KeyboardInterrupt:
             print("\nBuild monitoring interrupted by user")
             sys.exit(1)
-    
+
     if args.download:
         try:
             status = client.get_build_status(args.download)
             downloaded_files = []
-            
+
             # Determine architecture for output directory
             # Try to get arch from status, command line arg, or use default
             status_arch = status.get('arch')
             if isinstance(status_arch, list):
                 status_arch = status_arch[0] if status_arch else None
-            
+
             build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch", "x86_64")
             arch_output_dir = args.output_dir / build_arch
-            
+
             # Download packages (for successful builds)
             if 'packages' in status and status['packages']:
                 for package in status['packages']:
@@ -1235,7 +1284,7 @@ def main():
                         downloaded_files.append(package['filename'])
                     else:
                         print(f"Failed to download: {package['filename']}")
-            
+
             # Download logs (for all builds, including failed ones)
             if 'logs' in status and status['logs']:
                 for log in status['logs']:
@@ -1244,16 +1293,16 @@ def main():
                         downloaded_files.append(log['filename'])
                     else:
                         print(f"Failed to download: {log['filename']}")
-            
+
             if not downloaded_files:
                 print("No files available for download")
                 sys.exit(1)
-            
+
             sys.exit(0)
         except requests.RequestException as e:
             print(f"Error: {e}")
             sys.exit(1)
-    
+
     if args.status:
         try:
             status = client.get_build_status(args.status)
@@ -1266,7 +1315,7 @@ def main():
         except requests.RequestException as e:
             print(f"Error: {e}")
             sys.exit(1)
-    
+
     if args.cancel:
         if client.cancel_build(args.cancel):
             print("Build cancelled successfully")
@@ -1274,7 +1323,7 @@ def main():
         else:
             print("Failed to cancel build")
             sys.exit(1)
-    
+
     if args.list_servers:
         if args.server or args.farm:
             print(f"Testing server: {server_url}")
@@ -1305,7 +1354,7 @@ def main():
                 for server in servers:
                     print(f"    {server}")
         sys.exit(0)
-    
+
     if args.cleanup:
         if client.cleanup_server():
             print("Server cleanup triggered")
@@ -1313,7 +1362,7 @@ def main():
         else:
             print("Failed to trigger cleanup")
             sys.exit(1)
-    
+
     # Handle build submission
     if not args.pkgbuild_path:
         # Try to find PKGBUILD in current directory
@@ -1323,41 +1372,41 @@ def main():
         else:
             print("Error: No PKGBUILD path provided and none found in current directory")
             sys.exit(1)
-    
+
     build_path = args.pkgbuild_path
     if build_path.is_file():
         build_path = build_path.parent
-    
+
     # If --server or --farm is specified, use that server directly
     if args.server or args.farm:
         pkgbuild_path = build_path / "PKGBUILD"
         if not pkgbuild_path.exists():
             print(f"Error: PKGBUILD not found in {build_path}")
             sys.exit(1)
-        
+
         # Find source files
         source_files = []
         for file_path in build_path.iterdir():
             if file_path.is_file() and file_path.name != "PKGBUILD":
                 source_files.append(file_path)
-        
+
         # For farm submissions, check which architectures need building
         if args.farm:
             # Get architectures that need building
             architectures_needing_build = get_architectures_needing_build(pkgbuild_path, args.output_dir, args.force)
-            
+
             if not architectures_needing_build:
                 print("All packages already exist in output directory")
                 if not args.force:
                     print("Use --force to rebuild existing packages")
                 sys.exit(0)
-            
+
             # Show which architectures need building
             if args.verbose:
                 pkg_info = parse_pkgbuild_info(pkgbuild_path)
                 all_archs = pkg_info.get("arch", ["x86_64"])
                 skipped_archs = [arch for arch in all_archs if arch not in architectures_needing_build]
-                
+
                 if skipped_archs:
                     print(f"Skipping existing packages for architectures: {', '.join(skipped_archs)}")
                 print(f"Building for architectures: {', '.join(architectures_needing_build)}")
@@ -1366,7 +1415,7 @@ def main():
             target_arch = args.arch if args.arch and ',' not in args.arch else None
             if not target_arch:
                 target_arch = config.get("default_arch", "x86_64")
-            
+
             # Check if package already exists (unless force is specified)
             should_skip, reason = should_skip_build(args.output_dir, pkgbuild_path, target_arch, args.force)
             if should_skip:
@@ -1374,16 +1423,16 @@ def main():
                 if not args.force:
                     print("Use --force to rebuild existing packages")
                 sys.exit(0)
-            
+
             if args.verbose and not args.force:
                 print(reason)
-        
+
         try:
             if args.verbose:
                 print(f"Submitting build to {server_url}...")
                 if not args.farm and target_arch:
                     print(f"Target architecture: {target_arch}")
-            
+
             if args.farm:
                 # Handle farm submission with multiple architectures
                 response = submit_build_to_farm(server_url, pkgbuild_path, source_files, architectures_needing_build)
@@ -1391,22 +1440,22 @@ def main():
                     if 'builds' in response and response['builds']:
                         # Multi-architecture farm response
                         builds = response['builds']
-                        
+
                         if builds:
                             print(f"Monitoring {len(builds)} build(s): {response['message']}")
                         else:
                             print("No builds to monitor (all packages already exist)")
                             sys.exit(0)
-                        
+
                         if not args.detach and builds:
                             # Give the farm a moment to process the builds
                             time.sleep(0.5)
-                            
+
                             # Create base output directory if downloads are enabled
                             output_dir = None
                             if not args.no_download:
                                 output_dir = args.output_dir
-                            
+
                             try:
                                 success = monitor_farm_builds(builds, client, output_dir, args.verbose)
                                 sys.exit(0 if success else 1)
@@ -1432,18 +1481,18 @@ def main():
                         build_id = response.get('build_id')
                         if build_id:
                             print(f"Build submitted: {build_id}")
-                            
+
                             if not args.detach:
                                 # Give the farm a moment to process the build
                                 time.sleep(0.5)
-                                
+
                                 # Create architecture-specific output directory if downloads are enabled
                                 output_dir = None
                                 if not args.no_download:
                                     # Determine architecture for output directory (use first needed architecture)
                                     build_arch = architectures_needing_build[0] if architectures_needing_build else config.get("default_arch", "x86_64")
                                     output_dir = args.output_dir / build_arch
-                                
+
                                 try:
                                     # Use first needed architecture for display
                                     display_arch = architectures_needing_build[0] if architectures_needing_build else None
@@ -1467,18 +1516,18 @@ def main():
                 build_id = submit_build(server_url, pkgbuild_path, source_files)
                 if build_id:
                     print(f"Build submitted: {build_id}")
-                    
+
                     if not args.detach:
                         # Give the farm a moment to process the build
                         time.sleep(0.5)
-                        
+
                         # Create architecture-specific output directory if downloads are enabled
                         output_dir = None
                         if not args.no_download:
                             # Determine architecture for output directory
                             build_arch = target_arch or config.get("default_arch", "x86_64")
                             output_dir = args.output_dir / build_arch
-                        
+
                         try:
                             success = monitor_build(build_id, client, output_dir, 
                                                   args.verbose, allow_toggle=True, arch=target_arch)
@@ -1495,7 +1544,7 @@ def main():
         except Exception as e:
             print(f"Error: {e}")
             sys.exit(1)
-    
+
     # Build for multiple architectures or specific architecture using config
     try:
         if args.arch:
@@ -1528,9 +1577,9 @@ def main():
     except KeyboardInterrupt:
         print("\nBuilds interrupted by user")
         sys.exit(1)
-    
+
     sys.exit(0 if success else 1)
 
 
 if __name__ == "__main__":
-    main() 
+    main()
