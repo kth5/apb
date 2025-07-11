@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "x86_64": [
+      "http://localhost:8000"
+    ]
+  },
+  "default_server": "http://localhost:8000",
+  "default_arch": "x86_64",
+  "output_dir": "./test/output",
+  "farm_url": "http://localhost:8080"
+} 

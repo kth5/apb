@@ -1,0 +1,16 @@
+# systemd tmpfiles configuration for APB
+# This creates the necessary directories for APB operation
+
+# Main APB directory for temporary files and data
+d /var/lib/apb 0755 apb apb -
+
+# Subdirectories for different APB components
+d /var/lib/apb/builds 0755 apb apb -
+d /var/lib/apb/buildroot 0755 apb apb -
+d /var/lib/apb/cache 0755 apb apb -
+d /var/lib/apb/logs 0755 apb apb -
+d /var/lib/apb/farm 0755 apb apb -
+d /var/lib/apb/server 0755 apb apb -
+
+# Configuration directory (separate from /etc for runtime configs)
+d /var/lib/apb/config 0755 apb apb - 

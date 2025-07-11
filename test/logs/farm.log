@@ -1,0 +1,14 @@
+2025-07-10 22:33:57,677 - __main__ - INFO - Starting APB Farm on localhost:8080
+INFO:     Started server process [18749]
+INFO:     Waiting for application startup.
+2025-07-10 22:33:57,722 - __main__ - INFO - APB Farm started with 4 architecture groups
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://localhost:8080 (Press CTRL+C to quit)
+INFO:     ::1:42220 - "GET /health HTTP/1.1" 200 OK
+INFO:     ::1:42228 - "POST /build HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2025-07-10 22:34:00,641 - __main__ - INFO - APB Farm shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [18749]
+2025-07-10 22:34:00,642 - __main__ - INFO - Received signal 15, shutting down...

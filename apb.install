@@ -1,0 +1,59 @@
+post_install() {
+    # Create sysusers (user and group)
+    systemd-sysusers apb.conf
+    
+    # Create tmpfiles directories
+    systemd-tmpfiles --create apb.conf
+    
+    echo "APB installation completed."
+    echo ""
+    echo "Configuration:"
+    echo "  - Copy /etc/apb/apb.json.example to /etc/apb/apb.json and edit as needed"
+    echo "  - Or copy to /var/lib/apb/config/apb.json for per-user configuration"
+    echo ""
+    echo "Usage:"
+    echo "  - apb: Main client for interacting with APB servers"
+    echo "  - apb-server: Run an APB build server"
+    echo "  - apb-farm: Run an APB farm to manage multiple servers"
+    echo ""
+    echo "Data directories created in /var/lib/apb/ with apb:apb ownership"
+    echo ""
+    echo "IMPORTANT: Review and configure /etc/sudoers.d/apb"
+    echo "  - The sudoers configuration is installed but all rules are commented out"
+    echo "  - Uncomment and customize rules based on your security requirements"
+    echo "  - The apb user may need sudo access for build operations (pacman, etc.)"
+    echo "  - Only grant the minimum permissions required for your use case"
+}
+
+post_upgrade() {
+    # Recreate tmpfiles in case structure changed
+    systemd-tmpfiles --create apb.conf
+    
+    echo "APB upgraded successfully."
+    echo "Check /etc/apb/apb.json.example for any new configuration options."
+}
+
+pre_remove() {
+    # Stop any running services that might be using APB
+    echo "Stopping any running APB services..."
+    
+    # Kill any running apb processes gracefully
+    pkill -f "apb-server" 2>/dev/null || true
+    pkill -f "apb-farm" 2>/dev/null || true
+    
+    sleep 2
+    
+    # Force kill if still running
+    pkill -9 -f "apb-server" 2>/dev/null || true
+    pkill -9 -f "apb-farm" 2>/dev/null || true
+}
+
+post_remove() {
+    echo "APB removed."
+    echo ""
+    echo "Note: User data in /var/lib/apb/ has been preserved."
+    echo "To completely remove all APB data, run:"
+    echo "  sudo rm -rf /var/lib/apb/"
+    echo "  sudo userdel apb"
+    echo "  sudo groupdel apb"
+} 

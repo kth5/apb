@@ -1,0 +1,17 @@
+{
+  "servers": {
+    "powerpc64le": [
+      "http://localhost:8000"
+    ],
+    "powerpc64": [
+      "http://localhost:8000"
+    ],
+    "powerpc": [
+      "http://localhost:8000"
+    ],
+    "espresso": [
+      "http://localhost:8000"
+    ]
+  },
+  "farm_url": "http://127.0.0.1:8081"
+} 

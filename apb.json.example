@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "x86_64": [
+      "http://server1.example.com:8000",
+      "http://server2.example.com:8000"
+    ],
+    "aarch64": [
+      "http://arm-server1.example.com:8000"
+    ],
+    "riscv64": [
+      "http://riscv-server1.example.com:8000"
+    ]
+  }
+} 

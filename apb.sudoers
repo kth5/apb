@@ -1,0 +1,23 @@
+# APB User sudo configuration
+# 
+# Uncomment and customize the rules below based on your security requirements.
+# The apb user may need elevated privileges for certain build operations.
+
+# Allow apb user to run pacman for installing build dependencies
+# apb ALL=(root) NOPASSWD: /usr/bin/pacman
+
+# Allow apb user to manage systemd services (for build environment setup)
+# apb ALL=(root) NOPASSWD: /usr/bin/systemctl
+
+# Allow apb user to mount/unmount for build chroots (advanced setups)
+# apb ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount
+
+# Allow apb user to run specific build tools
+# apb ALL=(root) NOPASSWD: /usr/bin/makepkg, /usr/bin/repo-add
+
+# Alternative: Give broader access (less secure, evaluate carefully)
+# apb ALL=(ALL) NOPASSWD: ALL
+
+# Recommended: Only allow specific commands needed for your APB setup
+# Example for basic package installation during builds:
+# apb ALL=(root) NOPASSWD: /usr/bin/pacman -S *, /usr/bin/pacman -Sy, /usr/bin/pacman -Syu 

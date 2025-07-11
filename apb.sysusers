@@ -1,0 +1,8 @@
+# systemd sysusers configuration for APB
+# This creates the apb user and group for running APB services
+
+# Create apb group
+g apb - -
+
+# Create apb user with home directory and shell
+u apb - "APB Build System" /var/lib/apb /usr/bin/nologin
