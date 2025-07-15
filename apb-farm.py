@@ -1504,7 +1504,6 @@ async def get_dashboard(page: int = Query(1, ge=1)):
                 <br>
                 <small>
                     <a href="/build/{build['id']}/status" target="_blank">📋 View Details & Logs</a>
-                    {' | <a href="/build/{build["id"]}/output" target="_blank">📜 Raw Output</a>' if build['status'] in ['building', 'completed', 'failed'] else ''}
                 </small>
             </div>
         """
@@ -1640,13 +1639,52 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             raise HTTPException(status_code=404, detail=error_detail)
         else:
             return HTMLResponse(f"""
+            <!DOCTYPE html>
             <html>
-            <head><title>Build Not Found</title></head>
+            <head>
+                <title>Build Not Found</title>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                    .header {{ text-align: center; margin-bottom: 30px; }}
+                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                    .failed {{ background-color: #f8d7da; }}
+                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                    .build a:hover {{ text-decoration: underline; }}
+                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
+                    .error-detail strong {{ color: #721c24; }}
+                </style>
+            </head>
             <body>
-                <h1>Build Not Found</h1>
-                <p><strong>Build ID:</strong> {build_id}</p>
-                <p>{error_detail['detail']}</p>
-                <p>Please check that you're using the correct build ID and that the build was submitted to this farm.</p>
+                <div class="header">
+                    <h1>APB Farm - Build Status</h1>
+                </div>
+
+                <div class="build failed">
+                    <h2>❌ Build Not Found</h2>
+                    <div class="error-detail">
+                        <strong>Error:</strong> The requested build could not be found in the farm database.
+                    </div>
+
+                    <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+
+                    <h3>Details</h3>
+                    <p>{error_detail['detail']}</p>
+
+                    <h3>Next Steps</h3>
+                    <ul>
+                        <li>Verify that you're using the correct build ID</li>
+                        <li>Ensure the build was submitted through this farm</li>
+                        <li>Check if the build was submitted to a different farm instance</li>
+                    </ul>
+
+                    <p>
+                        <a href="/dashboard">🏠 Back to Dashboard</a> |
+                        <a href="/builds/latest">📋 View Recent Builds</a>
+                    </p>
+                </div>
             </body>
             </html>
             """, status_code=404)
@@ -1667,18 +1705,66 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             raise HTTPException(status_code=404, detail=error_detail)
         else:
             return HTMLResponse(f"""
+            <!DOCTYPE html>
             <html>
-            <head><title>Build Submission Failed - {pkgname}</title></head>
+            <head>
+                <title>Build Submission Failed - {pkgname}</title>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                    .header {{ text-align: center; margin-bottom: 30px; }}
+                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                    .failed {{ background-color: #f8d7da; }}
+                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                    .build a:hover {{ text-decoration: underline; }}
+                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
+                    .error-detail strong {{ color: #721c24; }}
+                    .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
+                    .metadata p {{ margin: 5px 0; }}
+                </style>
+            </head>
             <body>
-                <h1>Build Submission Failed: {pkgname}</h1>
-                <div style="background-color: #f8d7da; padding: 10px; border: 1px solid #f5c6cb; margin: 10px 0;">
-                    <strong>❌ Build Submission Failed</strong><br>
-                    This build failed during submission and was never assigned to a server.
+                <div class="header">
+                    <h1>APB Farm - Build Status</h1>
                 </div>
-                <p><strong>Build ID:</strong> {build_id}</p>
-                <p><strong>Status:</strong> {status}</p>
-                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
-                <p><strong>Created:</strong> {datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S') if created_at else 'unknown'}</p>
+
+                <div class="build failed">
+                    <h2>❌ Build Submission Failed: {pkgname}</h2>
+                    <div class="error-detail">
+                        <strong>Submission Error:</strong> This build failed during submission and was never assigned to a server.
+                    </div>
+
+                    <div class="metadata">
+                        <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+                        <p><strong>Package:</strong> {pkgname}</p>
+                        <p><strong>Status:</strong> {status}</p>
+                        <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                        <p><strong>Created:</strong> {datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S') if created_at else 'unknown'}</p>
+                    </div>
+
+                    <h3>Possible Causes</h3>
+                    <ul>
+                        <li>No servers available for the target architecture</li>
+                        <li>All servers at capacity during submission</li>
+                        <li>Network connectivity issues</li>
+                        <li>Invalid PKGBUILD or source files</li>
+                    </ul>
+
+                    <h3>Next Steps</h3>
+                    <ul>
+                        <li>Check server availability for your architecture</li>
+                        <li>Verify your PKGBUILD is valid</li>
+                        <li>Try submitting the build again</li>
+                    </ul>
+
+                    <p>
+                        <a href="/dashboard">🏠 Back to Dashboard</a> |
+                        <a href="/builds/latest">📋 View Recent Builds</a> |
+                        <a href="/farm">🌾 View Farm Status</a>
+                    </p>
+                </div>
             </body>
             </html>
             """, status_code=404)
@@ -1697,20 +1783,102 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 if format == "json":
                     return build_status
                 else:
+                    status_class = build_status.get('status', 'unknown')
+                    # Get detailed status information if available
+                    packages = build_status.get('packages', [])
+                    logs = build_status.get('logs', [])
+                    start_time = build_status.get('start_time')
+                    end_time = build_status.get('end_time')
+                    duration = build_status.get('duration', 0)
+
+                    # Build packages HTML
+                    packages_html = ""
+                    if packages:
+                        packages_html = "<h3>📦 Available Packages</h3><ul>"
+                        for pkg in packages:
+                            packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
+                        packages_html += "</ul>"
+
+                    # Build logs HTML
+                    logs_html = ""
+                    if logs:
+                        logs_html = "<h3>📄 Build Logs</h3><ul>"
+                        for log in logs:
+                            logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
+                        logs_html += "</ul>"
+
                     return HTMLResponse(f"""
+                    <!DOCTYPE html>
                     <html>
-                    <head><title>Build Status (Server Unavailable) - {pkgname}</title></head>
+                    <head>
+                        <title>Build Status (Server Unavailable) - {pkgname}</title>
+                        <meta charset="utf-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1">
+                        <meta http-equiv="refresh" content="30">
+                        <style>
+                            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                            .header {{ text-align: center; margin-bottom: 30px; }}
+                            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                            .completed {{ background-color: #d4edda; }}
+                            .failed {{ background-color: #f8d7da; }}
+                            .building {{ background-color: #fff3cd; }}
+                            .queued {{ background-color: #d1ecf1; }}
+                            .cancelled {{ background-color: #e2e3e5; }}
+                            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                            .build a:hover {{ text-decoration: underline; }}
+                            .warning-detail {{ background-color: #fff3cd; padding: 15px; border: 1px solid #ffeaa7; border-radius: 5px; margin: 15px 0; }}
+                            .warning-detail strong {{ color: #856404; }}
+                            .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
+                            .metadata p {{ margin: 5px 0; }}
+                            .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
+                            .status-completed {{ background-color: #d4edda; color: #155724; }}
+                            .status-failed {{ background-color: #f8d7da; color: #721c24; }}
+                            .status-building {{ background-color: #fff3cd; color: #856404; }}
+                            .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
+                            .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
+                        </style>
+                    </head>
                     <body>
-                        <h1>Build Status: {pkgname}</h1>
-                        <div style="background-color: #fff3cd; padding: 10px; border: 1px solid #ffeaa7; margin: 10px 0;">
-                            <strong>⚠️ Server Currently Unavailable</strong><br>
-                            The build server is currently unavailable. Showing last known status.
+                        <div class="header">
+                            <h1>APB Farm - Build Status</h1>
+                            <p>Package: <strong>{pkgname}</strong></p>
                         </div>
-                        <p><strong>Build ID:</strong> {build_id}</p>
-                        <p><strong>Status:</strong> {build_status.get('status', 'unknown')}</p>
-                        <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_status_update).strftime('%Y-%m-%d %H:%M:%S') if last_status_update else 'unknown'}</p>
-                        <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
-                        <p><em>This information may be outdated due to server unavailability.</em></p>
+
+                        <div class="build {status_class}">
+                            <h2>⚠️ Build Status (Server Unavailable)</h2>
+                            <div class="warning-detail">
+                                <strong>Server Status:</strong> The build server is currently unavailable. Showing last known status.<br>
+                                <em>This page will auto-refresh every 30 seconds to check for server recovery.</em>
+                            </div>
+
+                            <div class="metadata">
+                                <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+                                <p><strong>Package:</strong> {pkgname}</p>
+                                <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
+                                <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (unavailable)</p>
+                                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                                <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_status_update).strftime('%Y-%m-%d %H:%M:%S UTC') if last_status_update else 'unknown'}</p>
+                                {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
+                                {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
+                                {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
+                            </div>
+
+                            {packages_html}
+                            {logs_html}
+
+                            <h3>Actions</h3>
+                            <p>
+                                <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
+                                <a href="/dashboard">🏠 Back to Dashboard</a> |
+                                <a href="/farm">🌾 View Farm Status</a>
+                            </p>
+
+                            <div style="margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; font-size: 0.9em;">
+                                <strong>Note:</strong> This information may be outdated due to server unavailability.
+                                The server will automatically reconnect when available, and status will update.
+                            </div>
+                        </div>
                     </body>
                     </html>
                     """)
@@ -1730,18 +1898,83 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             raise HTTPException(status_code=503, detail=error_detail)
         else:
             return HTMLResponse(f"""
+            <!DOCTYPE html>
             <html>
-            <head><title>Server Unavailable - {pkgname}</title></head>
+            <head>
+                <title>Server Unavailable - {pkgname}</title>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <meta http-equiv="refresh" content="60">
+                <style>
+                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                    .header {{ text-align: center; margin-bottom: 30px; }}
+                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                    .failed {{ background-color: #f8d7da; }}
+                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                    .build a:hover {{ text-decoration: underline; }}
+                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
+                    .error-detail strong {{ color: #721c24; }}
+                    .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
+                    .metadata p {{ margin: 5px 0; }}
+                    .retry-info {{ background-color: #d1ecf1; padding: 15px; border: 1px solid #bee5eb; border-radius: 5px; margin: 15px 0; }}
+                    .retry-info strong {{ color: #0c5460; }}
+                </style>
+            </head>
             <body>
-                <h1>Server Unavailable: {pkgname}</h1>
-                <div style="background-color: #f8d7da; padding: 10px; border: 1px solid #f5c6cb; margin: 10px 0;">
-                    <strong>❌ Server Unavailable</strong><br>
-                    The server handling this build is currently unavailable.
+                <div class="header">
+                    <h1>APB Farm - Build Status</h1>
+                    <p>Package: <strong>{pkgname}</strong></p>
                 </div>
-                <p><strong>Build ID:</strong> {build_id}</p>
-                <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
-                <p><strong>Last Known Status:</strong> {last_known_status or status}</p>
-                <p>Please try again later when the server recovers.</p>
+
+                <div class="build failed">
+                    <h2>❌ Server Unavailable</h2>
+                    <div class="error-detail">
+                        <strong>Connection Error:</strong> The server handling this build is currently unavailable and no cached status is available.
+                    </div>
+
+                    <div class="metadata">
+                        <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+                        <p><strong>Package:</strong> {pkgname}</p>
+                        <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (unavailable)</p>
+                        <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                        <p><strong>Last Known Status:</strong> {last_known_status or status}</p>
+                    </div>
+
+                    <div class="retry-info">
+                        <strong>Auto-Retry:</strong> This page will automatically refresh every 60 seconds to check for server recovery.<br>
+                        <em>The farm will continue attempting to connect to the server in the background.</em>
+                    </div>
+
+                    <h3>Possible Causes</h3>
+                    <ul>
+                        <li>Server is temporarily down for maintenance</li>
+                        <li>Network connectivity issues</li>
+                        <li>Server overload or high resource usage</li>
+                        <li>Server configuration problems</li>
+                    </ul>
+
+                    <h3>What to Do</h3>
+                    <ul>
+                        <li>Wait for the server to recover (auto-refresh will detect this)</li>
+                        <li>Check the farm dashboard for other available servers</li>
+                        <li>Contact the farm administrator if the issue persists</li>
+                        <li>Consider submitting to a different architecture if available</li>
+                    </ul>
+
+                    <h3>Actions</h3>
+                    <p>
+                        <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
+                        <a href="/dashboard">🏠 Back to Dashboard</a> |
+                        <a href="/farm">🌾 View Farm Status</a> |
+                        <a href="/builds/latest">📋 View Recent Builds</a>
+                    </p>
+
+                    <div style="margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; font-size: 0.9em;">
+                        <strong>Status Monitoring:</strong> The farm is actively monitoring this server and will update the build status
+                        as soon as connectivity is restored. Your build may still be running on the server.
+                    </div>
+                </div>
             </body>
             </html>
             """, status_code=503)
@@ -1797,12 +2030,115 @@ async def get_build_status(build_id: str, format: str = Query("html")):
 
             raise HTTPException(status_code=503, detail=f"Server unavailable: {str(e)}")
     else:
-        # Forward to server's HTML page
+        # Generate farm's own HTML page instead of forwarding to server
         try:
-            async with http_session.get(f"{server_url}/build/{build_id}", timeout=10) as response:
+            async with http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10) as response:
                 if response.status == 200:
-                    content = await response.text()
-                    return HTMLResponse(content=content)
+                    build_status = await response.json()
+                    build_status["server_url"] = obfuscate_server_url(server_url)
+                    if server_arch:
+                        build_status["server_arch"] = server_arch
+
+                    # Update our cache with the latest status
+                    cursor = build_database.cursor()
+                    cursor.execute('''
+                        UPDATE builds SET
+                            last_known_status = ?,
+                            last_status_update = ?,
+                            server_available = 1,
+                            cached_response = ?
+                        WHERE id = ?
+                    ''', (build_status.get('status', 'unknown'), time.time(),
+                         json.dumps(build_status), build_id))
+                    build_database.commit()
+
+                    # Generate HTML response
+                    status_class = build_status.get('status', 'unknown')
+                    packages = build_status.get('packages', [])
+                    logs = build_status.get('logs', [])
+                    start_time = build_status.get('start_time')
+                    end_time = build_status.get('end_time')
+                    duration = build_status.get('duration', 0)
+
+                    # Build packages HTML
+                    packages_html = ""
+                    if packages:
+                        packages_html = "<h3>📦 Available Packages</h3><ul>"
+                        for pkg in packages:
+                            packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
+                        packages_html += "</ul>"
+
+                    # Build logs HTML
+                    logs_html = ""
+                    if logs:
+                        logs_html = "<h3>📄 Build Logs</h3><ul>"
+                        for log in logs:
+                            logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
+                        logs_html += "</ul>"
+
+                    return HTMLResponse(f"""
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Build Status - {pkgname}</title>
+                        <meta charset="utf-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1">
+                        <meta http-equiv="refresh" content="30">
+                        <style>
+                            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                            .header {{ text-align: center; margin-bottom: 30px; }}
+                            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                            .completed {{ background-color: #d4edda; }}
+                            .failed {{ background-color: #f8d7da; }}
+                            .building {{ background-color: #fff3cd; }}
+                            .queued {{ background-color: #d1ecf1; }}
+                            .cancelled {{ background-color: #e2e3e5; }}
+                            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                            .build a:hover {{ text-decoration: underline; }}
+                            .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
+                            .metadata p {{ margin: 5px 0; }}
+                            .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
+                            .status-completed {{ background-color: #d4edda; color: #155724; }}
+                            .status-failed {{ background-color: #f8d7da; color: #721c24; }}
+                            .status-building {{ background-color: #fff3cd; color: #856404; }}
+                            .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
+                            .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
+                        </style>
+                    </head>
+                    <body>
+                        <div class="header">
+                            <h1>APB Farm - Build Status</h1>
+                            <p>Package: <strong>{pkgname}</strong></p>
+                        </div>
+
+                        <div class="build {status_class}">
+                            <h2>📋 Build Status</h2>
+
+                            <div class="metadata">
+                                <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+                                <p><strong>Package:</strong> {pkgname}</p>
+                                <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
+                                <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
+                                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                                {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
+                                {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
+                                {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
+                            </div>
+
+                            {packages_html}
+                            {logs_html}
+
+                            <h3>Actions</h3>
+                            <p>
+                                <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
+                                <a href="/dashboard">🏠 Back to Dashboard</a> |
+                                <a href="/farm">🌾 View Farm Status</a>
+                            </p>
+                        </div>
+                    </body>
+                    </html>
+                    """)
                 else:
                     raise HTTPException(status_code=response.status, detail="Build not found")
         except Exception as e:
@@ -1819,22 +2155,108 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     build_status = json.loads(result[0])
                     pkgname = result[3] or 'unknown'
                     last_update = result[1]
+                    status_class = build_status.get('status', 'unknown')
+
+                    # Get detailed status information if available
+                    packages = build_status.get('packages', [])
+                    logs = build_status.get('logs', [])
+                    start_time = build_status.get('start_time')
+                    end_time = build_status.get('end_time')
+                    duration = build_status.get('duration', 0)
+
+                    # Build packages HTML
+                    packages_html = ""
+                    if packages:
+                        packages_html = "<h3>📦 Available Packages</h3><ul>"
+                        for pkg in packages:
+                            packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
+                        packages_html += "</ul>"
+
+                    # Build logs HTML
+                    logs_html = ""
+                    if logs:
+                        logs_html = "<h3>📄 Build Logs</h3><ul>"
+                        for log in logs:
+                            logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
+                        logs_html += "</ul>"
 
                     return HTMLResponse(f"""
+                    <!DOCTYPE html>
                     <html>
-                    <head><title>Build Status (Server Unavailable) - {pkgname}</title></head>
+                    <head>
+                        <title>Build Status (Server Unavailable) - {pkgname}</title>
+                        <meta charset="utf-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1">
+                        <meta http-equiv="refresh" content="30">
+                        <style>
+                            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                            .header {{ text-align: center; margin-bottom: 30px; }}
+                            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                            .completed {{ background-color: #d4edda; }}
+                            .failed {{ background-color: #f8d7da; }}
+                            .building {{ background-color: #fff3cd; }}
+                            .queued {{ background-color: #d1ecf1; }}
+                            .cancelled {{ background-color: #e2e3e5; }}
+                            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                            .build a:hover {{ text-decoration: underline; }}
+                            .warning-detail {{ background-color: #fff3cd; padding: 15px; border: 1px solid #ffeaa7; border-radius: 5px; margin: 15px 0; }}
+                            .warning-detail strong {{ color: #856404; }}
+                            .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
+                            .metadata p {{ margin: 5px 0; }}
+                            .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
+                            .status-completed {{ background-color: #d4edda; color: #155724; }}
+                            .status-failed {{ background-color: #f8d7da; color: #721c24; }}
+                            .status-building {{ background-color: #fff3cd; color: #856404; }}
+                            .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
+                            .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
+                            .error-info {{ background-color: #f8d7da; padding: 10px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; font-size: 0.9em; }}
+                        </style>
+                    </head>
                     <body>
-                        <h1>Build Status: {pkgname}</h1>
-                        <div style="background-color: #fff3cd; padding: 10px; border: 1px solid #ffeaa7; margin: 10px 0;">
-                            <strong>⚠️ Server Currently Unavailable</strong><br>
-                            The build server is currently unavailable. Showing last known status.
+                        <div class="header">
+                            <h1>APB Farm - Build Status</h1>
+                            <p>Package: <strong>{pkgname}</strong></p>
                         </div>
-                        <p><strong>Build ID:</strong> {build_id}</p>
-                        <p><strong>Status:</strong> {build_status.get('status', 'unknown')}</p>
-                        <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S') if last_update else 'unknown'}</p>
-                        <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
-                        <p><em>This information may be outdated due to server unavailability.</em></p>
-                        <p><strong>Error:</strong> {str(e)}</p>
+
+                        <div class="build {status_class}">
+                            <h2>⚠️ Build Status (Server Connection Failed)</h2>
+                            <div class="warning-detail">
+                                <strong>Connection Issue:</strong> Unable to contact the build server. Showing last cached status.<br>
+                                <em>This page will auto-refresh every 30 seconds to check for server recovery.</em>
+                            </div>
+
+                            <div class="metadata">
+                                <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+                                <p><strong>Package:</strong> {pkgname}</p>
+                                <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
+                                <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (connection failed)</p>
+                                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                                <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S UTC') if last_update else 'unknown'}</p>
+                                {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
+                                {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
+                                {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
+                            </div>
+
+                            <div class="error-info">
+                                <strong>Connection Error:</strong> {str(e)}
+                            </div>
+
+                            {packages_html}
+                            {logs_html}
+
+                            <h3>Actions</h3>
+                            <p>
+                                <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
+                                <a href="/dashboard">🏠 Back to Dashboard</a> |
+                                <a href="/farm">🌾 View Farm Status</a>
+                            </p>
+
+                            <div style="margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; font-size: 0.9em;">
+                                <strong>Note:</strong> This information may be outdated due to server connectivity issues.
+                                The farm will automatically retry connection and update status when possible.
+                            </div>
+                        </div>
                     </body>
                     </html>
                     """)
