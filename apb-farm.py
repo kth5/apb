@@ -12,7 +12,9 @@ import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+import hashlib
+import secrets
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import argparse
@@ -27,9 +29,11 @@ from enum import Enum
 
 # FastAPI dependencies
 try:
-    from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Query
+    from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, Query, Depends
     from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    from pydantic import BaseModel, Field
     import uvicorn
 except ImportError as e:
     print(f"Missing required dependency: {e}")
@@ -47,6 +51,12 @@ DEFAULT_CONFIG_PATHS = [
     Path.home() / ".apb-farm" / "apb.json"
 ]
 
+# Authentication constants
+TOKEN_EXPIRY_DAYS = 10
+ADMIN_ROLE = "admin"
+USER_ROLE = "user"
+GUEST_ROLE = "guest"
+
 # Classes need to be defined before global state to avoid NameError
 class BuildStatus:
     QUEUED = "queued"
@@ -63,6 +73,12 @@ class ServerHealth(Enum):
     MISCONFIGURED = "misconfigured"
 
 
+class UserRole(Enum):
+    ADMIN = "admin"
+    USER = "user"
+    GUEST = "guest"
+
+
 @dataclass
 class ServerStatus:
     url: str
@@ -72,6 +88,51 @@ class ServerStatus:
     last_known_architecture: Optional[str] = None
     health: ServerHealth = ServerHealth.HEALTHY
     last_response: Optional[Dict] = None
+
+
+@dataclass
+class User:
+    id: int
+    username: str
+    role: UserRole
+    created_at: float
+    last_login: Optional[float] = None
+
+
+# Pydantic models for API requests/responses
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=100)
+
+
+class LoginResponse(BaseModel):
+    token: str
+    user: dict
+    expires_in_days: int = 10
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=100)
+    role: str = Field(default="user", pattern="^(user|admin)$")
+
+
+class ChangeRoleRequest(BaseModel):
+    role: str = Field(..., pattern="^(user|admin)$")
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    role: str
+    created_at: float
+    last_login: Optional[float]
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=8, max_length=100)
+    new_password: str = Field(..., min_length=8, max_length=100)
+    confirm_password: str = Field(..., min_length=8, max_length=100)
 
 
 # Global state
@@ -86,12 +147,456 @@ background_tasks: List[asyncio.Task] = []
 # Enhanced server tracking for resilient architecture detection
 server_status_tracker: Dict[str, ServerStatus] = {}
 
+# Authentication manager instance
+auth_manager = None
+
+
+class AuthManager:
+    """Manages authentication and authorization for APB Farm"""
+
+    def __init__(self, db_connection: sqlite3.Connection):
+        self.db = db_connection
+        self.security = HTTPBearer(auto_error=False)
+        self._init_auth_tables()
+        self._create_default_admin()
+
+    def _init_auth_tables(self):
+        """Initialize authentication tables"""
+        try:
+            # Users table
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user',
+                    created_at REAL NOT NULL,
+                    last_login REAL,
+                    is_active BOOLEAN DEFAULT 1
+                )
+            ''')
+
+            # Tokens table
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS tokens (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_hash TEXT UNIQUE NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_used_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+
+            # Add user_id column to builds table if it doesn't exist
+            try:
+                self.db.execute('ALTER TABLE builds ADD COLUMN user_id INTEGER')
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            # Create indexes for performance
+            self.db.execute('CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)')
+            self.db.execute('CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id)')
+            self.db.execute('CREATE INDEX IF NOT EXISTS idx_builds_user ON builds(user_id)')
+
+            self.db.commit()
+            logger.info("Authentication tables initialized")
+
+        except Exception as e:
+            logger.error(f"Failed to initialize auth tables: {e}")
+            raise
+
+    def _create_default_admin(self):
+        """Create default admin user if none exists"""
+        cursor = self.db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users WHERE role = ?", (ADMIN_ROLE,))
+        admin_count = cursor.fetchone()[0]
+
+        if admin_count == 0:
+            # Create default admin user
+            default_password = "admin123"  # User should change this immediately
+            admin_user = self.create_user("admin", default_password, UserRole.ADMIN)
+            logger.warning(f"Created default admin user 'admin' with password '{default_password}' - CHANGE THIS IMMEDIATELY!")
+            return admin_user
+        return None
+
+    def _hash_password(self, password: str) -> str:
+        """Hash password using PBKDF2 with salt"""
+        salt = secrets.token_hex(32)
+        password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+        return f"{salt}:{password_hash.hex()}"
+
+    def _verify_password(self, password: str, stored_hash: str) -> bool:
+        """Verify password against stored hash"""
+        try:
+            salt, hash_hex = stored_hash.split(':', 1)
+            password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000)
+            return secrets.compare_digest(password_hash.hex(), hash_hex)
+        except Exception:
+            return False
+
+    def _generate_token(self) -> str:
+        """Generate a secure random token"""
+        return secrets.token_urlsafe(32)
+
+    def _hash_token(self, token: str) -> str:
+        """Hash token for storage"""
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def create_user(self, username: str, password: str, role: UserRole = UserRole.USER) -> User:
+        """Create a new user"""
+        if len(username) < 3:
+            raise ValueError("Username must be at least 3 characters")
+        if len(password) < 8:
+            raise ValueError("Password must be at least 8 characters")
+
+        password_hash = self._hash_password(password)
+        current_time = time.time()
+
+        try:
+            cursor = self.db.cursor()
+            cursor.execute('''
+                INSERT INTO users (username, password_hash, role, created_at)
+                VALUES (?, ?, ?, ?)
+            ''', (username, password_hash, role.value, current_time))
+
+            user_id = cursor.lastrowid
+            self.db.commit()
+
+            logger.info(f"Created user '{username}' with role '{role.value}'")
+            return User(
+                id=user_id,
+                username=username,
+                role=role,
+                created_at=current_time
+            )
+
+        except sqlite3.IntegrityError:
+            raise ValueError(f"Username '{username}' already exists")
+        except Exception as e:
+            logger.error(f"Failed to create user: {e}")
+            raise
+
+    def authenticate_user(self, username: str, password: str) -> Optional[User]:
+        """Authenticate user with username and password"""
+        cursor = self.db.cursor()
+        cursor.execute('''
+            SELECT id, username, password_hash, role, created_at, last_login
+            FROM users WHERE username = ? AND is_active = 1
+        ''', (username,))
+
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        user_id, username, stored_hash, role, created_at, last_login = row
+
+        if not self._verify_password(password, stored_hash):
+            return None
+
+        # Update last login
+        current_time = time.time()
+        cursor.execute('UPDATE users SET last_login = ? WHERE id = ?', (current_time, user_id))
+        self.db.commit()
+
+        return User(
+            id=user_id,
+            username=username,
+            role=UserRole(role),
+            created_at=created_at,
+            last_login=current_time
+        )
+
+    def create_token(self, user: User) -> str:
+        """Create a new authentication token for user"""
+        token = self._generate_token()
+        token_hash = self._hash_token(token)
+        current_time = time.time()
+        expires_at = current_time + (TOKEN_EXPIRY_DAYS * 24 * 3600)
+
+        cursor = self.db.cursor()
+        cursor.execute('''
+            INSERT INTO tokens (token_hash, user_id, created_at, last_used_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (token_hash, user.id, current_time, current_time, expires_at))
+        self.db.commit()
+
+        logger.info(f"Created token for user '{user.username}'")
+        return token
+
+    def validate_token(self, token: str) -> Optional[User]:
+        """Validate token and return associated user if valid"""
+        if not token:
+            return None
+
+        token_hash = self._hash_token(token)
+        current_time = time.time()
+
+        cursor = self.db.cursor()
+        cursor.execute('''
+            SELECT t.user_id, t.expires_at, u.username, u.role, u.created_at, u.last_login
+            FROM tokens t
+            JOIN users u ON t.user_id = u.id
+            WHERE t.token_hash = ? AND t.is_active = 1 AND u.is_active = 1
+        ''', (token_hash,))
+
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        user_id, expires_at, username, role, created_at, last_login = row
+
+        # Check if token has expired
+        if current_time > expires_at:
+            # Deactivate expired token
+            cursor.execute('UPDATE tokens SET is_active = 0 WHERE token_hash = ?', (token_hash,))
+            self.db.commit()
+            return None
+
+        # Update last used time and extend expiration
+        new_expires_at = current_time + (TOKEN_EXPIRY_DAYS * 24 * 3600)
+        cursor.execute('''
+            UPDATE tokens SET last_used_at = ?, expires_at = ? WHERE token_hash = ?
+        ''', (current_time, new_expires_at, token_hash))
+        self.db.commit()
+
+        return User(
+            id=user_id,
+            username=username,
+            role=UserRole(role),
+            created_at=created_at,
+            last_login=last_login
+        )
+
+    def revoke_token(self, token: str) -> bool:
+        """Revoke a specific token"""
+        token_hash = self._hash_token(token)
+        cursor = self.db.cursor()
+        cursor.execute('UPDATE tokens SET is_active = 0 WHERE token_hash = ?', (token_hash,))
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def revoke_user_tokens(self, user_id: int) -> int:
+        """Revoke all tokens for a user"""
+        cursor = self.db.cursor()
+        cursor.execute('UPDATE tokens SET is_active = 0 WHERE user_id = ?', (user_id,))
+        self.db.commit()
+        return cursor.rowcount
+
+    def cleanup_expired_tokens(self):
+        """Remove expired tokens from database"""
+        current_time = time.time()
+        cursor = self.db.cursor()
+        cursor.execute('DELETE FROM tokens WHERE expires_at < ?', (current_time,))
+        deleted = cursor.rowcount
+        self.db.commit()
+        if deleted > 0:
+            logger.info(f"Cleaned up {deleted} expired tokens")
+
+    def get_user_by_id(self, user_id: int) -> Optional[User]:
+        """Get user by ID"""
+        cursor = self.db.cursor()
+        cursor.execute('''
+            SELECT id, username, role, created_at, last_login
+            FROM users WHERE id = ? AND is_active = 1
+        ''', (user_id,))
+
+        row = cursor.fetchone()
+        if row:
+            return User(
+                id=row[0],
+                username=row[1],
+                role=UserRole(row[2]),
+                created_at=row[3],
+                last_login=row[4]
+            )
+        return None
+
+    def list_users(self, include_inactive: bool = False) -> List[User]:
+        """List all users"""
+        cursor = self.db.cursor()
+        query = '''
+            SELECT id, username, role, created_at, last_login
+            FROM users
+        '''
+        if not include_inactive:
+            query += ' WHERE is_active = 1'
+        query += ' ORDER BY created_at'
+
+        cursor.execute(query)
+        users = []
+        for row in cursor.fetchall():
+            users.append(User(
+                id=row[0],
+                username=row[1],
+                role=UserRole(row[2]),
+                created_at=row[3],
+                last_login=row[4]
+            ))
+        return users
+
+    def delete_user(self, user_id: int) -> bool:
+        """Soft delete a user (set inactive)"""
+        cursor = self.db.cursor()
+        cursor.execute('UPDATE users SET is_active = 0 WHERE id = ?', (user_id,))
+
+        # Also revoke all user tokens
+        self.revoke_user_tokens(user_id)
+        self.db.commit()
+
+        return cursor.rowcount > 0
+
+    def change_user_role(self, user_id: int, new_role: UserRole) -> bool:
+        """Change user role"""
+        cursor = self.db.cursor()
+        cursor.execute('UPDATE users SET role = ? WHERE id = ? AND is_active = 1',
+                      (new_role.value, user_id))
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def get_user_builds(self, user_id: int, limit: int = 50) -> List[Dict]:
+        """Get builds created by a specific user"""
+        cursor = self.db.cursor()
+        cursor.execute('''
+            SELECT id, server_url, server_arch, pkgname, status, start_time, end_time, created_at
+            FROM builds
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        ''', (user_id, limit))
+
+        builds = []
+        for row in cursor.fetchall():
+            builds.append({
+                "id": row[0],
+                "server_url": row[1],
+                "server_arch": row[2],
+                "pkgname": row[3],
+                "status": row[4],
+                "start_time": row[5],
+                "end_time": row[6],
+                "created_at": row[7]
+            })
+        return builds
+
+    def can_cancel_build(self, user: User, build_id: str) -> bool:
+        """Check if user can cancel a specific build"""
+        if user.role == UserRole.ADMIN:
+            return True
+
+        # Users can only cancel their own builds
+        cursor = self.db.cursor()
+        cursor.execute('SELECT user_id FROM builds WHERE id = ?', (build_id,))
+        row = cursor.fetchone()
+
+        return row and row[0] == user.id
+
+    def change_password(self, user_id: int, current_password: str, new_password: str) -> bool:
+        """Change user password after verifying current password"""
+        cursor = self.db.cursor()
+        cursor.execute('SELECT password_hash FROM users WHERE id = ? AND is_active = 1', (user_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            return False
+
+        stored_hash = row[0]
+
+        # Verify current password
+        if not self._verify_password(current_password, stored_hash):
+            return False
+
+        # Hash new password
+        new_password_hash = self._hash_password(new_password)
+
+        # Update password
+        cursor.execute('UPDATE users SET password_hash = ? WHERE id = ?', (new_password_hash, user_id))
+        self.db.commit()
+
+        logger.info(f"Password changed for user ID {user_id}")
+        return True
+
+
+# FastAPI Dependencies
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
+    request: Request = None
+) -> Optional[User]:
+    """Get current authenticated user from token (header or cookie)"""
+    global auth_manager
+    if not auth_manager:
+        return None
+
+    token = None
+
+    # Try to get token from Authorization header first
+    if credentials:
+        token = credentials.credentials
+
+    # If no header token, try to get from cookie
+    if not token and request:
+        token = request.cookies.get("authToken")
+
+    if token:
+        user = auth_manager.validate_token(token)
+        return user
+
+    return None
+
+
+async def require_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+) -> User:
+    """Require authentication - raise 401 if not authenticated"""
+    current_user = await get_current_user(credentials, request)
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return current_user
+
+
+async def require_admin(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+) -> User:
+    """Require admin role - raise 403 if not admin"""
+    current_user = await get_current_user(credentials, request)
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+async def get_current_user_optional(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+) -> Optional[User]:
+    """Get current user but don't require authentication"""
+    return await get_current_user(credentials, request)
+
+
+async def cleanup_expired_tokens_task():
+    """Background task to cleanup expired tokens"""
+    global auth_manager
+    while not shutdown_event.is_set():
+        try:
+            if auth_manager:
+                auth_manager.cleanup_expired_tokens()
+            await asyncio.sleep(3600)  # Run every hour
+        except Exception as e:
+            logger.error(f"Error in token cleanup: {e}")
+            await asyncio.sleep(3600)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan events"""
     # Startup
-    global build_database, background_tasks, config
+    global build_database, background_tasks, config, auth_manager
 
     # Load configuration
     config = load_config()
@@ -104,6 +609,9 @@ async def lifespan(app: FastAPI):
     # Initialize database
     build_database = init_database()
 
+    # Initialize authentication
+    auth_manager = AuthManager(build_database)
+
     # Setup HTTP session
     await setup_http_session()
 
@@ -112,7 +620,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(process_build_queue()),
         asyncio.create_task(update_build_status()),
         asyncio.create_task(discover_builds()),
-        asyncio.create_task(handle_unavailable_servers())
+        asyncio.create_task(handle_unavailable_servers()),
+        asyncio.create_task(cleanup_expired_tokens_task())
     ])
 
     logger.info(f"APB Farm started with {len(config.get('servers', {}))} architecture groups")
@@ -680,7 +1189,7 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     build_database.commit()
 
 
-async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None) -> List[Dict]:
+async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None) -> List[Dict]:
     """
     Queue builds for each architecture that has available servers.
     Returns a list of build information dictionaries.
@@ -782,11 +1291,11 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         cursor = build_database.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO builds
-            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             build_id, None, arch, pkgname, BuildStatus.QUEUED,
-            None, None, time.time(), len(build_queue), submission_group
+            None, None, time.time(), len(build_queue), submission_group, user_id
         ))
         build_database.commit()
 
@@ -1191,10 +1700,207 @@ async def handle_unavailable_servers():
             await asyncio.sleep(120)
 
 
+# Authentication Routes
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(login_data: LoginRequest):
+    """Login with username and password"""
+    global auth_manager
+    user = auth_manager.authenticate_user(login_data.username, login_data.password)
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = auth_manager.create_token(user)
+
+    return LoginResponse(
+        token=token,
+        user={
+            "id": user.id,
+            "username": user.username,
+            "role": user.role.value,
+            "created_at": user.created_at,
+            "last_login": user.last_login
+        }
+    )
+
+
+@app.post("/auth/logout")
+async def logout(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+):
+    """Logout current user (revoke current token)"""
+    global auth_manager
+
+    # Get token from header or cookie
+    token = None
+    if credentials:
+        token = credentials.credentials
+    else:
+        token = request.cookies.get("authToken")
+
+    if token and auth_manager:
+        auth_manager.revoke_token(token)
+
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/auth/logout")
+async def logout_get(request: Request):
+    """Browser-friendly logout endpoint"""
+    # For GET requests, just return a message directing to POST
+    # The JavaScript will handle the actual logout
+    return {"message": "Use POST /auth/logout or JavaScript logout() function"}
+
+
+@app.get("/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: User = Depends(require_auth)):
+    """Get current user information"""
+    return UserResponse(
+        id=current_user.id,
+        username=current_user.username,
+        role=current_user.role.value,
+        created_at=current_user.created_at,
+        last_login=current_user.last_login
+    )
+
+
+@app.get("/auth/users", response_model=List[UserResponse])
+async def list_users(current_user: User = Depends(require_admin)):
+    """List all users (admin only)"""
+    global auth_manager
+    users = auth_manager.list_users()
+    return [
+        UserResponse(
+            id=user.id,
+            username=user.username,
+            role=user.role.value,
+            created_at=user.created_at,
+            last_login=user.last_login
+        )
+        for user in users
+    ]
+
+
+@app.post("/auth/users", response_model=UserResponse)
+async def create_user(
+    user_data: CreateUserRequest,
+    current_user: User = Depends(require_admin)
+):
+    """Create a new user (admin only)"""
+    global auth_manager
+    try:
+        role = UserRole(user_data.role)
+        new_user = auth_manager.create_user(user_data.username, user_data.password, role)
+
+        return UserResponse(
+            id=new_user.id,
+            username=new_user.username,
+            role=new_user.role.value,
+            created_at=new_user.created_at,
+            last_login=new_user.last_login
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/auth/users/{user_id}")
+async def delete_user(
+    user_id: int,
+    current_user: User = Depends(require_admin)
+):
+    """Delete a user (admin only)"""
+    global auth_manager
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot delete yourself")
+
+    if auth_manager.delete_user(user_id):
+        return {"message": f"User {user_id} deleted successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="User not found")
+
+
+@app.put("/auth/users/{user_id}/role")
+async def change_user_role(
+    user_id: int,
+    role_data: ChangeRoleRequest,
+    current_user: User = Depends(require_admin)
+):
+    """Change user role (admin only)"""
+    global auth_manager
+    try:
+        new_role = UserRole(role_data.role)
+
+        if auth_manager.change_user_role(user_id, new_role):
+            return {"message": f"User role changed to {new_role.value}"}
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/auth/users/{user_id}/revoke-tokens")
+async def revoke_user_tokens(
+    user_id: int,
+    current_user: User = Depends(require_admin)
+):
+    """Revoke all tokens for a user (admin only)"""
+    global auth_manager
+    count = auth_manager.revoke_user_tokens(user_id)
+    return {"message": f"Revoked {count} tokens for user {user_id}"}
+
+
+@app.get("/auth/users/{user_id}/builds")
+async def get_user_builds(
+    user_id: int,
+    current_user: User = Depends(require_admin),
+    limit: int = 50
+):
+    """Get builds for a specific user (admin only)"""
+    global auth_manager
+    builds = auth_manager.get_user_builds(user_id, limit)
+    return {"builds": builds}
+
+
+@app.put("/auth/change-password")
+async def change_password(
+    password_data: ChangePasswordRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+):
+    """Change current user's password"""
+    global auth_manager
+
+    # Get current user
+    current_user = await get_current_user(credentials, request)
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Validate password confirmation
+    if password_data.new_password != password_data.confirm_password:
+        raise HTTPException(status_code=400, detail="New password and confirmation do not match")
+
+    # Change password
+    success = auth_manager.change_password(
+        current_user.id,
+        password_data.current_password,
+        password_data.new_password
+    )
+
+    if not success:
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    # Revoke all existing tokens for this user (force re-login)
+    auth_manager.revoke_user_tokens(current_user.id)
+
+    return {"message": "Password changed successfully. Please log in again."}
+
+
 # API Endpoints
 
 @app.get("/farm")
-async def get_farm_info():
+async def get_farm_info(current_user: Optional[User] = Depends(get_current_user_optional)):
     """Get farm information and status of all managed servers"""
     servers = []
     available_archs = await get_available_architectures()
@@ -1203,8 +1909,12 @@ async def get_farm_info():
     for arch, server_urls in available_archs.items():
         for server_url in server_urls:
             server_info = await get_server_info(server_url)
+
+            # Obfuscate URLs for non-admin users
+            display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
+
             servers.append({
-                "url": obfuscate_server_url(server_url),
+                "url": display_url,
                 "arch": arch,  # Use actual supported architecture
                 "status": "online" if server_info else "offline",
                 "info": server_info
@@ -1256,7 +1966,9 @@ async def get_farm_info():
         "version": VERSION,
         "servers": servers,
         "available_architectures": list(available_archs.keys()),
-        "total_servers": len(servers)
+        "total_servers": len(servers),
+        "authenticated": current_user is not None,
+        "user_role": current_user.role.value if current_user else "guest"
     }
 
 
@@ -1270,8 +1982,17 @@ async def health_check():
 
 
 @app.post("/build/{build_id}/cancel")
-async def cancel_build(build_id: str):
-    """Cancel a build by forwarding the request to the appropriate server"""
+async def cancel_build(
+    build_id: str,
+    current_user: User = Depends(require_auth)
+):
+    """Cancel a build (users can cancel own builds, admins can cancel any)"""
+    global auth_manager
+
+    # Check permissions
+    if not auth_manager.can_cancel_build(current_user, build_id):
+        raise HTTPException(status_code=403, detail="Not authorized to cancel this build")
+
     server_url = await find_build_server(build_id)
 
     if not server_url:
@@ -1304,7 +2025,7 @@ async def cancel_build(build_id: str):
 
 
 @app.get("/dashboard")
-async def get_dashboard(page: int = Query(1, ge=1)):
+async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User] = Depends(get_current_user_optional)):
     """Get farm dashboard HTML"""
     # Get server status grouped by actual supported architecture
     available_archs = await get_available_architectures()
@@ -1394,7 +2115,27 @@ async def get_dashboard(page: int = Query(1, ge=1)):
             "created_at": safe_timestamp_to_datetime(row[7]) or "unknown"
         })
 
-    # Generate HTML
+    # Generate HTML with authentication UI
+    auth_section = ""
+    if current_user:
+        admin_link = ""
+        if current_user.role == UserRole.ADMIN:
+            admin_link = '<a href="/admin" class="admin-link" title="User Administration">⚙️ Admin</a>'
+
+        auth_section = f"""
+        <div class="auth-section">
+            {admin_link}
+            <span class="auth-user clickable" onclick="showPasswordChangeForm()" title="Click to change password">👤 {current_user.username} ({current_user.role.value})</span>
+            <button onclick="logout()" class="auth-button logout-button">Logout</button>
+        </div>
+        """
+    else:
+        auth_section = """
+        <div class="auth-section">
+            <button onclick="showLoginForm()" class="auth-button login-button">Login</button>
+        </div>
+        """
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -1404,8 +2145,28 @@ async def get_dashboard(page: int = Query(1, ge=1)):
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta http-equiv="refresh" content="10">
         <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            .header {{ text-align: center; margin-bottom: 30px; }}
+            body {{ font-family: Arial, sans-serif; margin: 20px; position: relative; }}
+            .header {{ text-align: center; margin-bottom: 30px; position: relative; }}
+            .auth-section {{ position: absolute; top: 10px; right: 10px; display: flex; align-items: center; gap: 10px; }}
+            .admin-link {{ color: #ffc107; font-weight: bold; text-decoration: none; padding: 5px 8px; border-radius: 3px; background-color: rgba(255, 193, 7, 0.1); }}
+            .admin-link:hover {{ background-color: rgba(255, 193, 7, 0.2); text-decoration: underline; }}
+            .auth-user {{ margin-right: 10px; font-weight: bold; color: #28a745; }}
+            .auth-user.clickable {{ cursor: pointer; text-decoration: underline; }}
+            .auth-user.clickable:hover {{ color: #1e7e34; }}
+            .auth-button {{ padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }}
+            .login-button {{ background-color: #007bff; color: white; }}
+            .login-button:hover {{ background-color: #0056b3; }}
+            .logout-button {{ background-color: #dc3545; color: white; }}
+            .logout-button:hover {{ background-color: #c82333; }}
+            .login-form {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; display: none; }}
+            .login-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; display: none; }}
+            .login-form input {{ display: block; width: 200px; margin: 10px 0; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
+            .login-form button {{ margin: 5px; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }}
+            .login-submit {{ background-color: #28a745; color: white; }}
+            .login-cancel {{ background-color: #6c757d; color: white; }}
+            .error-message {{ color: #dc3545; margin: 10px 0; }}
+            .success-message {{ color: #28a745; margin: 10px 0; font-weight: bold; }}
+            .password-hint {{ color: #6c757d; font-size: 0.9em; margin: 5px 0; }}
             .servers {{ margin-bottom: 30px; }}
             .arch-group {{ margin-bottom: 20px; }}
             .arch-title {{ font-size: 18px; font-weight: bold; margin-bottom: 10px; }}
@@ -1434,7 +2195,35 @@ async def get_dashboard(page: int = Query(1, ge=1)):
         </style>
     </head>
     <body>
+        <div class="login-overlay" id="loginOverlay" onclick="hideLoginForm()"></div>
+        <div class="login-form" id="loginForm">
+            <h3>Login to APB Farm</h3>
+            <form id="loginFormElement" onsubmit="submitLogin(event)">
+                <input type="text" id="username" placeholder="Username" required>
+                <input type="password" id="password" placeholder="Password" required>
+                <div class="error-message" id="loginError"></div>
+                <button type="submit" class="login-submit">Login</button>
+                <button type="button" class="login-cancel" onclick="hideLoginForm()">Cancel</button>
+            </form>
+        </div>
+
+        <div class="login-overlay" id="passwordChangeOverlay" onclick="hidePasswordChangeForm()"></div>
+        <div class="login-form" id="passwordChangeForm">
+            <h3>Change Password</h3>
+            <form id="passwordChangeFormElement" onsubmit="submitPasswordChange(event)">
+                <input type="password" id="currentPassword" placeholder="Current Password" required>
+                <input type="password" id="newPassword" placeholder="New Password (min 8 characters)" required>
+                <input type="password" id="confirmPassword" placeholder="Confirm New Password" required>
+                <div class="password-hint">Password must be at least 8 characters long</div>
+                <div class="error-message" id="passwordChangeError"></div>
+                <div class="success-message" id="passwordChangeSuccess"></div>
+                <button type="submit" class="login-submit">Change Password</button>
+                <button type="button" class="login-cancel" onclick="hidePasswordChangeForm()">Cancel</button>
+            </form>
+        </div>
+
         <div class="header">
+            {auth_section}
             <h1>APB Farm Dashboard</h1>
             <p>Version: {VERSION}</p>
             <p>Available Architectures: {', '.join(available_archs.keys())}</p>
@@ -1516,6 +2305,189 @@ async def get_dashboard(page: int = Query(1, ge=1)):
             <span>Page {page}</span>
             <a href="/dashboard?page={page+1}">Next &raquo;</a>
         </div>
+
+        <script>
+            function showLoginForm() {{
+                document.getElementById('loginOverlay').style.display = 'block';
+                document.getElementById('loginForm').style.display = 'block';
+                document.getElementById('username').focus();
+            }}
+
+            function hideLoginForm() {{
+                document.getElementById('loginOverlay').style.display = 'none';
+                document.getElementById('loginForm').style.display = 'none';
+                document.getElementById('loginError').textContent = '';
+                document.getElementById('loginFormElement').reset();
+            }}
+
+            function showPasswordChangeForm() {{
+                document.getElementById('passwordChangeOverlay').style.display = 'block';
+                document.getElementById('passwordChangeForm').style.display = 'block';
+                document.getElementById('currentPassword').focus();
+            }}
+
+            function hidePasswordChangeForm() {{
+                document.getElementById('passwordChangeOverlay').style.display = 'none';
+                document.getElementById('passwordChangeForm').style.display = 'none';
+                document.getElementById('passwordChangeError').textContent = '';
+                document.getElementById('passwordChangeSuccess').textContent = '';
+                document.getElementById('passwordChangeFormElement').reset();
+            }}
+
+            async function submitLogin(event) {{
+                event.preventDefault();
+
+                const username = document.getElementById('username').value;
+                const password = document.getElementById('password').value;
+                const errorDiv = document.getElementById('loginError');
+
+                try {{
+                    const response = await fetch('/auth/login', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                        }},
+                        body: JSON.stringify({{ username, password }})
+                    }});
+ 
+                    if (response.ok) {{
+                        const data = await response.json();
+                        // Store token in localStorage and cookie
+                        localStorage.setItem('authToken', data.token);
+                        document.cookie = `authToken=${{data.token}}; path=/; max-age=${{data.expires_in_days * 24 * 3600}}; SameSite=Lax`;
+                        // Reload page to show authenticated state
+                        window.location.reload();
+                    }} else {{
+                        const errorData = await response.json();
+                        errorDiv.textContent = errorData.detail || 'Login failed';
+                    }}
+                }} catch (error) {{
+                    errorDiv.textContent = 'Network error. Please try again.';
+                    console.error('Login error:', error);
+                }}
+            }}
+
+            async function submitPasswordChange(event) {{
+                event.preventDefault();
+
+                const currentPassword = document.getElementById('currentPassword').value;
+                const newPassword = document.getElementById('newPassword').value;
+                const confirmPassword = document.getElementById('confirmPassword').value;
+                const errorDiv = document.getElementById('passwordChangeError');
+                const successDiv = document.getElementById('passwordChangeSuccess');
+
+                // Clear previous messages
+                errorDiv.textContent = '';
+                successDiv.textContent = '';
+
+                // Client-side validation
+                if (newPassword !== confirmPassword) {{
+                    errorDiv.textContent = 'New password and confirmation do not match';
+                    return;
+                }}
+
+                if (newPassword.length < 8) {{
+                    errorDiv.textContent = 'New password must be at least 8 characters long';
+                    return;
+                }}
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch('/auth/change-password', {{
+                        method: 'PUT',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: JSON.stringify({{
+                            current_password: currentPassword,
+                            new_password: newPassword,
+                            confirm_password: confirmPassword
+                        }})
+                    }});
+ 
+                    if (response.ok) {{
+                        const data = await response.json();
+                        successDiv.textContent = data.message;
+     
+                        // Auto-logout and redirect to login after 3 seconds
+                        setTimeout(() => {{
+                            localStorage.removeItem('authToken');
+                            document.cookie = 'authToken=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+                            window.location.reload();
+                        }}, 3000);
+                    }} else {{
+                        const errorData = await response.json();
+                        errorDiv.textContent = errorData.detail || 'Password change failed';
+                    }}
+                }} catch (error) {{
+                    errorDiv.textContent = 'Network error. Please try again.';
+                    console.error('Password change error:', error);
+                }}
+            }}
+
+            async function logout() {{
+                try {{
+                    const token = getAuthToken();
+                    if (token) {{
+                        await fetch('/auth/logout', {{
+                            method: 'POST',
+                            headers: {{
+                                'Authorization': `Bearer ${{token}}`
+                            }}
+                        }});
+                    }}
+                }} catch (error) {{
+                    console.error('Logout error:', error);
+                }} finally {{
+                    // Always remove token from localStorage and cookie
+                    localStorage.removeItem('authToken');
+                    document.cookie = 'authToken=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+                    window.location.reload();
+                }}
+            }}
+
+            // Helper function to get auth token from localStorage or cookie
+            function getAuthToken() {{
+                // Try localStorage first
+                let token = localStorage.getItem('authToken');
+                if (token) return token;
+
+                // Fall back to cookie
+                const cookies = document.cookie.split(';');
+                for (let cookie of cookies) {{
+                    const [name, value] = cookie.trim().split('=');
+                    if (name === 'authToken') {{
+                        return value;
+                    }}
+                }}
+                return null;
+            }}
+
+            // Sync token between localStorage and cookie on page load
+            const token = getAuthToken();
+            if (token) {{
+                // Ensure token is in both localStorage and cookie
+                localStorage.setItem('authToken', token);
+                if (!document.cookie.includes('authToken=')) {{
+                    document.cookie = `authToken=${{token}}; path=/; max-age=${{10 * 24 * 3600}}; SameSite=Lax`;
+                }}
+
+                // Add auth header to future requests
+                const originalFetch = window.fetch;
+                window.fetch = function(...args) {{
+                    if (args[1]) {{
+                        args[1].headers = args[1].headers || {{}};
+                        args[1].headers['Authorization'] = `Bearer ${{token}}`;
+                    }} else {{
+                        args[1] = {{
+                            headers: {{ 'Authorization': `Bearer ${{token}}` }}
+                        }};
+                    }}
+                    return originalFetch.apply(this, args);
+                }};
+            }}
+        </script>
     </body>
     </html>
     """
@@ -1527,9 +2499,10 @@ async def get_dashboard(page: int = Query(1, ge=1)):
 async def submit_build(
     pkgbuild: UploadFile = File(...),
     sources: List[UploadFile] = File(default=[]),
-    architectures: str = Form(None)
+    architectures: str = Form(None),
+    current_user: User = Depends(require_auth)  # Require authentication
 ):
-    """Submit a build request"""
+    """Submit a build request (authenticated users only)"""
     try:
         # Read PKGBUILD content
         pkgbuild_content = (await pkgbuild.read()).decode('utf-8')
@@ -1576,7 +2549,7 @@ async def submit_build(
                 })
 
         # Queue builds for each architecture
-        queued_builds = await queue_builds_for_architectures(pkgbuild_content, pkgname, target_archs, source_files)
+        queued_builds = await queue_builds_for_architectures(pkgbuild_content, pkgname, target_archs, source_files, current_user.id)
 
         if not queued_builds:
             # Get available architectures for error message
@@ -2461,6 +3434,320 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
         })
 
     return {"builds": builds}
+
+
+@app.get("/my/builds")
+async def get_my_builds(
+    current_user: User = Depends(require_auth),
+    limit: int = Query(50, ge=1, le=200)
+):
+    """Get builds submitted by current user"""
+    global auth_manager
+    builds = auth_manager.get_user_builds(current_user.id, limit)
+
+    # Add obfuscated server URLs for user display
+    for build in builds:
+        if build["server_url"]:
+            build["server_url"] = obfuscate_server_url(build["server_url"])
+
+    return {"builds": builds}
+
+
+@app.get("/admin")
+async def get_admin_panel(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+):
+    """Admin panel for user management (admin only)"""
+    current_user = await require_admin(request, credentials)
+
+    # Get all users
+    global auth_manager
+    users = auth_manager.list_users()
+
+    # Convert users to dict format for display
+    users_data = []
+    for user in users:
+        users_data.append({
+            "id": user.id,
+            "username": user.username,
+            "role": user.role.value,
+            "created_at": datetime.fromtimestamp(user.created_at).strftime('%Y-%m-%d %H:%M:%S') if user.created_at else 'unknown',
+            "last_login": datetime.fromtimestamp(user.last_login).strftime('%Y-%m-%d %H:%M:%S') if user.last_login else 'never'
+        })
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>APB Farm - Admin Panel</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            .header {{ text-align: center; margin-bottom: 30px; }}
+            .admin-section {{ margin: 20px 0; }}
+            .admin-section h2 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 5px; }}
+            .user-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+            .user-table th, .user-table td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+            .user-table th {{ background-color: #f8f9fa; font-weight: bold; }}
+            .user-table tr:nth-child(even) {{ background-color: #f8f9fa; }}
+            .user-table tr:hover {{ background-color: #e9ecef; }}
+            .action-button {{ padding: 5px 10px; margin: 2px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; }}
+            .edit-button {{ background-color: #ffc107; color: #000; }}
+            .delete-button {{ background-color: #dc3545; color: white; }}
+            .admin-badge {{ background-color: #28a745; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; }}
+            .user-badge {{ background-color: #007bff; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; }}
+            .add-user-form {{ background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }}
+            .add-user-form input, .add-user-form select {{ display: block; width: 200px; margin: 10px 0; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
+            .add-user-form button {{ margin: 5px; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }}
+            .submit-button {{ background-color: #28a745; color: white; }}
+            .cancel-button {{ background-color: #6c757d; color: white; }}
+            .nav-links {{ margin: 20px 0; text-align: center; }}
+            .nav-links a {{ margin: 0 10px; color: #007bff; text-decoration: none; }}
+            .nav-links a:hover {{ text-decoration: underline; }}
+            .error-message {{ color: #dc3545; margin: 10px 0; }}
+            .success-message {{ color: #28a745; margin: 10px 0; font-weight: bold; }}
+            .modal {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; display: none; }}
+            .modal-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; display: none; }}
+        </style>
+    </head>
+    <body>
+        <div class="modal-overlay" id="modalOverlay" onclick="hideModal()"></div>
+        <div class="modal" id="editUserModal">
+            <h3>Edit User</h3>
+            <form id="editUserForm" onsubmit="submitEditUser(event)">
+                <input type="hidden" id="editUserId">
+                <label>Username:</label>
+                <input type="text" id="editUsername" readonly>
+                <label>Role:</label>
+                <select id="editRole" required>
+                    <option value="user">User</option>
+                    <option value="admin">Admin</option>
+                </select>
+                <div class="error-message" id="editError"></div>
+                <div class="success-message" id="editSuccess"></div>
+                <button type="submit" class="submit-button">Update User</button>
+                <button type="button" class="cancel-button" onclick="hideModal()">Cancel</button>
+            </form>
+        </div>
+
+        <div class="header">
+            <h1>APB Farm - Admin Panel</h1>
+            <p>Logged in as: <strong>{current_user.username}</strong> (Admin)</p>
+        </div>
+
+        <div class="nav-links">
+            <a href="/dashboard">🏠 Back to Dashboard</a>
+            <a href="/farm">🌾 Farm Status</a>
+            <a href="/builds/latest">📋 Recent Builds</a>
+        </div>
+
+        <div class="admin-section">
+            <h2>👥 User Management</h2>
+
+            <div class="add-user-form">
+                <h3>Add New User</h3>
+                <form id="addUserForm" onsubmit="submitAddUser(event)">
+                    <label>Username:</label>
+                    <input type="text" id="newUsername" placeholder="Username (min 3 characters)" required>
+                    <label>Password:</label>
+                    <input type="password" id="newPassword" placeholder="Password (min 8 characters)" required>
+                    <label>Role:</label>
+                    <select id="newRole" required>
+                        <option value="user">User</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                    <div class="error-message" id="addError"></div>
+                    <div class="success-message" id="addSuccess"></div>
+                    <button type="submit" class="submit-button">Add User</button>
+                    <button type="button" class="cancel-button" onclick="clearAddForm()">Clear</button>
+                </form>
+            </div>
+
+            <table class="user-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Username</th>
+                        <th>Role</th>
+                        <th>Created</th>
+                        <th>Last Login</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+
+    for user in users_data:
+        role_badge = f'<span class="admin-badge">ADMIN</span>' if user["role"] == "admin" else f'<span class="user-badge">USER</span>'
+        delete_disabled = 'disabled title="Cannot delete yourself"' if user["id"] == current_user.id else ''
+
+        html += f"""
+                    <tr>
+                        <td>{user["id"]}</td>
+                        <td>{user["username"]}</td>
+                        <td>{role_badge}</td>
+                        <td>{user["created_at"]}</td>
+                        <td>{user["last_login"]}</td>
+                        <td>
+                            <button class="action-button edit-button" onclick="editUser({user['id']}, '{user['username']}', '{user['role']}')">Edit</button>
+                            <button class="action-button delete-button" onclick="deleteUser({user['id']}, '{user['username']}')" {delete_disabled}>Delete</button>
+                        </td>
+                    </tr>
+        """
+
+    html += f"""
+                </tbody>
+            </table>
+        </div>
+
+        <script>
+            // Helper function to get auth token
+            function getAuthToken() {{
+                let token = localStorage.getItem('authToken');
+                if (token) return token;
+
+                const cookies = document.cookie.split(';');
+                for (let cookie of cookies) {{
+                    const [name, value] = cookie.trim().split('=');
+                    if (name === 'authToken') {{
+                        return value;
+                    }}
+                }}
+                return null;
+            }}
+
+            function clearAddForm() {{
+                document.getElementById('addUserForm').reset();
+                document.getElementById('addError').textContent = '';
+                document.getElementById('addSuccess').textContent = '';
+            }}
+
+            async function submitAddUser(event) {{
+                event.preventDefault();
+
+                const username = document.getElementById('newUsername').value;
+                const password = document.getElementById('newPassword').value;
+                const role = document.getElementById('newRole').value;
+                const errorDiv = document.getElementById('addError');
+                const successDiv = document.getElementById('addSuccess');
+
+                errorDiv.textContent = '';
+                successDiv.textContent = '';
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch('/auth/users', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: JSON.stringify({{ username, password, role }})
+                    }});
+ 
+                    if (response.ok) {{
+                        const data = await response.json();
+                        successDiv.textContent = `User '${{username}}' created successfully!`;
+                        clearAddForm();
+                        setTimeout(() => window.location.reload(), 2000);
+                    }} else {{
+                        const errorData = await response.json();
+                        errorDiv.textContent = errorData.detail || 'Failed to create user';
+                    }}
+                }} catch (error) {{
+                    errorDiv.textContent = 'Network error. Please try again.';
+                    console.error('Add user error:', error);
+                }}
+            }}
+
+            function editUser(id, username, role) {{
+                document.getElementById('editUserId').value = id;
+                document.getElementById('editUsername').value = username;
+                document.getElementById('editRole').value = role;
+                document.getElementById('editError').textContent = '';
+                document.getElementById('editSuccess').textContent = '';
+
+                document.getElementById('modalOverlay').style.display = 'block';
+                document.getElementById('editUserModal').style.display = 'block';
+            }}
+
+            function hideModal() {{
+                document.getElementById('modalOverlay').style.display = 'none';
+                document.getElementById('editUserModal').style.display = 'none';
+            }}
+
+            async function submitEditUser(event) {{
+                event.preventDefault();
+
+                const userId = document.getElementById('editUserId').value;
+                const role = document.getElementById('editRole').value;
+                const errorDiv = document.getElementById('editError');
+                const successDiv = document.getElementById('editSuccess');
+
+                errorDiv.textContent = '';
+                successDiv.textContent = '';
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch(`/auth/users/${{userId}}/role`, {{
+                        method: 'PUT',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: JSON.stringify({{ role }})
+                    }});
+ 
+                    if (response.ok) {{
+                        successDiv.textContent = 'User role updated successfully!';
+                        setTimeout(() => {{
+                            hideModal();
+                            window.location.reload();
+                        }}, 1500);
+                    }} else {{
+                        const errorData = await response.json();
+                        errorDiv.textContent = errorData.detail || 'Failed to update user';
+                    }}
+                }} catch (error) {{
+                    errorDiv.textContent = 'Network error. Please try again.';
+                    console.error('Edit user error:', error);
+                }}
+            }}
+
+            async function deleteUser(id, username) {{
+                if (!confirm(`Are you sure you want to delete user '${{username}}'? This action cannot be undone.`)) {{
+                    return;
+                }}
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch(`/auth/users/${{id}}`, {{
+                        method: 'DELETE',
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }}
+                    }});
+ 
+                    if (response.ok) {{
+                        alert(`User '${{username}}' deleted successfully!`);
+                        window.location.reload();
+                    }} else {{
+                        const errorData = await response.json();
+                        alert(`Failed to delete user: ${{errorData.detail || 'Unknown error'}}`);
+                    }}
+                }} catch (error) {{
+                    alert('Network error. Please try again.');
+                    console.error('Delete user error:', error);
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=html)
 
 
 async def setup_http_session():

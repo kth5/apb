@@ -10,6 +10,7 @@ import sys
 import time
 import threading
 import queue
+import getpass
 from pathlib import Path
 from typing import Dict, List, Optional, Generator, Any
 from urllib.parse import urljoin
@@ -265,13 +266,174 @@ def get_architectures_needing_build(pkgbuild_path: Path, output_dir: Path, force
     return architectures_needing_build
 
 
+class APBAuthClient:
+    """Handles authentication for APB client"""
+
+    def __init__(self, farm_url: str, config_path: Optional[Path] = None):
+        self.farm_url = farm_url.rstrip('/')
+        self.config_path = config_path or Path.home() / ".apb" / "auth.json"
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self._token = None
+        self._load_token()
+
+    def _load_token(self):
+        """Load stored token from config file"""
+        try:
+            if self.config_path.exists():
+                with open(self.config_path, 'r') as f:
+                    data = json.load(f)
+                    farm_tokens = data.get('tokens', {})
+                    self._token = farm_tokens.get(self.farm_url)
+        except Exception as e:
+            print(f"Warning: Could not load stored token: {e}")
+
+    def _save_token(self, token: str):
+        """Save token to config file"""
+        try:
+            # Load existing config
+            config = {}
+            if self.config_path.exists():
+                with open(self.config_path, 'r') as f:
+                    config = json.load(f)
+
+            # Update token for this farm
+            if 'tokens' not in config:
+                config['tokens'] = {}
+            config['tokens'][self.farm_url] = token
+
+            # Save config
+            with open(self.config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+
+            # Set restrictive permissions
+            self.config_path.chmod(0o600)
+            self._token = token
+
+        except Exception as e:
+            print(f"Warning: Could not save token: {e}")
+
+    def _clear_token(self):
+        """Clear stored token"""
+        try:
+            if self.config_path.exists():
+                with open(self.config_path, 'r') as f:
+                    config = json.load(f)
+
+                if 'tokens' in config and self.farm_url in config['tokens']:
+                    del config['tokens'][self.farm_url]
+
+                    with open(self.config_path, 'w') as f:
+                        json.dump(config, f, indent=2)
+
+            self._token = None
+        except Exception as e:
+            print(f"Warning: Could not clear token: {e}")
+
+    def login(self, username: str, password: str) -> bool:
+        """Login with username and password"""
+        try:
+            response = requests.post(
+                f"{self.farm_url}/auth/login",
+                json={"username": username, "password": password},
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                token = data.get('token')
+                if token:
+                    self._save_token(token)
+                    print(f"Successfully logged in as {username}")
+                    return True
+            else:
+                try:
+                    error_data = response.json()
+                    print(f"Login failed: {error_data.get('detail', 'Unknown error')}")
+                except:
+                    print(f"Login failed: HTTP {response.status_code}")
+                return False
+
+        except Exception as e:
+            print(f"Login error: {e}")
+            return False
+
+    def logout(self) -> bool:
+        """Logout (revoke current token)"""
+        if not self._token:
+            return True
+
+        try:
+            response = requests.post(
+                f"{self.farm_url}/auth/logout",
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=30
+            )
+
+            # Clear token regardless of response
+            self._clear_token()
+
+            if response.status_code == 200:
+                print("Successfully logged out")
+                return True
+            else:
+                print(f"Logout response: HTTP {response.status_code}")
+                return True  # Still consider it successful since we cleared local token
+
+        except Exception as e:
+            print(f"Logout error: {e}")
+            self._clear_token()  # Clear local token anyway
+            return True
+
+    def get_auth_headers(self) -> Dict[str, str]:
+        """Get authentication headers for requests"""
+        if self._token:
+            return {"Authorization": f"Bearer {self._token}"}
+        return {}
+
+    def is_authenticated(self) -> bool:
+        """Check if we have a stored token"""
+        return self._token is not None
+
+    def get_user_info(self) -> Optional[Dict[str, Any]]:
+        """Get current user information"""
+        if not self._token:
+            return None
+
+        try:
+            response = requests.get(
+                f"{self.farm_url}/auth/me",
+                headers=self.get_auth_headers(),
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 401:
+                # Token is invalid, clear it
+                self._clear_token()
+                return None
+            else:
+                print(f"Failed to get user info: HTTP {response.status_code}")
+                return None
+
+        except Exception as e:
+            print(f"Error getting user info: {e}")
+            return None
+
+
 class APBotClient:
     """Main client class for interacting with APB servers."""
 
-    def __init__(self, server_url: str):
-        """Initialize APBotClient with server URL."""
+    def __init__(self, server_url: str, auth_client: Optional[APBAuthClient] = None):
+        """Initialize APBotClient with server URL and optional authentication."""
         self.server_url = server_url.rstrip('/')
         self.session = requests.Session()
+        self.auth_client = auth_client
+
+        # Set authentication headers if available
+        if self.auth_client:
+            headers = self.auth_client.get_auth_headers()
+            self.session.headers.update(headers)
 
     def build_package(self, files: List[Path]) -> str:
         """
@@ -604,7 +766,7 @@ def load_config(config_path: Optional[Path] = None) -> Dict:
     }
 
 
-def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path]) -> Optional[str]:
+def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path], auth_client: Optional[APBAuthClient] = None) -> Optional[str]:
     """
     Submit a build to a server with automatic server selection.
 
@@ -612,19 +774,20 @@ def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path])
         server_url: Server URL
         pkgbuild_path: Path to PKGBUILD file
         source_files: List of source files
+        auth_client: Optional authentication client
 
     Returns:
         Build ID if successful, None otherwise
     """
     try:
-        client = APBotClient(server_url)
+        client = APBotClient(server_url, auth_client)
         files = [pkgbuild_path] + source_files
         return client.build_package(files)
     except requests.RequestException:
         return None
 
 
-def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: List[Path], architectures: List[str] = None) -> Optional[Dict]:
+def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: List[Path], architectures: List[str] = None, auth_client: Optional[APBAuthClient] = None) -> Optional[Dict]:
     """
     Submit a build to a farm server and return the full response.
 
@@ -633,12 +796,13 @@ def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: Lis
         pkgbuild_path: Path to PKGBUILD file
         source_files: List of source files
         architectures: Optional list of architectures to build for
+        auth_client: Optional authentication client for farm access
 
     Returns:
         Full response dictionary if successful, None otherwise
     """
     try:
-        client = APBotClient(server_url)
+        client = APBotClient(server_url, auth_client)
         files = [pkgbuild_path] + source_files
 
         # Prepare files for upload
@@ -671,13 +835,20 @@ def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: Lis
             try:
                 error_detail = e.response.json()
                 print(f"Farm error response: {error_detail}")
+                # Handle authentication errors specifically
+                if e.response.status_code == 401:
+                    print("Authentication required. Please login first using: apb --farm --login")
+                elif e.response.status_code == 403:
+                    print("Access denied. You may not have permission to submit builds.")
             except:
                 print(f"Farm HTTP {e.response.status_code} response: {e.response.text}")
+                if e.response.status_code == 401:
+                    print("Authentication required. Please login first using: apb --farm --login")
         return None
 
 
 def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Path = None,
-                       verbose: bool = False, pkgbuild_path: Path = None) -> bool:
+                       verbose: bool = False, pkgbuild_path: Path = None, auth_client: Optional[APBAuthClient] = None) -> bool:
     """
     Monitor multiple builds from a farm submission.
 
@@ -1181,7 +1352,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
 
 def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                             verbose: bool = False, detach: bool = False,
-                            specific_arch: str = None, force: bool = False) -> bool:
+                            specific_arch: str = None, force: bool = False, auth_client: Optional[APBAuthClient] = None) -> bool:
     """
     Build a package for multiple architectures using available servers.
 
@@ -1286,7 +1457,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                 if verbose:
                     print(f"[{arch}] Submitting build to {server_url}...")
 
-                build_id = submit_build(server_url, pkgbuild_path, source_files)
+                build_id = submit_build(server_url, pkgbuild_path, source_files, auth_client)
                 if build_id:
                     print(f"[{arch}] Build submitted: {build_id}")
                     arch_build_info[arch] = {
@@ -1340,7 +1511,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
             continue
 
         try:
-            client = APBotClient(info['server_url'])
+            client = APBotClient(info['server_url'], auth_client)
             # For "any" architecture, download to "any" subdirectory
             if arch == "any":
                 arch_output_dir = output_dir / "any"
@@ -1371,7 +1542,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
             for remaining_arch, remaining_info in arch_build_info.items():
                 if remaining_info['build_id'] and remaining_info.get('status') not in ['completed', 'failed', 'cancelled']:
                     try:
-                        remaining_client = APBotClient(remaining_info['server_url'])
+                        remaining_client = APBotClient(remaining_info['server_url'], auth_client)
                         if remaining_client.cancel_build(remaining_info['build_id']):
                             print(f"[{remaining_arch}] Build cancelled successfully")
                             arch_build_info[remaining_arch]['status'] = 'cancelled'
@@ -1428,6 +1599,12 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--quiet", action="store_true", help="Suppress output except errors")
 
+    # Authentication options
+    parser.add_argument("--login", action="store_true", help="Login to farm")
+    parser.add_argument("--logout", action="store_true", help="Logout from farm")
+    parser.add_argument("--auth-status", action="store_true", help="Show authentication status")
+    parser.add_argument("--username", type=str, help="Username for login")
+
     # Build options
     parser.add_argument("--output-dir", type=Path, default=Path("./output"),
                        help="Output directory for downloaded files")
@@ -1463,7 +1640,70 @@ def main():
     else:
         server_url = config.get("default_server", "http://localhost:8000")
 
-    client = APBotClient(server_url)
+    # Setup authentication for farm connections
+    auth_client = None
+    if args.farm or server_url == config.get("farm_url"):
+        auth_client = APBAuthClient(server_url)
+    elif any([args.login, args.logout, args.auth_status]) and config.get("farm_url"):
+        # For auth operations, automatically use farm_url from config even if --farm wasn't specified
+        farm_url = config.get("farm_url")
+        auth_client = APBAuthClient(farm_url)
+        # Update server_url to match for consistency in auth operations
+        server_url = farm_url
+
+    # Handle authentication operations
+    if args.login:
+        if not auth_client:
+            print("Error: Login is only supported for farm connections.")
+            print("Either use --farm flag or configure farm_url in your apb.json file.")
+            sys.exit(1)
+
+        username = args.username or input("Username: ")
+        password = getpass.getpass("Password: ")
+
+        if auth_client.login(username, password):
+            print("Login successful!")
+            # Show user info
+            user_info = auth_client.get_user_info()
+            if user_info:
+                print(f"Logged in as: {user_info['username']} ({user_info['role']})")
+        else:
+            print("Login failed!")
+            sys.exit(1)
+        sys.exit(0)
+
+    if args.logout:
+        if not auth_client:
+            print("Error: Logout is only supported for farm connections.")
+            print("Either use --farm flag or configure farm_url in your apb.json file.")
+            sys.exit(1)
+
+        if auth_client.logout():
+            print("Logout successful!")
+        else:
+            print("Logout failed!")
+        sys.exit(0)
+
+    if args.auth_status:
+        if not auth_client:
+            print("Authentication is only supported for farm connections.")
+            print("Either use --farm flag or configure farm_url in your apb.json file.")
+            sys.exit(0)
+
+        if auth_client.is_authenticated():
+            user_info = auth_client.get_user_info()
+            if user_info:
+                print(f"Authenticated as: {user_info['username']} ({user_info['role']})")
+                print(f"Farm URL: {server_url}")
+            else:
+                print("Authentication token is invalid")
+        else:
+            print("Not authenticated")
+            print(f"Farm URL: {server_url}")
+            print("Use --login to authenticate")
+        sys.exit(0)
+
+    client = APBotClient(server_url, auth_client)
 
     # Handle monitoring operations
     if args.monitor:
@@ -1662,7 +1902,7 @@ def main():
 
             if args.farm:
                 # Handle farm submission with multiple architectures
-                response = submit_build_to_farm(server_url, pkgbuild_path, source_files, architectures_needing_build)
+                response = submit_build_to_farm(server_url, pkgbuild_path, source_files, architectures_needing_build, auth_client)
                 if response:
                     if 'builds' in response and response['builds']:
                         # Multi-architecture farm response
@@ -1684,7 +1924,7 @@ def main():
                                 output_dir = args.output_dir
 
                             try:
-                                success = monitor_farm_builds(builds, client, output_dir, args.verbose, pkgbuild_path)
+                                success = monitor_farm_builds(builds, client, output_dir, args.verbose, pkgbuild_path, auth_client)
                                 sys.exit(0 if success else 1)
                             except KeyboardInterrupt:
                                 print("\nBuilds interrupted by user")
@@ -1740,7 +1980,7 @@ def main():
                     sys.exit(1)
             else:
                 # Handle direct server submission (single architecture)
-                build_id = submit_build(server_url, pkgbuild_path, source_files)
+                build_id = submit_build(server_url, pkgbuild_path, source_files, auth_client)
                 if build_id:
                     print(f"Build submitted: {build_id}")
 
@@ -1780,7 +2020,7 @@ def main():
                 # Single architecture build
                 success = build_for_multiple_arches(
                     build_path, args.output_dir, config,
-                    args.verbose, args.detach, architectures[0], args.force
+                    args.verbose, args.detach, architectures[0], args.force, auth_client
                 )
             else:
                 # Multiple architectures - build sequentially
@@ -1791,7 +2031,7 @@ def main():
                     print(f"{'='*50}")
                     arch_success = build_for_multiple_arches(
                         build_path, args.output_dir, config,
-                        args.verbose, args.detach, arch, args.force
+                        args.verbose, args.detach, arch, args.force, auth_client
                     )
                     success = success and arch_success
                     if not arch_success:
@@ -1799,7 +2039,7 @@ def main():
         else:
             success = build_for_multiple_arches(
                 build_path, args.output_dir, config,
-                args.verbose, args.detach, None, args.force
+                args.verbose, args.detach, None, args.force, auth_client
             )
     except KeyboardInterrupt:
         print("\nBuilds interrupted by user")

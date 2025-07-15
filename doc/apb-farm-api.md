@@ -7,7 +7,60 @@ The APB Farm is a proxy service that manages multiple APB Servers, automatically
 - Configurable via `--host` and `--port` command line arguments
 
 ## Authentication
-Currently, the APB Farm does not implement authentication. All endpoints are publicly accessible.
+
+The APB Farm implements a comprehensive token-based authentication system with role-based access control. Authentication is required for build submissions and certain administrative operations.
+
+### Authentication Overview
+
+- **Token-based**: Uses secure Bearer tokens for authentication
+- **Role-based Access Control**: Three user roles with different permissions
+- **Secure Storage**: Passwords hashed with PBKDF2, tokens stored securely
+- **Token Management**: Automatic expiration, renewal, and cleanup
+- **Default Admin**: Creates default admin user on first startup
+
+### User Roles
+
+#### Guest (Unauthenticated Users)
+- View dashboard and farm status
+- View public build information (with obfuscated server URLs)
+- No build submission capabilities
+
+#### User (Regular Users)
+- All guest permissions
+- Submit builds to the farm
+- Cancel own builds
+- View own build history via `/my/builds`
+- Access authenticated endpoints
+
+#### Admin (Administrators)
+- All user permissions
+- Cancel any user's builds
+- View unobfuscated server URLs
+- Complete user management (create, delete, change roles)
+- Access to user build histories
+- Revoke user tokens
+
+### Authentication Flow
+
+1. **Registration**: Admins create user accounts with username/password
+2. **Login**: Users authenticate with credentials to receive token
+3. **Token Usage**: Include token in `Authorization: Bearer <token>` header
+4. **Auto-renewal**: Tokens automatically renewed on use (10-day expiration)
+5. **Logout**: Explicitly revoke tokens when done
+
+### Default Admin Account
+
+On first startup, the farm creates a default admin account:
+- **Username**: `admin`
+- **Password**: `admin123`
+- **⚠️ SECURITY WARNING**: Change this password immediately after first login!
+
+### Token Security
+
+- **Expiration**: 10-day expiration with automatic renewal on use
+- **Secure Hashing**: SHA-256 hashing for token storage
+- **Background Cleanup**: Expired tokens automatically removed every hour
+- **Revocation**: Individual token or all user tokens can be revoked
 
 ## Content Types
 - **Request**: `multipart/form-data` for file uploads, `application/json` for JSON requests
@@ -103,6 +156,9 @@ Each server maintains:
 #### GET /farm
 Get farm information and status of all managed servers.
 
+**Request Headers:**
+- `Authorization: Bearer <token>` (optional)
+
 **Response:**
 ```json
 {
@@ -110,7 +166,7 @@ Get farm information and status of all managed servers.
   "version": "2025-07-15",
   "servers": [
     {
-      "url": "ser---1",
+      "url": "http://server1.example.com:8000",
       "arch": "x86_64",
       "status": "online",
       "info": {
@@ -120,25 +176,21 @@ Get farm information and status of all managed servers.
           "current_builds_count": 1,
           "queued_builds": 2,
           "max_concurrent_builds": 3
-        },
-        "current_build": {
-          "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-          "pkgname": "example-package",
-          "status": "building"
         }
       }
-    },
-    {
-      "url": "ser---2",
-      "arch": "x86_64",
-      "status": "offline",
-      "info": null
     }
   ],
   "available_architectures": ["x86_64", "powerpc64le"],
-  "total_servers": 2
+  "total_servers": 2,
+  "authenticated": true,
+  "user_role": "user"
 }
 ```
+
+**Authentication Impact:**
+- **Guest**: Server URLs are obfuscated (e.g., `ser---1`)
+- **User/Admin**: Different levels of server information visibility
+- **Admin**: Full server URLs and detailed information
 
 #### GET /health
 Health check endpoint for the farm.
@@ -186,23 +238,19 @@ Get the farm dashboard (HTML page) showing all servers, their current builds, an
 ### Build Management
 
 #### POST /build
-Submit a build request to the farm, which will automatically select the best server.
+Submit a build request to the farm (Authentication Required).
+
+**Request Headers:**
+- `Authorization: Bearer <token>` (required)
 
 **Request:**
 - **Content-Type:** `multipart/form-data`
 - **Parameters:**
   - `pkgbuild` (file, required): The PKGBUILD file
   - `sources` (file[], optional): Additional source files
-  - `architectures` (string, optional): Comma-separated list of target architectures to filter
+  - `architectures` (string, optional): Comma-separated list of target architectures
 
-**Multi-Architecture Processing:**
-1. Parse PKGBUILD to determine required architecture(s)
-2. Check available server architectures
-3. Create separate builds for each available architecture
-4. Generate unique build IDs for each architecture-specific build
-5. Queue builds with submission group tracking
-
-**Response:**
+**Enhanced Response:**
 ```json
 {
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -210,7 +258,6 @@ Submit a build request to the farm, which will automatically select the best ser
   "message": "Queued 2 build(s) for processing",
   "pkgname": "example-package",
   "target_architectures": ["x86_64", "powerpc64le"],
-  "pkgbuild_architectures": ["x86_64", "powerpc64le", "aarch64"],
   "builds": [
     {
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -219,24 +266,22 @@ Submit a build request to the farm, which will automatically select the best ser
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0
-    },
-    {
-      "build_id": "7b2c8f1e-9d4a-4567-8901-2345678abcde",
-      "arch": "powerpc64le",
-      "status": "queued",
-      "pkgname": "example-package",
-      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
-      "created_at": 1642694400.0
     }
   ],
   "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
-  "queue_status": {
-    "queue_size": 3,
-    "builds_queued": 2
-  },
+  "user_id": 2,
   "created_at": 1642694400.0
 }
 ```
+
+**Authentication Changes:**
+- **Required**: All build submissions require authentication
+- **User Tracking**: Builds are associated with the submitting user
+- **Permission Checking**: Users can only cancel their own builds (admins can cancel any)
+
+**Error Responses:**
+- **401 Unauthorized**: Authentication required
+- **403 Forbidden**: Insufficient permissions
 
 **Architecture Filtering:**
 If `architectures` parameter is provided, only those architectures will be built (if they exist in the PKGBUILD and have available servers).
@@ -265,6 +310,447 @@ When no servers are available for the requested architectures:
   "pkgbuild_architectures": ["powerpc", "riscv64", "x86_64"]
 }
 ```
+
+#### GET /build/{build_id}/status
+Get build status. Returns HTML page by default, JSON if `format=json` is specified.
+
+**Parameters:**
+- `build_id` (string, required): The build ID
+- `format` (string, optional): Response format (`json` or `html`)
+
+**Enhanced Error Handling:**
+- **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
+- **Build Not Found**: If build was never submitted through farm, provides detailed error message
+- **Submission Failed**: If build failed during submission before server assignment
+
+**Response (HTML):**
+Forwards to the appropriate server's build status page, or displays cached information with server availability warnings.
+
+**Response (JSON):**
+```json
+{
+  "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+  "pkgname": "example-package",
+  "status": "completed",
+  "start_time": 1642694400.0,
+  "end_time": 1642694500.0,
+  "duration": 100.0,
+  "server_url": "ser---1",
+  "server_arch": "x86_64",
+  "packages": [...],
+  "logs": [...],
+  "server_unavailable": false,
+  "last_status_update": 1642694500.0
+}
+```
+
+**Server Unavailable Response:**
+```json
+{
+  "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+  "pkgname": "example-package",
+  "status": "building",
+  "server_unavailable": true,
+  "last_status_update": 1642694450.0,
+  "server_url": "ser---1",
+  "error_message": "Server unavailable: Connection timeout"
+}
+```
+
+**Note:** Server URLs are obfuscated in responses for security (e.g., `server1.example.com` → `ser---1`).
+
+#### GET /build/{build_id}/status-api
+Get build status as JSON (alias for `/build/{build_id}/status?format=json`).
+
+**Parameters:**
+- `build_id` (string, required): The build ID
+
+**Response:** Same as `/build/{build_id}/status` with `format=json`.
+
+#### POST /build/{build_id}/cancel
+Cancel a build with permission checking.
+
+**Request Headers:**
+- `Authorization: Bearer <token>` (required)
+
+**Parameters:**
+- `build_id` (string, required): Build ID
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Build 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3 cancelled successfully",
+  "server_response": {
+    "success": true,
+    "message": "Build cancelled successfully"
+  }
+}
+```
+
+**Permission Rules:**
+- **Users**: Can cancel only their own builds
+- **Admins**: Can cancel any user's builds
+
+**Error Responses:**
+- **401 Unauthorized**: Authentication required
+- **403 Forbidden**: Not authorized to cancel this build
+
+#### GET /build/{build_id}/output
+Get build output/logs by forwarding to the appropriate server.
+
+**Parameters:**
+- `build_id` (string, required): Build UUID
+- `start_index` (integer, optional): Starting line index (default: 0)
+- `limit` (integer, optional): Maximum number of lines (default: 50)
+
+**Response:**
+```json
+{
+  "output": [
+    "==> Making package: example-package 1.0.0-1 (x86_64)",
+    "==> Checking runtime dependencies...",
+    "==> Installing missing dependencies...",
+    "==> Starting build()...",
+    "==> Build completed successfully"
+  ],
+  "total_lines": 150,
+  "start_index": 0,
+  "returned_lines": 50
+}
+```
+
+#### GET /build/{build_id}/stream
+Stream build output in real-time by forwarding to the appropriate server.
+
+**Parameters:**
+- `build_id` (string, required): Build UUID
+
+**Response:**
+- **Content-Type:** `text/event-stream`
+- Forwards Server-Sent Events from the target server
+- Handles server unavailability with appropriate error responses
+
+---
+
+### File Downloads
+
+#### GET /build/{build_id}/download/{filename}
+Download a build artifact by forwarding to the appropriate server.
+
+**Parameters:**
+- `build_id` (string, required): Build UUID
+- `filename` (string, required): The filename to download
+
+**Response:** Binary file content with appropriate headers.
+
+**Error Handling:**
+- Automatically retries up to 3 times on connection errors
+- Handles server unavailability with detailed error messages
+- Returns 404 if file not found on any server
+- Returns 503 if connection to servers fails
+
+---
+
+### Build History
+
+#### GET /builds/latest
+Get the latest builds across all managed servers.
+
+**Parameters:**
+- `limit` (integer, optional): Maximum number of builds (default: 20, max: 100)
+- `status` (string, optional): Filter by status
+
+**Response:**
+```json
+{
+  "builds": [
+    {
+      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "server_url": "ser---1",
+      "server_arch": "x86_64",
+      "pkgname": "example-package",
+      "status": "completed",
+      "start_time": "2024-01-20 10:00:00 UTC",
+      "end_time": "2024-01-20 10:05:00 UTC",
+      "created_at": "2024-01-20 10:00:00 UTC"
+    }
+  ]
+}
+```
+
+#### GET /my/builds
+Get builds submitted by the current authenticated user.
+
+**Request Headers:**
+- `Authorization: Bearer <token>` (required)
+
+**Parameters:**
+- `limit` (integer, optional): Maximum builds to return (default: 50, max: 200)
+
+**Response:**
+```json
+{
+  "builds": [
+    {
+      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "server_url": "ser---1",
+      "server_arch": "x86_64",
+      "pkgname": "example-package",
+      "status": "completed",
+      "start_time": 1642694400.0,
+      "end_time": 1642694500.0,
+      "created_at": 1642694400.0
+    }
+  ]
+}
+```
+
+**Note:** Server URLs are obfuscated for regular users in this endpoint.
+
+---
+
+## Authentication Endpoints
+
+### POST /auth/login
+Authenticate user and receive access token.
+
+**Request:**
+```json
+{
+  "username": "your_username",
+  "password": "your_password"
+}
+```
+
+**Response:**
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "user": {
+    "id": 1,
+    "username": "your_username",
+    "role": "user",
+    "created_at": 1642694400.0,
+    "last_login": 1642694400.0
+  },
+  "expires_in_days": 10
+}
+```
+
+**Error Responses:**
+- **401 Unauthorized**: Invalid username or password
+
+**Usage Example:**
+```bash
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "myuser", "password": "mypassword"}'
+```
+
+### POST /auth/logout
+Logout and revoke current authentication token.
+
+**Request Headers:**
+- `Authorization: Bearer <token>` (required)
+
+**Response:**
+```json
+{
+  "message": "Logged out successfully"
+}
+```
+
+**Note:** This revokes only the current token. User can have multiple active tokens from different sessions.
+
+### GET /auth/me
+Get current authenticated user information.
+
+**Request Headers:**
+- `Authorization: Bearer <token>` (required)
+
+**Response:**
+```json
+{
+  "id": 1,
+  "username": "your_username",
+  "role": "user",
+  "created_at": 1642694400.0,
+  "last_login": 1642694400.0
+}
+```
+
+**Error Responses:**
+- **401 Unauthorized**: Invalid or expired token
+
+---
+
+## User Management Endpoints (Admin Only)
+
+### GET /auth/users
+List all users in the system.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Response:**
+```json
+[
+  {
+    "id": 1,
+    "username": "admin",
+    "role": "admin",
+    "created_at": 1642694400.0,
+    "last_login": 1642694400.0
+  },
+  {
+    "id": 2,
+    "username": "user1",
+    "role": "user",
+    "created_at": 1642694500.0,
+    "last_login": 1642694600.0
+  }
+]
+```
+
+**Error Responses:**
+- **401 Unauthorized**: Authentication required
+- **403 Forbidden**: Admin access required
+
+### POST /auth/users
+Create a new user account.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Request:**
+```json
+{
+  "username": "newuser",
+  "password": "securepassword123",
+  "role": "user"
+}
+```
+
+**Response:**
+```json
+{
+  "id": 3,
+  "username": "newuser",
+  "role": "user",
+  "created_at": 1642694700.0,
+  "last_login": null
+}
+```
+
+**Validation Rules:**
+- Username: 3-50 characters, unique
+- Password: 8-100 characters minimum
+- Role: "user" or "admin"
+
+**Error Responses:**
+- **400 Bad Request**: Invalid username, password, or role
+- **401 Unauthorized**: Authentication required
+- **403 Forbidden**: Admin access required
+
+### DELETE /auth/users/{user_id}
+Delete a user account (soft delete - marks as inactive).
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Parameters:**
+- `user_id` (integer): User ID to delete
+
+**Response:**
+```json
+{
+  "message": "User 3 deleted successfully"
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: Cannot delete yourself
+- **401 Unauthorized**: Authentication required
+- **403 Forbidden**: Admin access required
+- **404 Not Found**: User not found
+
+**Note:** This performs a soft delete (marks user as inactive) and revokes all user tokens.
+
+### PUT /auth/users/{user_id}/role
+Change user role.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Parameters:**
+- `user_id` (integer): User ID to modify
+
+**Request:**
+```json
+{
+  "role": "admin"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "User role changed to admin"
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: Invalid role
+- **401 Unauthorized**: Authentication required
+- **403 Forbidden**: Admin access required
+- **404 Not Found**: User not found
+
+### POST /auth/users/{user_id}/revoke-tokens
+Revoke all authentication tokens for a user.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Parameters:**
+- `user_id` (integer): User ID
+
+**Response:**
+```json
+{
+  "message": "Revoked 3 tokens for user 2"
+}
+```
+
+### GET /auth/users/{user_id}/builds
+Get build history for a specific user.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Parameters:**
+- `user_id` (integer): User ID
+- `limit` (integer, optional): Maximum builds to return (default: 50)
+
+**Response:**
+```json
+{
+  "builds": [
+    {
+      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "server_url": "http://server1.example.com:8000",
+      "server_arch": "x86_64",
+      "pkgname": "example-package",
+      "status": "completed",
+      "start_time": 1642694400.0,
+      "end_time": 1642694500.0,
+      "created_at": 1642694400.0
+    }
+  ]
+}
+```
+
+
 
 #### GET /build/{build_id}/status
 Get build status. Returns HTML page by default, JSON if `format=json` is specified.
@@ -463,6 +949,53 @@ CREATE TABLE builds (
 
 ---
 
+## Authentication Database Schema
+
+The farm authentication system uses the following database tables:
+
+### Users Table
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,           -- PBKDF2-hashed password
+    role TEXT NOT NULL DEFAULT 'user',     -- 'user' or 'admin'
+    created_at REAL NOT NULL,              -- Unix timestamp
+    last_login REAL,                       -- Unix timestamp
+    is_active BOOLEAN DEFAULT 1            -- Soft delete flag
+);
+```
+
+### Tokens Table
+```sql
+CREATE TABLE tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash TEXT UNIQUE NOT NULL,       -- SHA-256 hashed token
+    user_id INTEGER NOT NULL,              -- Foreign key to users.id
+    created_at REAL NOT NULL,              -- Unix timestamp
+    last_used_at REAL NOT NULL,            -- Unix timestamp
+    expires_at REAL NOT NULL,              -- Unix timestamp
+    is_active BOOLEAN DEFAULT 1,           -- Token active flag
+    FOREIGN KEY (user_id) REFERENCES users (id)
+);
+```
+
+### Enhanced Builds Table
+The existing builds table has been extended with user tracking:
+```sql
+ALTER TABLE builds ADD COLUMN user_id INTEGER;  -- Links builds to users
+CREATE INDEX idx_builds_user ON builds(user_id);
+```
+
+### Security Features
+
+- **Password Security**: PBKDF2 with 100,000 iterations and random salt
+- **Token Security**: SHA-256 hashing for storage, secure random generation
+- **Database Indexes**: Optimized for authentication performance
+- **Automatic Cleanup**: Background task removes expired tokens every hour
+
+---
+
 ## Background Tasks
 
 The farm runs several background tasks for maintaining system health:
@@ -622,3 +1155,36 @@ The farm searches for configuration files in this order:
 - Farm-level health status
 - Automatic server discovery and recovery
 - Enhanced error reporting and diagnostics
+
+---
+
+## Migration and Compatibility
+
+### Backward Compatibility
+
+- **Existing Endpoints**: All existing endpoints remain functional
+- **Guest Access**: Unauthenticated users can still view dashboard and public information
+- **API Compatibility**: No breaking changes to existing API contracts
+
+### Migration Path
+
+1. **Install Updated Farm**: Deploy new farm version with authentication
+2. **Default Admin**: Use default admin account (admin/admin123) for initial setup
+3. **Create Users**: Create user accounts for team members
+4. **Update Clients**: Update client configurations with authentication
+5. **Security Hardening**: Change default admin password, configure HTTPS
+
+### Environment-Specific Deployment
+
+#### Development
+```bash
+# Use default settings with HTTP
+apb-farm.py --host localhost --port 8080
+```
+
+#### Production
+```bash
+# Use HTTPS reverse proxy, secure settings
+apb-farm.py --host 0.0.0.0 --port 8080
+# Configure nginx/apache for HTTPS termination
+```

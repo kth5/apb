@@ -7,7 +7,30 @@ The APB Server is the core component that handles package building requests and 
 - Configurable via `--host` and `--port` command line arguments
 
 ## Authentication
-Currently, the APB Server does not implement authentication. All endpoints are publicly accessible.
+
+The APB Server itself does not implement authentication. All server endpoints are publicly accessible. However, when used in conjunction with APB Farm, authentication is handled at the farm level:
+
+### APB Farm Integration
+
+- **Farm Authentication**: APB Farm implements comprehensive authentication and forwards authenticated requests to servers
+- **No Direct Client Authentication**: Clients authenticate with the farm, not individual servers
+- **Server Trust**: Servers trust requests forwarded from the farm (farm acts as authentication proxy)
+- **Build Ownership**: The farm tracks which user submitted each build and enforces permissions
+
+### Security Model
+
+- **Farm as Gateway**: All authenticated client requests go through the farm
+- **Server Isolation**: Individual servers remain publicly accessible but are typically deployed behind firewalls
+- **Authentication Proxy**: Farm acts as an authentication proxy for multiple servers
+- **Permission Enforcement**: Build cancellation and access control enforced at farm level
+
+### Deployment Recommendations
+
+For production deployments:
+- Deploy servers behind firewall/VPN accessible only to farm
+- Use APB Farm as the public-facing authentication gateway
+- Configure servers to accept requests only from farm instances
+- Monitor server access logs for unauthorized direct access attempts
 
 ## Content Types
 - **Request**: `multipart/form-data` for file uploads, `application/json` for JSON requests
