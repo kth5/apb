@@ -627,6 +627,8 @@ async def get_best_server_for_arch(target_archs: List[str]) -> Optional[str]:
         current_builds = queue_status.get("current_builds_count", 0)
         queued_builds = queue_status.get("queued_builds", 0)
         max_concurrent = queue_status.get("max_concurrent_builds", 3)
+        server_busy_with_buildroot = queue_status.get("server_busy_with_buildroot", False)
+        buildroot_recreation_count = queue_status.get("buildroot_recreation_count", 0)
 
         # Skip if server is at capacity
         if current_builds >= max_concurrent:
@@ -638,6 +640,12 @@ async def get_best_server_for_arch(target_archs: List[str]) -> Optional[str]:
         # Add penalty for degraded servers (prefer healthy servers)
         if status and status.health == ServerHealth.DEGRADED:
             score += 5  # Penalty to prefer healthy servers
+
+        # Add significant penalty for servers doing buildroot recreation
+        # This encourages the farm to use other servers while buildroot recreation is happening
+        if server_busy_with_buildroot:
+            score += 20  # Large penalty to prefer servers not doing buildroot recreation
+            logger.debug(f"Server {server_url} is busy with buildroot recreation ({buildroot_recreation_count} builds), adding penalty")
 
         if score < best_score:
             best_score = score
@@ -1445,9 +1453,15 @@ async def get_dashboard(page: int = Query(1, ge=1)):
         for server in servers:
             status_class = "online" if server["status"] == "online" else ("misconfigured" if arch == "misconfigured" else "offline")
             queue_info = ""
+            buildroot_info = ""
             if server["info"]:
                 queue_status = server["info"].get("queue_status", {})
                 queue_info = f" - Builds: {queue_status.get('current_builds_count', 0)}, Queued: {queue_status.get('queued_builds', 0)}"
+
+                # Add buildroot recreation information
+                if queue_status.get("server_busy_with_buildroot", False):
+                    buildroot_count = queue_status.get("buildroot_recreation_count", 0)
+                    buildroot_info = f" - <span style='color: #ff8c00; font-weight: bold;'>🔨 Buildroot Recreation ({buildroot_count})</span>"
 
             # Show currently running builds
             current_builds_html = ""
@@ -1467,7 +1481,7 @@ async def get_dashboard(page: int = Query(1, ge=1)):
 
             html += f"""
                 <div class="server {status_class}">
-                    <strong>{server['url']}</strong> ({server['status']}){queue_info}
+                    <strong>{server['url']}</strong> ({server['status']}){queue_info}{buildroot_info}
                     {current_builds_html}
                 </div>
             """

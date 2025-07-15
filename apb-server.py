@@ -65,6 +65,7 @@ server_config = {}
 shutdown_event = threading.Event()
 build_counter = 0  # Counter for buildroot recreation
 running_processes: Dict[str, subprocess.Popen] = {}  # Track running build processes
+buildroot_recreation_builds: Dict[str, bool] = {}  # Track builds doing buildroot recreation
 
 # Resource monitoring
 resource_monitor_thread = None
@@ -92,14 +93,33 @@ async def lifespan(app: FastAPI):
     logger.info("APB Server shutting down...")
     shutdown_event.set()
 
-    # Cancel running builds
+    # Cancel running builds with appropriate timeouts
     for build_id, process in running_processes.items():
         try:
-            logger.info(f"Terminating build process {build_id}")
+            is_buildroot_recreation = buildroot_recreation_builds.get(build_id, False)
+            termination_timeout = 300 if is_buildroot_recreation else 10
+
+            if is_buildroot_recreation:
+                logger.info(f"Terminating build process {build_id} (buildroot recreation) - allowing {termination_timeout}s for graceful shutdown")
+            else:
+                logger.info(f"Terminating build process {build_id}")
+
             process.terminate()
-            process.wait(timeout=10)
+            process.wait(timeout=termination_timeout)
+        except subprocess.TimeoutExpired:
+            if is_buildroot_recreation:
+                logger.warning(f"Build {build_id} (buildroot recreation) did not terminate gracefully within {termination_timeout}s during shutdown, forcing kill")
+            else:
+                logger.warning(f"Build {build_id} did not terminate gracefully within {termination_timeout}s during shutdown, forcing kill")
+            try:
+                process.kill()
+            except:
+                pass
         except Exception as e:
-            logger.error(f"Error terminating build {build_id}: {e}")
+            if "timed out" in str(e).lower() and is_buildroot_recreation:
+                logger.warning(f"Expected timeout during shutdown for buildroot recreation build {build_id}: {e}")
+            else:
+                logger.error(f"Error terminating build {build_id} during shutdown: {e}")
             try:
                 process.kill()
             except:
@@ -308,12 +328,32 @@ def terminate_build(build_id: str):
     try:
         if build_id in running_processes:
             process = running_processes[build_id]
+
+            # Check if this build is doing buildroot recreation
+            is_buildroot_recreation = buildroot_recreation_builds.get(build_id, False)
+
+            # Use longer timeout for buildroot recreation (5 minutes vs 10 seconds)
+            termination_timeout = 300 if is_buildroot_recreation else 10
+
             process.terminate()
             try:
-                process.wait(timeout=10)
+                process.wait(timeout=termination_timeout)
+                if is_buildroot_recreation:
+                    logger.info(f"Build {build_id} (buildroot recreation) terminated gracefully after SIGTERM")
+                else:
+                    logger.info(f"Build {build_id} terminated gracefully after SIGTERM")
             except subprocess.TimeoutExpired:
+                # For buildroot recreation, this is somewhat expected and shouldn't be an ERROR
+                if is_buildroot_recreation:
+                    logger.warning(f"Build {build_id} (buildroot recreation) did not respond to SIGTERM within {termination_timeout}s, sending SIGKILL")
+                else:
+                    logger.warning(f"Build {build_id} did not respond to SIGTERM within {termination_timeout}s, sending SIGKILL")
                 process.kill()
+
             del running_processes[build_id]
+            # Clean up buildroot recreation tracking
+            if build_id in buildroot_recreation_builds:
+                del buildroot_recreation_builds[build_id]
 
         if build_id in active_builds:
             active_builds[build_id]["status"] = BuildStatus.CANCELLED
@@ -330,7 +370,15 @@ def terminate_build(build_id: str):
         logger.info(f"Build {build_id} terminated successfully")
 
     except Exception as e:
-        logger.error(f"Error terminating build {build_id}: {e}")
+        # Use appropriate log level based on the type of error
+        if "timed out" in str(e).lower() and buildroot_recreation_builds.get(build_id, False):
+            logger.warning(f"Expected timeout during buildroot recreation for build {build_id}: {e}")
+        else:
+            logger.error(f"Error terminating build {build_id}: {e}")
+
+        # Clean up tracking even on error
+        if build_id in buildroot_recreation_builds:
+            del buildroot_recreation_builds[build_id]
 
 
 def get_system_info() -> Dict[str, Any]:
@@ -439,17 +487,29 @@ def get_queue_status() -> Dict[str, Any]:
     current_builds = len([b for b in active_builds.values() if b["status"] == BuildStatus.BUILDING])
     queued_builds = len([b for b in active_builds.values() if b["status"] == BuildStatus.QUEUED])
 
+    # Count builds doing buildroot recreation
+    buildroot_recreation_count = len(buildroot_recreation_builds)
+
     # Get current build info
     current_build = None
+    buildroot_recreation_builds_info = []
+
     for build_id, build_info in active_builds.items():
         if build_info["status"] == BuildStatus.BUILDING:
-            current_build = {
+            is_buildroot_recreation = build_id in buildroot_recreation_builds
+            build_details = {
                 "build_id": build_id,
                 "pkgname": build_info.get("pkgname", "unknown"),
                 "status": "building",
-                "start_time": build_info.get("start_time", time.time())
+                "start_time": build_info.get("start_time", time.time()),
+                "buildroot_recreation": is_buildroot_recreation
             }
-            break
+
+            if not current_build:
+                current_build = build_details
+
+            if is_buildroot_recreation:
+                buildroot_recreation_builds_info.append(build_details)
 
     return {
         "current_builds_count": current_builds,
@@ -457,7 +517,10 @@ def get_queue_status() -> Dict[str, Any]:
         "max_concurrent_builds": server_config.get("max_concurrent", DEFAULT_MAX_CONCURRENT),
         "current_build": current_build,
         "total_active_builds": len(active_builds),
-        "build_history_count": len(build_history)
+        "build_history_count": len(build_history),
+        "buildroot_recreation_count": buildroot_recreation_count,
+        "buildroot_recreation_builds": buildroot_recreation_builds_info,
+        "server_busy_with_buildroot": buildroot_recreation_count > 0
     }
 
 
@@ -725,6 +788,8 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any])
 
         # Recreate buildroot if needed
         if should_recreate:
+            # Mark this build as doing buildroot recreation
+            buildroot_recreation_builds[build_id] = True
             log_output("Removing existing buildroot for recreation")
             try:
                 root_path = buildroot_path / "root"
@@ -748,6 +813,11 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any])
                 log_output(f"Warning: Could not recreate buildroot: {e}")
                 log_output("Continuing with existing buildroot")
                 build_counter = 0  # Reset counter to avoid immediate retry
+            finally:
+                # Clear buildroot recreation flag
+                if build_id in buildroot_recreation_builds:
+                    del buildroot_recreation_builds[build_id]
+                log_output("Buildroot recreation phase completed, proceeding with package build")
 
         # Get makepkg config
         makepkg_config = get_makepkg_config()
@@ -1800,7 +1870,6 @@ def main():
             workers=1,  # Explicit single worker
             timeout_keep_alive=60,  # Keep connections alive longer
             access_log=True if args.debug else False,
-            limit_max_requests=1000,  # Restart worker after 1000 requests to prevent memory leaks
             limit_concurrency=100  # Limit concurrent connections
         )
     except KeyboardInterrupt:
