@@ -364,8 +364,7 @@ async def get_server_info(server_url: str) -> Optional[Dict]:
     max_retries = 2  # Reduced from 3 to 2
     for attempt in range(max_retries):
         try:
-            # Reduced timeout to prevent blocking (was 30 seconds, now 8 seconds)
-            timeout = aiohttp.ClientTimeout(total=8, connect=3)
+            timeout = aiohttp.ClientTimeout(total=10, connect=3)
 
             async with http_session.get(f"{server_url}/", timeout=timeout) as response:
                 if response.status == 200:
@@ -1965,7 +1964,7 @@ async def download_file(build_id: str, filename: str):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=30) as response:
+            async with http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300) as response:
                 if response.status == 200:
                     content = await response.read()
                     return StreamingResponse(
