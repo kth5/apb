@@ -1470,7 +1470,7 @@ async def get_dashboard(page: int = Query(1, ge=1)):
                     start_time = build["start_time"] or "unknown"
                     current_builds_html += f"""
                         <li>
-                            <a href="/build/{build['id']}/status" target="_blank">{build['pkgname']}</a>
+                            <a href="/build/{build['id']}/status">{build['pkgname']}</a>
                             <small>(started: {start_time})</small>
                         </li>
                     """
@@ -1503,7 +1503,7 @@ async def get_dashboard(page: int = Query(1, ge=1)):
                 <small>Created: {build['created_at']}</small>
                 <br>
                 <small>
-                    <a href="/build/{build['id']}/status" target="_blank">📋 View Details & Logs</a>
+                    <a href="/build/{build['id']}/status">📋 View Details & Logs</a>
                 </small>
             </div>
         """
