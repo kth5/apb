@@ -1473,7 +1473,7 @@ def main():
             # Try to get architecture from build status or use command line arg or default
             try:
                 status = client.get_build_status(args.monitor)
-                status_arch = status.get('arch')
+                status_arch = status.get('server_arch') or status.get('arch')
                 if isinstance(status_arch, list):
                     status_arch = status_arch[0] if status_arch else None
                 build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch", "powerpc64le")
@@ -1495,12 +1495,12 @@ def main():
             downloaded_files = []
 
             # Determine architecture for output directory
-            # Try to get arch from status, command line arg, or use default
-            status_arch = status.get('arch')
+            # Try to get arch from status (prefer server_arch for farm builds), command line arg, or use default
+            status_arch = status.get('server_arch') or status.get('arch')
             if isinstance(status_arch, list):
                 status_arch = status_arch[0] if status_arch else None
 
-            build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch", "x86_64")
+            build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch")
             arch_output_dir = args.output_dir / build_arch
 
             # Download packages (for successful builds)
@@ -1641,7 +1641,7 @@ def main():
             # For direct server submissions, use original logic
             target_arch = args.arch if args.arch and ',' not in args.arch else None
             if not target_arch:
-                target_arch = config.get("default_arch", "x86_64")
+                target_arch = config.get("default_arch")
 
             # Check if package already exists (unless force is specified)
             should_skip, reason = should_skip_build(args.output_dir, pkgbuild_path, target_arch, args.force)
@@ -1717,7 +1717,7 @@ def main():
                                 output_dir = None
                                 if not args.no_download:
                                     # Determine architecture for output directory (use first needed architecture)
-                                    build_arch = architectures_needing_build[0] if architectures_needing_build else config.get("default_arch", "x86_64")
+                                    build_arch = architectures_needing_build[0] if architectures_needing_build else config.get("default_arch")
                                     output_dir = args.output_dir / build_arch
 
                                 try:
@@ -1752,7 +1752,7 @@ def main():
                         output_dir = None
                         if not args.no_download:
                             # Determine architecture for output directory
-                            build_arch = target_arch or config.get("default_arch", "x86_64")
+                            build_arch = target_arch or config.get("default_arch")
                             output_dir = args.output_dir / build_arch
 
                         try:

@@ -1679,6 +1679,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 build_status["server_unavailable"] = True
                 build_status["last_status_update"] = last_status_update
                 build_status["server_url"] = obfuscate_server_url(server_url)
+                build_status["server_arch"] = server_arch  # Add architecture from farm database
 
                 if format == "json":
                     return build_status
@@ -1739,6 +1740,10 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 if response.status == 200:
                     build_status = await response.json()
                     build_status["server_url"] = obfuscate_server_url(server_url)
+                    if server_arch:
+                        build_status["server_arch"] = server_arch  # Add architecture from farm database
+                    else:
+                        logger.warning(f"server_arch is None/empty for build {build_id}")
 
                     # Update our cache with the latest status
                     cursor = build_database.cursor()
@@ -1771,6 +1776,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     build_status["server_unavailable"] = True
                     build_status["last_status_update"] = result[1]
                     build_status["server_url"] = obfuscate_server_url(server_url)
+                    build_status["server_arch"] = result[2]  # Add architecture from database result
                     build_status["error_message"] = f"Server unavailable: {str(e)}"
                     return build_status
                 except json.JSONDecodeError:
