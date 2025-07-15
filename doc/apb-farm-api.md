@@ -66,6 +66,34 @@ Example scenario:
 - Available servers support: `x86_64`, `powerpc64le`
 - Result: Builds queued for `x86_64` and `powerpc64le` only, `aarch64` skipped
 
+## Server Health Monitoring
+
+The farm implements sophisticated server health tracking with the following states:
+
+### Health States
+
+- **HEALTHY**: Server is responding normally and available for builds
+- **DEGRADED**: Server has experienced failures but is still operational (reduced priority)
+- **UNAVAILABLE**: Server is temporarily unreachable but may recover
+- **MISCONFIGURED**: Server has persistent issues and should be investigated
+
+### Health Tracking Logic
+
+- Servers are marked as DEGRADED after 5 consecutive failures
+- Servers are marked as SEVERELY DEGRADED after 15 consecutive failures
+- HTTP 502 errors are treated specially as they often indicate busy servers
+- Architecture mismatches between configuration and server reports are tracked
+- Cached server information is used during temporary outages
+
+### Server Status Tracking
+
+Each server maintains:
+- Last successful contact timestamp
+- Last failed contact timestamp
+- Consecutive failure count
+- Last known architecture
+- Cached response data for fallback during outages
+
 ---
 
 ## Endpoints
@@ -79,14 +107,14 @@ Get farm information and status of all managed servers.
 ```json
 {
   "status": "running",
-  "version": "2025-07-11",
+  "version": "2025-07-15",
   "servers": [
     {
       "url": "ser---1",
       "arch": "x86_64",
       "status": "online",
       "info": {
-        "version": "2025-07-11",
+        "version": "2025-07-15",
         "supported_architecture": "x86_64",
         "queue_status": {
           "current_builds_count": 1,
@@ -119,20 +147,39 @@ Health check endpoint for the farm.
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-11"
+  "version": "2025-07-15"
 }
 ```
 
 #### GET /dashboard
-Get the farm dashboard (HTML page) showing all servers and recent builds.
+Get the farm dashboard (HTML page) showing all servers, their current builds, and recent build history.
 
 **Parameters:**
 - `page` (integer, optional): Page number for build history pagination (default: 1)
 
 **Response:** HTML page with:
-- Server status grouped by architecture
-- Recent builds across all servers
-- Pagination controls
+- **Server Status by Architecture**: Shows each server grouped by architecture
+- **Currently Running Builds**: Displays up to 3 currently building packages per server with:
+  - Package name (clickable link to build details)
+  - Build start time
+  - "... and X more" indicator if more than 3 builds are running
+- **Server Health Information**: Visual indicators for server status (online/offline/misconfigured)
+- **Queue Information**: Current and queued build counts per server
+- **Recent Build History**: Paginated list of recent builds across all servers
+- **Auto-refresh**: Page refreshes every 10 seconds for real-time updates
+
+**Dashboard Features:**
+- **Real-time Status**: Shows live server health and build activity
+- **Build Monitoring**: Direct links to build status pages for active builds
+- **Architecture Grouping**: Servers organized by their actual supported architecture
+- **Degraded Server Handling**: Special display for servers with health issues
+- **Responsive Design**: Mobile-friendly layout with proper styling
+
+**CSS Styling includes:**
+- Color-coded server status (green=online, red=offline, yellow=misconfigured)
+- Styled running builds section with blue accent border
+- Responsive build history with status-based color coding
+- Pagination controls for build history navigation
 
 ---
 
@@ -146,29 +193,60 @@ Submit a build request to the farm, which will automatically select the best ser
 - **Parameters:**
   - `pkgbuild` (file, required): The PKGBUILD file
   - `sources` (file[], optional): Additional source files
+  - `architectures` (string, optional): Comma-separated list of target architectures to filter
 
-**Queue-based Processing:**
+**Multi-Architecture Processing:**
 1. Parse PKGBUILD to determine required architecture(s)
-2. Generate unique UUID build ID and queue the build
-3. Background process redistributes queued builds to available servers
-4. Builds are assigned to servers based on availability and architecture compatibility
-5. Farm passes its build ID to the server, ensuring consistent tracking across the system
+2. Check available server architectures
+3. Create separate builds for each available architecture
+4. Generate unique build IDs for each architecture-specific build
+5. Queue builds with submission group tracking
 
 **Response:**
 ```json
 {
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
   "status": "queued",
-  "message": "Build has been queued for processing",
+  "message": "Queued 2 build(s) for processing",
   "pkgname": "example-package",
-  "target_architectures": ["x86_64"],
+  "target_architectures": ["x86_64", "powerpc64le"],
+  "pkgbuild_architectures": ["x86_64", "powerpc64le", "aarch64"],
+  "builds": [
+    {
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "arch": "x86_64",
+      "status": "queued",
+      "pkgname": "example-package",
+      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
+      "created_at": 1642694400.0
+    },
+    {
+      "build_id": "7b2c8f1e-9d4a-4567-8901-2345678abcde",
+      "arch": "powerpc64le",
+      "status": "queued",
+      "pkgname": "example-package",
+      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
+      "created_at": 1642694400.0
+    }
+  ],
+  "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
   "queue_status": {
     "queue_size": 3,
-    "position": 3
+    "builds_queued": 2
   },
   "created_at": 1642694400.0
 }
 ```
+
+**Architecture Filtering:**
+If `architectures` parameter is provided, only those architectures will be built (if they exist in the PKGBUILD and have available servers).
+
+**Queue-based Processing:**
+1. Builds are queued immediately and processed by background tasks
+2. Background process redistributes queued builds to available servers
+3. Builds are assigned to servers based on availability and architecture compatibility
+4. Farm passes its build ID to the server, ensuring consistent tracking
+5. Retry logic with exponential backoff for failed submissions
 
 **Error Responses:**
 - **503 Service Unavailable**: No suitable server available
@@ -195,8 +273,13 @@ Get build status. Returns HTML page by default, JSON if `format=json` is specifi
 - `build_id` (string, required): The build ID
 - `format` (string, optional): Response format (`json` or `html`)
 
-**Response (HTML):** 
-Forwards to the appropriate server's build status page.
+**Enhanced Error Handling:**
+- **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
+- **Build Not Found**: If build was never submitted through farm, provides detailed error message
+- **Submission Failed**: If build failed during submission before server assignment
+
+**Response (HTML):**
+Forwards to the appropriate server's build status page, or displays cached information with server availability warnings.
 
 **Response (JSON):**
 ```json
@@ -210,7 +293,22 @@ Forwards to the appropriate server's build status page.
   "server_url": "ser---1",
   "server_arch": "x86_64",
   "packages": [...],
-  "logs": [...]
+  "logs": [...],
+  "server_unavailable": false,
+  "last_status_update": 1642694500.0
+}
+```
+
+**Server Unavailable Response:**
+```json
+{
+  "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+  "pkgname": "example-package",
+  "status": "building",
+  "server_unavailable": true,
+  "last_status_update": 1642694450.0,
+  "server_url": "ser---1",
+  "error_message": "Server unavailable: Connection timeout"
 }
 ```
 
@@ -223,6 +321,29 @@ Get build status as JSON (alias for `/build/{build_id}/status?format=json`).
 - `build_id` (string, required): The build ID
 
 **Response:** Same as `/build/{build_id}/status` with `format=json`.
+
+#### POST /build/{build_id}/cancel
+Cancel a build by forwarding the request to the appropriate server.
+
+**Parameters:**
+- `build_id` (string, required): The build ID
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Build 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3 cancelled successfully",
+  "server_response": {
+    "success": true,
+    "message": "Build cancelled successfully"
+  }
+}
+```
+
+**Enhanced Error Handling:**
+- Handles server unavailability gracefully
+- Updates local database when cancellation succeeds
+- Provides detailed error messages for troubleshooting
 
 #### GET /build/{build_id}/output
 Get build output/logs by forwarding to the appropriate server.
@@ -254,9 +375,10 @@ Stream build output in real-time by forwarding to the appropriate server.
 **Parameters:**
 - `build_id` (string, required): Build UUID
 
-**Response:** 
+**Response:**
 - **Content-Type:** `text/event-stream`
 - Forwards Server-Sent Events from the target server
+- Handles server unavailability with appropriate error responses
 
 ---
 
@@ -273,6 +395,7 @@ Download a build artifact by forwarding to the appropriate server.
 
 **Error Handling:**
 - Automatically retries up to 3 times on connection errors
+- Handles server unavailability with detailed error messages
 - Returns 404 if file not found on any server
 - Returns 503 if connection to servers fails
 
@@ -284,7 +407,7 @@ Download a build artifact by forwarding to the appropriate server.
 Get the latest builds across all managed servers.
 
 **Parameters:**
-- `limit` (integer, optional): Maximum number of builds (default: 20)
+- `limit` (integer, optional): Maximum number of builds (default: 20, max: 100)
 - `status` (string, optional): Filter by status
 
 **Response:**
@@ -307,77 +430,75 @@ Get the latest builds across all managed servers.
 
 ---
 
-### Server Discovery
+## Build Database Schema
 
-The farm automatically discovers and tracks builds from all configured servers. It maintains a local database of build history and continuously monitors server status.
+The farm maintains a SQLite database with comprehensive build tracking:
 
-**Server Information Caching:**
-- Server information is cached for 60 seconds
-- Background tasks refresh server status every 60 seconds
-- Build status is checked every 120 seconds
+### Builds Table Schema
+```sql
+CREATE TABLE builds (
+    id TEXT PRIMARY KEY,                -- Build UUID
+    server_url TEXT,                   -- Assigned server URL
+    server_arch TEXT,                  -- Target architecture
+    pkgname TEXT,                      -- Package name
+    status TEXT,                       -- Current build status
+    start_time REAL,                   -- Build start timestamp
+    end_time REAL,                     -- Build completion timestamp
+    created_at REAL,                   -- Submission timestamp
+    queue_position INTEGER,            -- Position in queue when submitted
+    submission_group TEXT,             -- Group ID for related builds
+    last_known_status TEXT,            -- Last known status from server
+    last_status_update REAL,           -- Last status check timestamp
+    server_available BOOLEAN DEFAULT 1, -- Server availability flag
+    cached_response TEXT               -- Cached server response (JSON)
+);
+```
 
-**Build Discovery:**
-- Periodically discovers new builds from all servers
-- Maintains a local database of all builds
-- Tracks build status changes automatically
+### Database Features
+- **Build Tracking**: Complete history of all builds across all servers
+- **Server Availability**: Tracks which servers are currently available
+- **Status Caching**: Caches server responses for offline access
+- **Submission Grouping**: Links related builds from same PKGBUILD submission
+- **Queue Management**: Tracks build queue positions and timing
 
 ---
 
-## Build ID Management
+## Background Tasks
 
-The APB Farm implements a unified build ID system to ensure consistent tracking across the entire system:
+The farm runs several background tasks for maintaining system health:
 
-### Build ID Generation
-- **Farm Build ID**: Generated as a UUID (e.g., `25733701-5546-41bc-957d-d76bbaa09f15`)
-- **Server Build ID**: Previously generated by servers, now uses the same ID as the farm
-- **Database Tracking**: Farm maintains mapping between farm and server build IDs for backwards compatibility
+### Process Build Queue
+- **Frequency**: Continuous with 5-second intervals
+- **Function**: Processes queued builds and assigns them to available servers
+- **Features**:
+  - Exponential backoff retry logic
+  - Server availability checking
+  - Load balancing across servers
+  - Architecture compatibility validation
 
-### Build ID Consistency
-- When the farm forwards a build to a server, it provides its build ID
-- The server uses the farm's build ID instead of generating its own
-- This ensures that clients can use the same build ID for all operations:
-  - Status checking
-  - Build cancellation
-  - File downloads
-  - Output streaming
+### Update Build Status
+- **Frequency**: Every 120 seconds
+- **Function**: Updates status for all active builds
+- **Features**:
+  - Concurrent status checking for performance
+  - Error isolation to prevent one failure from blocking others
+  - Database updates with comprehensive status information
 
-### Legacy Build Support
-- Builds created before the ID unification are still supported
-- Legacy builds where farm and server IDs differ are handled automatically
-- The system maintains backward compatibility with existing builds
+### Discover Builds
+- **Frequency**: Every 300 seconds
+- **Function**: Discovers builds directly submitted to servers
+- **Features**:
+  - Automatic discovery of builds not submitted through farm
+  - Database synchronization with server build lists
+  - Historical build data collection
 
-### Example Build ID Flow
-```
-1. Client submits build to farm
-2. Farm generates UUID: 25733701-5546-41bc-957d-d76bbaa09f15
-3. Farm queues build with this ID
-4. Farm forwards build to server with build_id parameter
-5. Server uses farm's ID instead of generating own
-6. Client can use 25733701-5546-41bc-957d-d76bbaa09f15 for:
-   - Status checking: GET /build/25733701-5546-41bc-957d-d76bbaa09f15/status
-   - Cancellation: POST /build/25733701-5546-41bc-957d-d76bbaa09f15/cancel
-   - Downloads: GET /build/25733701-5546-41bc-957d-d76bbaa09f15/download/file.pkg.tar.xz
-```
-
-## Architecture-Specific Routing
-
-The farm uses a queue-based system to intelligently distribute builds based on the PKGBUILD architecture field:
-
-### Architecture Types
-- **`any`**: Can be built on any architecture - queued for assignment to any available server
-- **Specific architecture** (e.g., `x86_64`, `aarch64`): Queued for assignment to servers of that architecture
-- **Multiple architectures**: Queued for assignment to servers supporting any of the specified architectures
-
-### Server Assignment Priority (Background Process)
-1. **Available servers**: Servers that report as available for new builds
-2. **Idle servers**: No current builds and empty queue
-3. **Lowest load**: Server with minimal current builds + queued builds
-4. **Online status**: Only online servers are considered
-
-### Queue Management
-- Builds are processed in FIFO order
-- Failed assignments are retried up to 3 times with 30-second delays
-- Queue status is continuously monitored and updated
+### Handle Unavailable Servers
+- **Frequency**: Every 120 seconds
+- **Function**: Manages builds on servers that become unavailable
+- **Features**:
+  - Detects builds on unavailable servers
+  - Attempts final status updates before marking as lost
+  - Automatically fails builds on servers unavailable for >30 minutes
 
 ---
 
@@ -388,7 +509,7 @@ The farm provides robust error handling and fallback mechanisms:
 ### HTTP Status Codes
 - **200 OK**: Request successful
 - **404 Not Found**: Build not found on any server
-- **503 Service Unavailable**: 
+- **503 Service Unavailable**:
   - No suitable server available for architecture
   - All servers for architecture are offline
   - Connection errors to servers
@@ -403,9 +524,16 @@ The farm provides robust error handling and fallback mechanisms:
 ```
 
 ### Fallback Mechanisms
-- If build not found in farm database, searches all configured servers
-- Automatic retry with exponential backoff for server connections
-- Graceful degradation when servers are unavailable
+- **Cached Responses**: Uses cached data when servers are temporarily unavailable
+- **Automatic Retry**: Exponential backoff for server connections
+- **Graceful Degradation**: Continues operation when some servers are unavailable
+- **Health Recovery**: Automatically detects when servers come back online
+
+### Server Unavailability Handling
+- **Temporary Outages**: Uses cached status information
+- **Extended Outages**: Marks builds as failed after 30 minutes
+- **Partial Failures**: Continues serving available servers while others recover
+- **Error Isolation**: Server failures don't affect other servers or farm operation
 
 ---
 
@@ -414,14 +542,16 @@ The farm provides robust error handling and fallback mechanisms:
 The farm provides real-time monitoring of builds across all servers:
 
 ### Background Tasks
-- **Server Status Refresh**: Every 60 seconds
-- **Build Status Updates**: Every 120 seconds
-- **Build Discovery**: Continuously discovers new builds
+- **Server Status Refresh**: Every 90 seconds with enhanced caching
+- **Build Status Updates**: Every 120 seconds with concurrent processing
+- **Build Discovery**: Every 300 seconds across all servers
+- **Server Health Monitoring**: Continuous with failure tracking
 
 ### Dashboard Updates
-- Auto-refresh every 10 seconds when viewing active builds
-- Collapsible architecture sections with session state persistence
-- Real-time build status indicators
+- **Auto-refresh**: Every 10 seconds when viewing active builds
+- **Live Build Display**: Shows currently running builds per server
+- **Real-time Status**: Updates build and server status indicators
+- **Health Indicators**: Visual feedback for server health states
 
 ---
 
@@ -430,8 +560,9 @@ The farm provides real-time monitoring of builds across all servers:
 ### Configuration File Locations
 The farm searches for configuration files in this order:
 1. `./apb.json` (current directory)
-2. `~/.config/apb.json` (user config directory)
-3. `/etc/apb.json` (system-wide config)
+2. `/etc/apb/apb.json` (system-wide)
+3. `~/.apb/apb.json` (user home)
+4. `~/.apb-farm/apb.json` (farm-specific)
 
 ### Configuration Schema
 ```json
@@ -450,7 +581,6 @@ The farm searches for configuration files in this order:
 - `--port`: Port to listen on (default: 8080)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - `--config`: Path to specific config file
-- `--curses-ui`: Enable terminal UI dashboard
 
 ---
 
@@ -479,13 +609,16 @@ The farm searches for configuration files in this order:
 - Comprehensive logging with configurable levels
 - Separate log files for different components
 - Request/response logging for debugging
+- Enhanced server health tracking logs
 
 ### Metrics
-- Server availability tracking
+- Server availability tracking with health states
 - Build distribution across servers
 - Performance metrics for server selection
+- Queue processing performance monitoring
 
 ### Health Checks
-- Individual server health monitoring
+- Individual server health monitoring with failure tracking
 - Farm-level health status
 - Automatic server discovery and recovery
+- Enhanced error reporting and diagnostics

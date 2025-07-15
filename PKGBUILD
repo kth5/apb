@@ -1,6 +1,6 @@
 # Maintainer: Alexander Baldeck <alexander@baldeck.de>
 pkgname=apb
-pkgver=2025.07.11
+pkgver=2025.07.15
 pkgrel=1
 pkgdesc="Arch Package Builder - A distributed package building system"
 arch=('any')

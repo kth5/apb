@@ -25,6 +25,10 @@ from concurrent.futures import ThreadPoolExecutor
 import queue
 import fcntl
 import configparser
+import gc
+import resource
+import select
+from contextlib import asynccontextmanager
 
 # Minimal dependencies - only FastAPI and uvicorn
 try:
@@ -39,15 +43,18 @@ except ImportError as e:
     sys.exit(1)
 
 # Version and constants
-VERSION = "2025-07-11"
+VERSION = "2025-07-15"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8000
 DEFAULT_BUILDROOT = Path.home() / ".apb" / "buildroot"
 DEFAULT_BUILDS_DIR = Path.home() / ".apb" / "builds"
 DEFAULT_MAX_CONCURRENT = 3
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB per file
+MAX_REQUEST_SIZE = 500 * 1024 * 1024  # 500MB total request
+BUILD_TIMEOUT = 7200  # 2 hours max build time
+MAX_BUILD_OUTPUTS = 10000  # Max lines to keep in memory
 
 # Global state
-app = FastAPI(title="APB Server", version=VERSION)
 build_queue = queue.Queue()
 active_builds: Dict[str, Dict] = {}
 build_history: Dict[str, Dict] = {}
@@ -57,6 +64,58 @@ build_streams: Dict[str, List] = {}
 server_config = {}
 shutdown_event = threading.Event()
 build_counter = 0  # Counter for buildroot recreation
+running_processes: Dict[str, subprocess.Popen] = {}  # Track running build processes
+
+# Resource monitoring
+resource_monitor_thread = None
+last_cleanup_time = time.time()
+
+# Async context manager for app lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan"""
+    global resource_monitor_thread
+
+    # Start resource monitoring
+    resource_monitor_thread = threading.Thread(target=monitor_resources, daemon=True)
+    resource_monitor_thread.start()
+
+    # Start queue processor
+    queue_thread = threading.Thread(target=process_build_queue, daemon=True)
+    queue_thread.start()
+
+    logger.info("APB Server background tasks started")
+
+    yield
+
+    # Cleanup on shutdown
+    logger.info("APB Server shutting down...")
+    shutdown_event.set()
+
+    # Cancel running builds
+    for build_id, process in running_processes.items():
+        try:
+            logger.info(f"Terminating build process {build_id}")
+            process.terminate()
+            process.wait(timeout=10)
+        except Exception as e:
+            logger.error(f"Error terminating build {build_id}: {e}")
+            try:
+                process.kill()
+            except:
+                pass
+
+    # Cleanup executor
+    build_executor.shutdown(wait=False)
+
+    logger.info("APB Server shutdown complete")
+
+# Create FastAPI app with lifespan
+app = FastAPI(
+    title="APB Server",
+    version=VERSION,
+    lifespan=lifespan
+)
 
 # Add CORS middleware
 app.add_middleware(
@@ -66,6 +125,52 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Request timeout middleware
+@app.middleware("http")
+async def request_timeout_middleware(request: Request, call_next):
+    """Add request timeout to prevent hanging requests"""
+    try:
+        # Set different timeouts based on endpoint
+        if request.url.path.startswith("/build"):
+            timeout = 300  # 5 minutes for build submissions
+        elif request.url.path.startswith("/stream"):
+            timeout = None  # No timeout for streaming endpoints
+        else:
+            timeout = 30  # 30 seconds for other endpoints
+
+        if timeout:
+            return await asyncio.wait_for(call_next(request), timeout=timeout)
+        else:
+            return await call_next(request)
+
+    except asyncio.TimeoutError:
+        logger.warning(f"Request timeout for {request.method} {request.url.path}")
+        return JSONResponse(
+            status_code=408,
+            content={"error": "Request timeout", "detail": "Request took too long to process"}
+        )
+    except Exception as e:
+        logger.error(f"Error in request timeout middleware: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal server error", "detail": str(e)}
+        )
+
+# Add global exception handler to prevent HTTP 502 errors
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Global exception handler to prevent HTTP 502 errors"""
+    logger.error(f"Unhandled exception in {request.method} {request.url}: {exc}")
+    logger.error(f"Exception type: {type(exc).__name__}")
+
+    # Force garbage collection
+    gc.collect()
+
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "detail": str(exc), "type": type(exc).__name__}
+    )
 
 # Logging setup
 logging.basicConfig(
@@ -83,6 +188,151 @@ class BuildStatus:
     CANCELLED = "cancelled"
 
 
+def monitor_resources():
+    """Monitor system resources and cleanup if needed"""
+    global last_cleanup_time
+
+    while not shutdown_event.is_set():
+        try:
+            # Check memory usage
+            memory = psutil.virtual_memory()
+            if memory.percent > 90:
+                logger.warning(f"High memory usage: {memory.percent}%")
+                cleanup_build_data()
+
+            # Check disk space
+            disk = psutil.disk_usage(server_config.get("builds_dir", "/tmp"))
+            if (disk.used / disk.total) > 0.95:
+                logger.warning(f"High disk usage: {(disk.used / disk.total) * 100:.1f}%")
+                cleanup_old_builds()
+
+            # Regular cleanup every hour
+            if time.time() - last_cleanup_time > 3600:
+                cleanup_build_data()
+                last_cleanup_time = time.time()
+
+            # Check for hung processes
+            current_time = time.time()
+            for build_id, build_info in list(active_builds.items()):
+                if (build_info["status"] == BuildStatus.BUILDING and
+                    "start_time" in build_info and
+                    current_time - build_info["start_time"] > BUILD_TIMEOUT):
+
+                    logger.warning(f"Build {build_id} exceeded timeout, terminating")
+                    terminate_build(build_id)
+
+            time.sleep(30)  # Check every 30 seconds
+
+        except Exception as e:
+            logger.error(f"Error in resource monitor: {e}")
+            time.sleep(60)
+
+
+def cleanup_build_data():
+    """Clean up build data to free memory"""
+    global build_outputs
+
+    try:
+        # Clean up old build outputs
+        current_time = time.time()
+        builds_to_clean = []
+
+        for build_id, build_info in build_history.items():
+            if (build_info.get("end_time", 0) and
+                current_time - build_info["end_time"] > 3600):  # 1 hour old
+                builds_to_clean.append(build_id)
+
+        for build_id in builds_to_clean:
+            if build_id in build_outputs:
+                del build_outputs[build_id]
+            if build_id in build_streams:
+                del build_streams[build_id]
+
+        # Limit build history
+        if len(build_history) > 100:
+            # Keep only the 50 most recent builds
+            sorted_builds = sorted(
+                build_history.items(),
+                key=lambda x: x[1].get("end_time", x[1].get("created_at", 0)),
+                reverse=True
+            )
+            build_history.clear()
+            for build_id, build_info in sorted_builds[:50]:
+                build_history[build_id] = build_info
+
+        # Limit output lines for active builds
+        for build_id in list(build_outputs.keys()):
+            if len(build_outputs[build_id]) > MAX_BUILD_OUTPUTS:
+                # Keep only the last 5000 lines
+                build_outputs[build_id] = build_outputs[build_id][-5000:]
+
+        # Force garbage collection
+        gc.collect()
+
+        logger.info(f"Cleaned up build data: {len(builds_to_clean)} old builds removed")
+
+    except Exception as e:
+        logger.error(f"Error cleaning up build data: {e}")
+
+
+def cleanup_old_builds():
+    """Clean up old build directories"""
+    try:
+        builds_dir = Path(server_config.get("builds_dir", "/tmp"))
+        current_time = time.time()
+        week_ago = current_time - (7 * 24 * 60 * 60)
+
+        cleaned_count = 0
+        for build_dir in builds_dir.iterdir():
+            if build_dir.is_dir():
+                try:
+                    if build_dir.stat().st_mtime < week_ago:
+                        shutil.rmtree(build_dir)
+                        cleaned_count += 1
+
+                        # Remove from build_history if present
+                        if build_dir.name in build_history:
+                            del build_history[build_dir.name]
+
+                except Exception as e:
+                    logger.error(f"Error cleaning up {build_dir}: {e}")
+
+        logger.info(f"Cleaned up {cleaned_count} old build directories")
+
+    except Exception as e:
+        logger.error(f"Error cleaning up old builds: {e}")
+
+
+def terminate_build(build_id: str):
+    """Terminate a specific build"""
+    try:
+        if build_id in running_processes:
+            process = running_processes[build_id]
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            del running_processes[build_id]
+
+        if build_id in active_builds:
+            active_builds[build_id]["status"] = BuildStatus.CANCELLED
+            active_builds[build_id]["end_time"] = time.time()
+            if "start_time" in active_builds[build_id]:
+                active_builds[build_id]["duration"] = (
+                    active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
+                )
+
+            # Move to history
+            build_history[build_id] = active_builds[build_id].copy()
+            del active_builds[build_id]
+
+        logger.info(f"Build {build_id} terminated successfully")
+
+    except Exception as e:
+        logger.error(f"Error terminating build {build_id}: {e}")
+
+
 def get_system_info() -> Dict[str, Any]:
     """Get system information for server status"""
     try:
@@ -91,18 +341,19 @@ def get_system_info() -> Dict[str, Any]:
         memory = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
         load_avg = os.getloadavg()
-        
+
         boot_time = psutil.boot_time()
         uptime_seconds = time.time() - boot_time
         uptime_days = int(uptime_seconds // 86400)
         uptime_hours = int((uptime_seconds % 86400) // 3600)
         uptime_minutes = int((uptime_seconds % 3600) // 60)
-        
+
         return {
             "architecture": platform.machine(),
             "cpu": {
                 "model": platform.processor() or "Unknown",
                 "cores": cpu_count,
+                "usage_percent": cpu_percent,
                 "load_average": list(load_avg)
             },
             "memory": {
@@ -117,16 +368,23 @@ def get_system_info() -> Dict[str, Any]:
                 "free": disk.free,
                 "percentage": (disk.used / disk.total) * 100
             },
-            "uptime": f"{uptime_days} days, {uptime_hours} hours, {uptime_minutes} minutes"
+            "uptime": f"{uptime_days} days, {uptime_hours} hours, {uptime_minutes} minutes",
+            "process_info": {
+                "pid": os.getpid(),
+                "thread_count": threading.active_count(),
+                "open_files": len(psutil.Process().open_files()),
+                "memory_usage": psutil.Process().memory_info().rss
+            }
         }
     except Exception as e:
         logger.error(f"Error getting system info: {e}")
         return {
             "architecture": platform.machine(),
-            "cpu": {"model": "Unknown", "cores": 1, "load_average": [0.0, 0.0, 0.0]},
+            "cpu": {"model": "Unknown", "cores": 1, "usage_percent": 0, "load_average": [0.0, 0.0, 0.0]},
             "memory": {"total": 0, "available": 0, "used": 0, "percentage": 0.0},
             "disk": {"total": 0, "used": 0, "free": 0, "percentage": 0.0},
-            "uptime": "Unknown"
+            "uptime": "Unknown",
+            "process_info": {"pid": os.getpid(), "thread_count": 0, "open_files": 0, "memory_usage": 0}
         }
 
 
@@ -138,7 +396,7 @@ def get_server_architecture() -> str:
             override_arch = server_config["architecture_override"]
             logger.info(f"Using command-line architecture override: {override_arch}")
             return override_arch
-        
+
         # Read /etc/pacman.conf to get the Architecture setting
         pacman_conf_path = Path("/etc/pacman.conf")
         if pacman_conf_path.exists():
@@ -150,26 +408,26 @@ def get_server_architecture() -> str:
                         if arch_value and arch_value != "auto":
                             logger.info(f"Found Architecture={arch_value} in /etc/pacman.conf")
                             return arch_value
-        
+
         # If Architecture is "auto" or not set, map from machine architecture
         machine_arch = platform.machine()
         logger.info(f"Architecture not set in /etc/pacman.conf or is 'auto', mapping from machine architecture: {machine_arch}")
-        
+
         # Map machine architecture to farm architecture names
         arch_mapping = {
             "ppc64le": "powerpc64le",
-            "ppc64": "powerpc64", 
+            "ppc64": "powerpc64",
             "ppc": "powerpc",
             "x86_64": "x86_64",
             "aarch64": "aarch64",
             "armv7h": "armv7h",
             "armv6h": "armv6h"
         }
-        
+
         mapped_arch = arch_mapping.get(machine_arch, machine_arch)
         logger.info(f"Mapped machine architecture '{machine_arch}' to farm architecture '{mapped_arch}'")
         return mapped_arch
-        
+
     except Exception as e:
         logger.error(f"Error determining server architecture: {e}")
         # Fallback to machine architecture
@@ -180,7 +438,7 @@ def get_queue_status() -> Dict[str, Any]:
     """Get build queue status"""
     current_builds = len([b for b in active_builds.values() if b["status"] == BuildStatus.BUILDING])
     queued_builds = len([b for b in active_builds.values() if b["status"] == BuildStatus.QUEUED])
-    
+
     # Get current build info
     current_build = None
     for build_id, build_info in active_builds.items():
@@ -192,12 +450,14 @@ def get_queue_status() -> Dict[str, Any]:
                 "start_time": build_info.get("start_time", time.time())
             }
             break
-    
+
     return {
         "current_builds_count": current_builds,
         "queued_builds": queued_builds,
         "max_concurrent_builds": server_config.get("max_concurrent", DEFAULT_MAX_CONCURRENT),
-        "current_build": current_build
+        "current_build": current_build,
+        "total_active_builds": len(active_builds),
+        "build_history_count": len(build_history)
     }
 
 
@@ -206,17 +466,17 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
     try:
         with open(pkgbuild_path, 'r') as f:
             content = f.read()
-        
+
         # Simple parsing - in production, this would be more robust
         info = {"pkgname": "unknown", "arch": ["x86_64"], "validpgpkeys": []}
         pkgbase = None
-        
+
         # Handle multi-line arrays
         lines = content.split('\n')
         i = 0
         while i < len(lines):
             line = lines[i].strip()
-            
+
             if line.startswith('pkgbase='):
                 pkgbase = line.split('=', 1)[1].strip('\'"')
             elif line.startswith('pkgname='):
@@ -239,7 +499,7 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
             elif line.startswith('validpgpkeys='):
                 # Handle both single-line and multi-line arrays
                 keys_content = line.split('=', 1)[1].strip()
-                
+
                 # If it's a single line array
                 if keys_content.startswith('(') and keys_content.endswith(')'):
                     keys_content = keys_content[1:-1]
@@ -248,7 +508,7 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
                 elif keys_content.startswith('('):
                     keys_content = keys_content[1:]  # Remove opening parenthesis
                     keys = []
-                    
+
                     # Continue reading lines until we find the closing parenthesis
                     while i < len(lines) and not keys_content.endswith(')'):
                         if keys_content.strip():
@@ -256,21 +516,21 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
                         i += 1
                         if i < len(lines):
                             keys_content = lines[i].strip()
-                    
+
                     # Handle the last line with closing parenthesis
                     if keys_content.endswith(')'):
                         keys_content = keys_content[:-1]  # Remove closing parenthesis
                         if keys_content.strip():
                             keys.extend([key.strip('\'"') for key in keys_content.split() if key.strip('\'"')])
-                    
+
                     info["validpgpkeys"] = keys
-            
+
             i += 1
-        
+
         # If pkgbase is defined, use it as pkgname and ignore pkgname field completely
         if pkgbase:
             info["pkgname"] = pkgbase
-        
+
         return info
     except Exception as e:
         logger.error(f"Error parsing PKGBUILD: {e}")
@@ -281,15 +541,15 @@ def download_gpg_keys(gpg_keys: List[str], log_output_func) -> bool:
     """Download GPG keys for package validation"""
     if not gpg_keys:
         return True
-    
+
     try:
         log_output_func(f"Downloading {len(gpg_keys)} GPG keys for source validation")
-        
+
         # Create GPG command to receive keys
         cmd = ["gpg", "--recv-keys"] + gpg_keys
-        
+
         log_output_func(f"Running: {' '.join(cmd)}")
-        
+
         # Execute GPG command
         result = subprocess.run(
             cmd,
@@ -297,27 +557,27 @@ def download_gpg_keys(gpg_keys: List[str], log_output_func) -> bool:
             text=True,
             timeout=300  # 5 minute timeout
         )
-        
+
         # Log GPG output
         if result.stdout:
             for line in result.stdout.split('\n'):
                 if line.strip():
                     log_output_func(f"GPG: {line}")
-        
+
         if result.stderr:
             for line in result.stderr.split('\n'):
                 if line.strip():
                     log_output_func(f"GPG: {line}")
-        
+
         if result.returncode != 0:
             log_output_func(f"Warning: GPG key download failed with exit code {result.returncode}")
             log_output_func("This may cause source validation to fail during build")
             # Don't fail the build, just warn - some packages may have optional key validation
             return True
-        
+
         log_output_func("GPG keys downloaded successfully")
         return True
-        
+
     except subprocess.TimeoutExpired:
         log_output_func("Error: GPG key download timed out after 5 minutes")
         return False
@@ -330,28 +590,28 @@ def setup_buildroot(buildroot_path: Path) -> bool:
     """Setup buildroot using mkarchroot"""
     try:
         root_path = buildroot_path / "root"
-        
+
         # Create buildroot directory
         buildroot_path.mkdir(parents=True, exist_ok=True)
 
         # Create buildroot using mkarchroot if it doesn't exist
         if not root_path.exists():
             cmd = [
-                "sudo", "mkarchroot", 
+                "sudo", "mkarchroot",
                 str(root_path),
                 "base", "base-devel", "ccache"
             ]
-            
+
             logger.info(f"Setting up buildroot: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True)
-            
+
             if result.returncode != 0:
                 logger.error(f"Failed to setup buildroot: {result.stderr}")
                 return False
-        
+
         # Always copy host configuration files into the chroot after mkarchroot
         chroot_etc = root_path / "etc"
-        
+
         # Copy makepkg.conf
         host_makepkg_conf = Path("/etc/makepkg.conf")
         chroot_makepkg_conf = chroot_etc / "makepkg.conf"
@@ -368,7 +628,7 @@ def setup_buildroot(buildroot_path: Path) -> bool:
                 return False
         else:
             logger.warning("Host /etc/makepkg.conf not found")
-        
+
         # Copy pacman.conf
         host_pacman_conf = Path("/etc/pacman.conf")
         chroot_pacman_conf = chroot_etc / "pacman.conf"
@@ -385,7 +645,7 @@ def setup_buildroot(buildroot_path: Path) -> bool:
                 return False
         else:
             logger.warning("Host /etc/pacman.conf not found")
-        
+
         return True
     except Exception as e:
         logger.error(f"Error setting up buildroot: {e}")
@@ -405,7 +665,7 @@ def get_makepkg_config() -> Dict[str, str]:
                     config['CCACHE_DIR'] = line.split('=', 1)[1].strip('\'"')
     except Exception as e:
         logger.error(f"Error reading makepkg.conf: {e}")
-    
+
     return config
 
 
@@ -432,15 +692,15 @@ def unlock_srcdest(lock_fd: int):
 def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any]):
     """Build package using makechrootpkg"""
     global build_counter
-    
+
     try:
         # Update build status
         active_builds[build_id]["status"] = BuildStatus.BUILDING
         active_builds[build_id]["start_time"] = time.time()
-        
+
         # Add to build outputs
         build_outputs[build_id] = []
-        
+
         def log_output(message: str):
             build_outputs[build_id].append(message)
             # Send to streams
@@ -451,88 +711,165 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any])
                     pass
 
         log_output(f"Starting build for {pkgbuild_info['pkgname']}")
-        
+
         # Check if buildroot needs recreation
         buildroot_path = Path(server_config["buildroot"])
         should_recreate = False
-        
+
         if server_config.get("buildroot_autorecreate"):
             build_counter += 1
             if build_counter >= server_config["buildroot_autorecreate"]:
                 should_recreate = True
                 build_counter = 0
                 log_output(f"Recreating buildroot after {server_config['buildroot_autorecreate']} builds")
-        
+
         # Recreate buildroot if needed
         if should_recreate:
             log_output("Removing existing buildroot for recreation")
             try:
                 root_path = buildroot_path / "root"
                 if root_path.exists():
-                    shutil.rmtree(root_path)
+                    log_output("Removing existing buildroot directory...")
+                    # Use subprocess to avoid blocking the main thread
+                    result = subprocess.run(['sudo', 'rm', '-rf', str(root_path)],
+                                          capture_output=True, text=True, timeout=300)
+                    if result.returncode != 0:
+                        log_output(f"Warning: Could not remove buildroot: {result.stderr}")
+                        # Continue anyway - mkarchroot might handle it
+
+                log_output("Setting up new buildroot...")
                 if not setup_buildroot(buildroot_path):
-                    raise Exception("Failed to recreate buildroot")
+                    # Don't fail the build - just log the warning and continue
+                    log_output("Warning: Failed to recreate buildroot, continuing with existing buildroot")
+                    build_counter = 0  # Reset counter to avoid immediate retry
+                else:
+                    log_output("Buildroot recreation completed successfully")
             except Exception as e:
                 log_output(f"Warning: Could not recreate buildroot: {e}")
-                raise Exception("Failed to recreate buildroot")
-        
+                log_output("Continuing with existing buildroot")
+                build_counter = 0  # Reset counter to avoid immediate retry
+
         # Get makepkg config
         makepkg_config = get_makepkg_config()
-        
-        # Lock SRCDEST if it exists
+
+        # Lock SRCDEST if it exists with timeout
         srcdest_lock = None
         if 'SRCDEST' in makepkg_config:
             srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'])
             if srcdest_lock is None:
                 log_output("Waiting for SRCDEST lock...")
-                # Wait for lock
+                # Wait for lock with timeout to prevent infinite waiting
+                lock_start_time = time.time()
                 while srcdest_lock is None and not shutdown_event.is_set():
-                    time.sleep(1)
+                    if time.time() - lock_start_time > 600:  # 10 minute timeout
+                        log_output("SRCDEST lock timeout after 10 minutes, continuing without lock")
+                        break
+                    time.sleep(5)  # Check every 5 seconds instead of 1
                     srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'])
-        
+
         try:
             # Download GPG keys if specified in PKGBUILD
             if pkgbuild_info.get("validpgpkeys"):
                 log_output("Downloading GPG keys for source validation...")
                 if not download_gpg_keys(pkgbuild_info["validpgpkeys"], log_output):
                     log_output("GPG key download failed, continuing build (may fail during source validation)")
-            
+
             # Build makechrootpkg command with correct flags
             cmd = ["sudo", "makechrootpkg", "-cuT", "-r", str(buildroot_path)]
-            
+
             # Add bind mounts
             if 'CCACHE_DIR' in makepkg_config:
                 cmd.extend(["-d", makepkg_config['CCACHE_DIR']])
             if 'SRCDEST' in makepkg_config:
                 cmd.extend(["-d", makepkg_config['SRCDEST']])
-            
+
             log_output(f"Running: {' '.join(cmd)}")
-            
-            # Execute build
+
+            # Execute build with timeout management
             process = subprocess.Popen(
                 cmd,
                 cwd=build_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                preexec_fn=os.setsid  # Create new process group for better cleanup
             )
-            
-            # Stream output
-            for line in iter(process.stdout.readline, ''):
-                if shutdown_event.is_set():
+            running_processes[build_id] = process  # Track the process
+
+            # Stream output with timeout management
+            start_time = time.time()
+            last_output_time = start_time
+
+            while True:
+                try:
+                    # Check for shutdown or timeout
+                    current_time = time.time()
+                    if shutdown_event.is_set():
+                        log_output("Build cancelled due to server shutdown")
+                        process.terminate()
+                        break
+
+                    # Check overall build timeout
+                    if current_time - start_time > BUILD_TIMEOUT:
+                        log_output(f"Build timed out after {BUILD_TIMEOUT} seconds")
+                        process.terminate()
+                        break
+
+                    # Check for output timeout (no output for 30 minutes = hung build)
+                    if current_time - last_output_time > 1800:  # 30 minutes
+                        log_output("Build appears to be hung (no output for 30 minutes), terminating")
+                        process.terminate()
+                        break
+
+                    # Read output with timeout
+                    try:
+                        # Use poll() to check if process is still running
+                        if process.poll() is not None:
+                            # Process finished, read remaining output
+                            remaining_output = process.stdout.read()
+                            if remaining_output:
+                                for line in remaining_output.split('\n'):
+                                    if line.strip():
+                                        log_output(line.rstrip())
+                            break
+
+                        # Read line with timeout simulation using select
+                        if select.select([process.stdout], [], [], 1.0)[0]:
+                            line = process.stdout.readline()
+                            if line:
+                                log_output(line.rstrip())
+                                last_output_time = current_time
+
+                    except Exception as e:
+                        logger.error(f"Error reading process output: {e}")
+                        break
+
+                    # Small sleep to prevent busy waiting
+                    time.sleep(0.1)
+
+                except KeyboardInterrupt:
+                    log_output("Build interrupted")
                     process.terminate()
                     break
-                log_output(line.rstrip())
-            
-            process.wait()
-            
+
+            # Wait for process to finish with timeout
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Build process {build_id} did not terminate gracefully, killing")
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except:
+                    process.kill()
+                process.wait()
+
             # Check if build was successful
             if process.returncode == 0:
                 active_builds[build_id]["status"] = BuildStatus.COMPLETED
                 active_builds[build_id]["exit_code"] = 0
                 log_output("Build completed successfully")
-                
+
                 # Find built packages
                 packages = []
                 for pkg_file in build_dir.glob("*.pkg.tar.*"):
@@ -541,33 +878,35 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any])
                         "size": pkg_file.stat().st_size,
                         "download_url": f"/build/{build_id}/download/{pkg_file.name}"
                     })
-                
+
                 active_builds[build_id]["packages"] = packages
-                
+
             else:
                 active_builds[build_id]["status"] = BuildStatus.FAILED
                 active_builds[build_id]["exit_code"] = process.returncode
                 log_output(f"Build failed with exit code {process.returncode}")
-        
+
         finally:
             if srcdest_lock:
                 unlock_srcdest(srcdest_lock)
-        
+            if build_id in running_processes:
+                del running_processes[build_id] # Ensure process is removed from tracking
+
         # Finalize build
         active_builds[build_id]["end_time"] = time.time()
         active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
-        
+
         # Add logs
         log_file = build_dir / "build.log"
         with open(log_file, 'w') as f:
             f.write('\n'.join(build_outputs[build_id]))
-        
+
         active_builds[build_id]["logs"] = [{
             "filename": "build.log",
             "size": log_file.stat().st_size,
             "download_url": f"/build/{build_id}/download/build.log"
         }]
-        
+
         # Send completion event to streams
         for stream_queue in build_streams.get(build_id, []):
             try:
@@ -577,22 +916,22 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any])
                 }))
             except:
                 pass
-        
+
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
-        
+
         log_output(f"Build {build_id} finished")
-        
+
     except Exception as e:
         logger.error(f"Build error: {e}")
         active_builds[build_id]["status"] = BuildStatus.FAILED
         active_builds[build_id]["end_time"] = time.time()
         active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
         active_builds[build_id]["exit_code"] = 1
-        
+
         if build_id in build_outputs:
             build_outputs[build_id].append(f"Build failed: {str(e)}")
-        
+
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
 
@@ -603,45 +942,143 @@ def process_build_queue():
         try:
             # Get build from queue
             build_data = build_queue.get(timeout=1)
-            
+
             # Submit to executor
             build_executor.submit(
-                build_package, 
-                build_data["build_id"], 
-                build_data["build_dir"], 
+                build_package,
+                build_data["build_id"],
+                build_data["build_dir"],
                 build_data["pkgbuild_info"]
             )
-            
+
         except queue.Empty:
             continue
         except Exception as e:
             logger.error(f"Error processing build queue: {e}")
 
 
-# Start queue processor
-queue_thread = threading.Thread(target=process_build_queue, daemon=True)
-queue_thread.start()
+# Queue processor is now started in the lifespan manager
 
 
 @app.get("/")
 async def get_server_info():
     """Get server information and status"""
-    return {
-        "status": "running",
-        "version": VERSION,
-        "supported_architecture": get_server_architecture(),
-        "system_info": get_system_info(),
-        "queue_status": get_queue_status()
-    }
+    try:
+        return {
+            "status": "running",
+            "version": VERSION,
+            "supported_architecture": get_server_architecture(),
+            "system_info": get_system_info(),
+            "queue_status": get_queue_status()
+        }
+    except Exception as e:
+        logger.error(f"Error getting server info: {e}")
+        # Return minimal info to prevent HTTP 502
+        return {
+            "status": "running",
+            "version": VERSION,
+            "supported_architecture": get_server_architecture(),
+            "system_info": {"architecture": platform.machine()},
+            "queue_status": {"current_builds_count": 0, "queued_builds": 0}
+        }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "version": VERSION
-    }
+    """Enhanced health check endpoint that actually tests server responsiveness"""
+    start_time = time.time()
+
+    try:
+        health_status = {
+            "status": "healthy",
+            "version": VERSION,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "checks": {}
+        }
+
+        # Test memory usage
+        try:
+            memory = psutil.virtual_memory()
+            health_status["checks"]["memory"] = {
+                "status": "ok" if memory.percent < 95 else "warning",
+                "usage_percent": memory.percent,
+                "available_mb": memory.available // (1024 * 1024)
+            }
+        except Exception as e:
+            health_status["checks"]["memory"] = {"status": "error", "error": str(e)}
+
+        # Test disk space
+        try:
+            disk = psutil.disk_usage(server_config.get("builds_dir", "/tmp"))
+            disk_percent = (disk.used / disk.total) * 100
+            health_status["checks"]["disk"] = {
+                "status": "ok" if disk_percent < 95 else "warning",
+                "usage_percent": disk_percent,
+                "free_gb": disk.free // (1024 * 1024 * 1024)
+            }
+        except Exception as e:
+            health_status["checks"]["disk"] = {"status": "error", "error": str(e)}
+
+        # Test thread pool
+        try:
+            # Check if executor is responsive
+            future = build_executor.submit(lambda: "test")
+            try:
+                result = future.result(timeout=1.0)
+                health_status["checks"]["executor"] = {"status": "ok", "test_result": result}
+            except Exception as e:
+                health_status["checks"]["executor"] = {"status": "error", "error": str(e)}
+        except Exception as e:
+            health_status["checks"]["executor"] = {"status": "error", "error": str(e)}
+
+        # Test build queue
+        try:
+            health_status["checks"]["build_queue"] = {
+                "status": "ok",
+                "queue_size": build_queue.qsize(),
+                "active_builds": len(active_builds),
+                "running_processes": len(running_processes)
+            }
+        except Exception as e:
+            health_status["checks"]["build_queue"] = {"status": "error", "error": str(e)}
+
+        # Test file system access
+        try:
+            test_file = Path(server_config.get("builds_dir", "/tmp")) / ".health_check"
+            test_file.write_text("health_check")
+            test_file.unlink()
+            health_status["checks"]["filesystem"] = {"status": "ok"}
+        except Exception as e:
+            health_status["checks"]["filesystem"] = {"status": "error", "error": str(e)}
+
+        # Calculate response time
+        response_time = time.time() - start_time
+        health_status["response_time_ms"] = round(response_time * 1000, 2)
+
+        # Determine overall status
+        check_statuses = [check.get("status", "error") for check in health_status["checks"].values()]
+        if "error" in check_statuses:
+            health_status["status"] = "degraded"
+        elif "warning" in check_statuses:
+            health_status["status"] = "warning"
+
+        # If response time is too high, mark as degraded
+        if response_time > 5.0:
+            health_status["status"] = "degraded"
+            health_status["warning"] = "High response time"
+
+        return health_status
+
+    except Exception as e:
+        logger.error(f"Error in health check: {e}")
+        # Return degraded status instead of always healthy
+        return {
+            "status": "degraded",
+            "version": VERSION,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "error": str(e),
+            "response_time_ms": round((time.time() - start_time) * 1000, 2)
+        }
 
 
 @app.post("/build")
@@ -655,56 +1092,117 @@ async def submit_build(
         # Validate PKGBUILD file
         if not pkgbuild.filename or pkgbuild.filename.lower() != "pkgbuild":
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail={"error": "Invalid PKGBUILD file", "detail": "File must be named 'PKGBUILD'"}
             )
-        
+
         # Check if build_id already exists
         if build_id in active_builds or build_id in build_history:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail={"error": "Build ID already exists", "detail": f"Build with ID '{build_id}' already exists"}
             )
-        
+
         # Create build directory
         builds_dir = Path(server_config["builds_dir"])
         builds_dir.mkdir(parents=True, exist_ok=True)
-        
+
         build_dir = builds_dir / build_id
         build_dir.mkdir(exist_ok=True)
-        
-        # Save PKGBUILD
+
+        # Save PKGBUILD with size limit and streaming
         pkgbuild_path = build_dir / "PKGBUILD"
         try:
+            # Check file size first
+            if pkgbuild.size and pkgbuild.size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail={"error": "File too large", "detail": f"PKGBUILD exceeds {MAX_FILE_SIZE} bytes"}
+                )
+
+            # Stream file to disk to avoid memory issues
             with open(pkgbuild_path, 'wb') as f:
-                content = await pkgbuild.read()
-                f.write(content)
+                bytes_written = 0
+                while True:
+                    # Read in chunks to avoid memory exhaustion
+                    chunk = await pkgbuild.read(8192)  # 8KB chunks
+                    if not chunk:
+                        break
+
+                    bytes_written += len(chunk)
+                    if bytes_written > MAX_FILE_SIZE:
+                        f.close()
+                        pkgbuild_path.unlink(missing_ok=True)  # Delete partial file
+                        raise HTTPException(
+                            status_code=413,
+                            detail={"error": "File too large", "detail": f"PKGBUILD exceeds {MAX_FILE_SIZE} bytes"}
+                        )
+
+                    f.write(chunk)
+
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail={"error": "Failed to save PKGBUILD", "detail": str(e)}
             )
-        
-        # Save source files
+
+        # Save source files with size limits and streaming
+        total_size = 0
         for source in sources:
             if source.filename:
                 source_path = build_dir / source.filename
                 try:
+                    # Check individual file size
+                    if source.size and source.size > MAX_FILE_SIZE:
+                        logger.error(f"Source file {source.filename} too large: {source.size} bytes")
+                        continue
+
+                    # Stream file to disk
                     with open(source_path, 'wb') as f:
-                        content = await source.read()
-                        f.write(content)
+                        bytes_written = 0
+                        while True:
+                            chunk = await source.read(8192)  # 8KB chunks
+                            if not chunk:
+                                break
+
+                            bytes_written += len(chunk)
+                            total_size += len(chunk)
+
+                            # Check individual file size limit
+                            if bytes_written > MAX_FILE_SIZE:
+                                f.close()
+                                source_path.unlink(missing_ok=True)
+                                logger.error(f"Source file {source.filename} exceeded size limit")
+                                break
+
+                            # Check total request size limit
+                            if total_size > MAX_REQUEST_SIZE:
+                                f.close()
+                                source_path.unlink(missing_ok=True)
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail={"error": "Request too large", "detail": f"Total request size exceeds {MAX_REQUEST_SIZE} bytes"}
+                                )
+
+                            f.write(chunk)
+
+                except HTTPException:
+                    raise
                 except Exception as e:
                     logger.error(f"Error saving source file {source.filename}: {e}")
-        
+                    # Continue with other files
+
         # Parse PKGBUILD
         pkgbuild_info = parse_pkgbuild(pkgbuild_path)
-        
+
         if pkgbuild_info["pkgname"] == "unknown":
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail={"error": "Invalid PKGBUILD file", "detail": "Missing required pkgname field"}
             )
-        
+
         # Create build record
         active_builds[build_id] = {
             "build_id": build_id,
@@ -715,26 +1213,26 @@ async def submit_build(
             "packages": [],
             "logs": []
         }
-        
+
         # Add to queue
         build_queue.put({
             "build_id": build_id,
             "build_dir": build_dir,
             "pkgbuild_info": pkgbuild_info
         })
-        
+
         return {
             "build_id": build_id,
             "status": "queued",
             "message": "Build queued successfully"
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error submitting build: {e}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail={"error": "Internal server error", "detail": str(e)}
         )
 
@@ -743,10 +1241,10 @@ async def submit_build(
 async def get_build_status(build_id: str):
     """Get build status as JSON"""
     build_info = active_builds.get(build_id) or build_history.get(build_id)
-    
+
     if not build_info:
         raise HTTPException(status_code=404, detail="Build not found")
-    
+
     return build_info
 
 
@@ -755,13 +1253,13 @@ async def get_build_output(build_id: str, start_index: int = 0, limit: int = 50)
     """Get build output/logs"""
     if build_id not in build_outputs:
         raise HTTPException(status_code=404, detail="Build not found")
-    
+
     output_lines = build_outputs[build_id]
     total_lines = len(output_lines)
-    
+
     end_index = min(start_index + limit, total_lines)
     returned_lines = output_lines[start_index:end_index]
-    
+
     return {
         "output": returned_lines,
         "total_lines": total_lines,
@@ -773,31 +1271,31 @@ async def get_build_output(build_id: str, start_index: int = 0, limit: int = 50)
 @app.get("/build/{build_id}/stream")
 async def stream_build_output(build_id: str):
     """Stream build output using Server-Sent Events"""
-    
+
     async def event_generator():
         # Create queue for this stream
         stream_queue = queue.Queue()
-        
+
         if build_id not in build_streams:
             build_streams[build_id] = []
         build_streams[build_id].append(stream_queue)
-        
+
         try:
             # Send existing output
             if build_id in build_outputs:
                 for line in build_outputs[build_id]:
                     yield f"event: output\ndata: {line}\n\n"
-            
+
             # Send current status
             build_info = active_builds.get(build_id) or build_history.get(build_id)
             if build_info:
                 yield f"event: status\ndata: {json.dumps({'status': build_info['status']})}\n\n"
-            
+
             # Stream new events
             while True:
                 try:
                     event_type, data = stream_queue.get(timeout=30)
-                    
+
                     if event_type == "output":
                         yield f"event: output\ndata: {data}\n\n"
                     elif event_type == "status":
@@ -805,21 +1303,21 @@ async def stream_build_output(build_id: str):
                     elif event_type == "complete":
                         yield f"event: complete\ndata: {json.dumps(data)}\n\n"
                         break
-                        
+
                 except queue.Empty:
                     # Send heartbeat
                     yield f"event: heartbeat\ndata: {time.time()}\n\n"
-                    
+
                     # Check if build is done
                     build_info = active_builds.get(build_id) or build_history.get(build_id)
                     if build_info and build_info["status"] in [BuildStatus.COMPLETED, BuildStatus.FAILED, BuildStatus.CANCELLED]:
                         break
-        
+
         finally:
             # Remove from streams
             if build_id in build_streams:
                 build_streams[build_id].remove(stream_queue)
-    
+
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
@@ -828,22 +1326,22 @@ async def cancel_build(build_id: str):
     """Cancel a build"""
     if build_id not in active_builds:
         raise HTTPException(status_code=404, detail="Build not found")
-    
+
     build_info = active_builds[build_id]
-    
+
     if build_info["status"] in [BuildStatus.COMPLETED, BuildStatus.FAILED, BuildStatus.CANCELLED]:
         return {"success": False, "message": "Build already finished"}
-    
+
     # Mark as cancelled
     build_info["status"] = BuildStatus.CANCELLED
     build_info["end_time"] = time.time()
-    
+
     if "start_time" in build_info:
         build_info["duration"] = build_info["end_time"] - build_info["start_time"]
 
     # Move to history
     build_history[build_id] = build_info.copy()
-    
+
     return {"success": True, "message": "Build cancelled successfully"}
 
 
@@ -851,10 +1349,10 @@ async def cancel_build(build_id: str):
 async def confirm_cancel_build(build_id: str):
     """Get build cancellation confirmation page"""
     build_info = active_builds.get(build_id) or build_history.get(build_id)
-    
+
     if not build_info:
         raise HTTPException(status_code=404, detail="Build not found")
-    
+
     return HTMLResponse(f"""
     <html>
     <head><title>Cancel Build - {build_info['pkgname']}</title></head>
@@ -878,14 +1376,14 @@ async def view_file(build_id: str, filename: str):
     builds_dir = Path(server_config["builds_dir"])
     build_dir = builds_dir / build_id
     file_path = build_dir / filename
-    
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    
+
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         return HTMLResponse(f"""
         <html>
         <head><title>View File - {filename}</title></head>
@@ -912,10 +1410,10 @@ async def download_file(build_id: str, filename: str):
     builds_dir = Path(server_config["builds_dir"])
     build_dir = builds_dir / build_id
     file_path = build_dir / filename
-    
+
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    
+
     return FileResponse(
         path=str(file_path),
         filename=filename,
@@ -927,13 +1425,13 @@ async def download_file(build_id: str, filename: str):
 async def get_latest_builds(limit: int = 10, status: Optional[str] = None):
     """Get latest builds"""
     all_builds = list(build_history.values()) + list(active_builds.values())
-    
+
     if status:
         all_builds = [b for b in all_builds if b["status"] == status]
-    
+
     # Sort by creation time (newest first)
     all_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-    
+
     builds = []
     for build in all_builds[:limit]:
         builds.append({
@@ -944,7 +1442,7 @@ async def get_latest_builds(limit: int = 10, status: Optional[str] = None):
             "end_time": datetime.fromtimestamp(build["end_time"], timezone.utc).isoformat() if build.get("end_time") else None,
             "duration": build.get("duration", 0)
         })
-    
+
     return {"builds": builds, "total": len(all_builds)}
 
 
@@ -953,10 +1451,10 @@ async def get_builds_for_package(pkgname: str, limit: int = 5):
     """Get builds for a specific package"""
     all_builds = list(build_history.values()) + list(active_builds.values())
     pkg_builds = [b for b in all_builds if b["pkgname"] == pkgname]
-    
+
     # Sort by creation time (newest first)
     pkg_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-    
+
     builds = []
     for build in pkg_builds[:limit]:
         builds.append({
@@ -966,7 +1464,7 @@ async def get_builds_for_package(pkgname: str, limit: int = 5):
             "end_time": datetime.fromtimestamp(build["end_time"], timezone.utc).isoformat() if build.get("end_time") else None,
             "duration": build.get("duration", 0)
         })
-    
+
     return {"pkgname": pkgname, "builds": builds, "total": len(pkg_builds)}
 
 
@@ -975,17 +1473,17 @@ async def get_latest_build_for_package(pkgname: str, successful_only: bool = Tru
     """Get the latest build for a specific package"""
     all_builds = list(build_history.values()) + list(active_builds.values())
     pkg_builds = [b for b in all_builds if b["pkgname"] == pkgname]
-    
+
     if successful_only:
         pkg_builds = [b for b in pkg_builds if b["status"] == BuildStatus.COMPLETED]
-    
+
     if not pkg_builds:
         raise HTTPException(status_code=404, detail="No builds found for package")
-    
+
     # Sort by creation time (newest first)
     pkg_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
     latest_build = pkg_builds[0]
-    
+
     return {
         "build_id": latest_build["build_id"],
         "pkgname": latest_build["pkgname"],
@@ -1002,20 +1500,20 @@ async def download_latest_build_file(pkgname: str, file_type: str, successful_on
     """Download the latest build file for a package"""
     all_builds = list(build_history.values()) + list(active_builds.values())
     pkg_builds = [b for b in all_builds if b["pkgname"] == pkgname]
-    
+
     if successful_only:
         pkg_builds = [b for b in pkg_builds if b["status"] == BuildStatus.COMPLETED]
-    
+
     if not pkg_builds:
         raise HTTPException(status_code=404, detail="No builds found for package")
-    
+
     # Sort by creation time (newest first)
     pkg_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
     latest_build = pkg_builds[0]
-    
+
     builds_dir = Path(server_config["builds_dir"])
     build_dir = builds_dir / latest_build["build_id"]
-    
+
     # Handle different file types
     if file_type == "package":
         # Find main package file
@@ -1050,7 +1548,7 @@ async def download_latest_build_file(pkgname: str, file_type: str, successful_on
                 filename="PKGBUILD",
                 media_type='text/plain'
             )
-    
+
     raise HTTPException(status_code=404, detail=f"File type '{file_type}' not found")
 
 
@@ -1058,10 +1556,10 @@ async def download_latest_build_file(pkgname: str, file_type: str, successful_on
 async def get_build_details(build_id: str, request: Request):
     """Get detailed build information (HTML or JSON based on Accept header)"""
     build_info = active_builds.get(build_id) or build_history.get(build_id)
-    
+
     if not build_info:
         raise HTTPException(status_code=404, detail="Build not found")
-    
+
     # Check Accept header for JSON vs HTML
     accept_header = request.headers.get("Accept", "")
     if "application/json" in accept_header:
@@ -1069,7 +1567,7 @@ async def get_build_details(build_id: str, request: Request):
         sources = []
         builds_dir = Path(server_config["builds_dir"])
         build_dir = builds_dir / build_id
-        
+
         # List source files
         for src_file in build_dir.iterdir():
             if src_file.is_file() and src_file.name not in ["build.log"] and not src_file.name.endswith(".pkg.tar.xz"):
@@ -1078,7 +1576,7 @@ async def get_build_details(build_id: str, request: Request):
                     "size": src_file.stat().st_size,
                     "download_url": f"/build/{build_id}/download/{src_file.name}"
                 })
-        
+
         return {
             "build_id": build_info["build_id"],
             "pkgname": build_info["pkgname"],
@@ -1096,11 +1594,11 @@ async def get_build_details(build_id: str, request: Request):
         packages_html = ""
         for pkg in build_info.get("packages", []):
             packages_html += f'<li><a href="{pkg["download_url"]}">{pkg["filename"]}</a> ({pkg["size"]} bytes)</li>'
-        
+
         logs_html = ""
         for log in build_info.get("logs", []):
             logs_html += f'<li><a href="{log["download_url"]}">{log["filename"]}</a> ({log["size"]} bytes)</li>'
-        
+
         return HTMLResponse(f"""
         <html>
         <head><title>Build Details - {build_info['pkgname']}</title></head>
@@ -1112,16 +1610,16 @@ async def get_build_details(build_id: str, request: Request):
             <p><strong>End Time:</strong> {datetime.fromtimestamp(build_info["end_time"], timezone.utc).isoformat() if build_info.get("end_time") else "N/A"}</p>
             <p><strong>Duration:</strong> {build_info.get("duration", 0):.2f} seconds</p>
             <p><strong>Exit Code:</strong> {build_info.get("exit_code", 0)}</p>
-            
+
             <h2>Packages</h2>
             <ul>{packages_html}</ul>
-            
+
             <h2>Logs</h2>
             <ul>{logs_html}</ul>
-            
+
             <h2>Actions</h2>
-            <a href="/build/{build_id}/stream">Stream Output</a> | 
-            <a href="/build/{build_id}/output">View Output</a> | 
+            <a href="/build/{build_id}/stream">Stream Output</a> |
+            <a href="/build/{build_id}/output">View Output</a> |
             <a href="/build/{build_id}/confirm-cancel">Cancel Build</a>
         </body>
         </html>
@@ -1132,10 +1630,10 @@ async def get_build_details(build_id: str, request: Request):
 async def get_build_packages(build_id: str):
     """List packages produced by a build"""
     build_info = active_builds.get(build_id) or build_history.get(build_id)
-    
+
     if not build_info:
         raise HTTPException(status_code=404, detail="Build not found")
-    
+
     packages = []
     for pkg in build_info.get("packages", []):
         packages.append({
@@ -1144,7 +1642,7 @@ async def get_build_packages(build_id: str):
             "created_at": datetime.fromtimestamp(build_info.get("end_time", build_info.get("created_at", 0)), timezone.utc).isoformat(),
             "download_url": pkg["download_url"]
         })
-    
+
     return {
         "build_id": build_id,
         "packages": packages
@@ -1173,12 +1671,12 @@ async def admin_cleanup():
     """Trigger server cleanup"""
     try:
         cleanup_id = f"cleanup_{int(time.time())}"
-        
+
         # Clean up old builds (example: remove builds older than 7 days)
         builds_dir = Path(server_config["builds_dir"])
         current_time = time.time()
         week_ago = current_time - (7 * 24 * 60 * 60)
-        
+
         cleaned_count = 0
         for build_dir in builds_dir.iterdir():
             if build_dir.is_dir():
@@ -1189,15 +1687,15 @@ async def admin_cleanup():
                         cleaned_count += 1
                 except Exception as e:
                     logger.error(f"Error cleaning up {build_dir}: {e}")
-        
+
         logger.info(f"Cleanup completed: removed {cleaned_count} old builds")
-        
+
         return {
             "success": True,
             "message": f"Cleanup completed: removed {cleaned_count} old builds",
             "cleanup_id": cleanup_id
         }
-        
+
     except Exception as e:
         logger.error(f"Error during cleanup: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1213,7 +1711,7 @@ def signal_handler(signum, frame):
 def main():
     """Main entry point"""
     global server_config, build_executor
-    
+
     parser = argparse.ArgumentParser(description="APB Server - Arch Package Builder")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Host to bind to")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind to")
@@ -1222,18 +1720,27 @@ def main():
     parser.add_argument("--max-concurrent", type=int, default=DEFAULT_MAX_CONCURRENT, help="Max concurrent builds")
     parser.add_argument("--buildroot-autorecreate", type=int, help="Recreate buildroot after N builds")
     parser.add_argument("--architecture", type=str, help="Override detected architecture (e.g., 'powerpc' for espresso server)")
+    parser.add_argument("--max-file-size", type=int, default=100*1024*1024, help="Maximum file size in bytes")
+    parser.add_argument("--max-request-size", type=int, default=500*1024*1024, help="Maximum total request size in bytes")
+    parser.add_argument("--build-timeout", type=int, default=7200, help="Maximum build time in seconds")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    
+
     args = parser.parse_args()
-    
+
     # Setup logging
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
     # Setup signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
+    # Update global constants with command line arguments
+    global MAX_FILE_SIZE, MAX_REQUEST_SIZE, BUILD_TIMEOUT
+    MAX_FILE_SIZE = args.max_file_size
+    MAX_REQUEST_SIZE = args.max_request_size
+    BUILD_TIMEOUT = args.build_timeout
+
     # Store configuration
     server_config = {
         "host": args.host,
@@ -1242,39 +1749,59 @@ def main():
         "builds_dir": args.builds_dir,
         "max_concurrent": args.max_concurrent,
         "buildroot_autorecreate": args.buildroot_autorecreate,
-        "architecture_override": args.architecture
+        "architecture_override": args.architecture,
+        "max_file_size": args.max_file_size,
+        "max_request_size": args.max_request_size,
+        "build_timeout": args.build_timeout
     }
-    
+
     # Update executor with correct max_workers
     build_executor = ThreadPoolExecutor(max_workers=args.max_concurrent)
-    
+
     # Create directories
     args.buildroot.mkdir(parents=True, exist_ok=True)
     args.builds_dir.mkdir(parents=True, exist_ok=True)
-    
+
     logger.info(f"Starting APB Server v{VERSION}")
     logger.info(f"Buildroot: {args.buildroot}")
     logger.info(f"Builds directory: {args.builds_dir}")
     logger.info(f"Max concurrent builds: {args.max_concurrent}")
-    
+    logger.info(f"Max file size: {args.max_file_size // (1024*1024)} MB")
+    logger.info(f"Max request size: {args.max_request_size // (1024*1024)} MB")
+    logger.info(f"Build timeout: {args.build_timeout} seconds")
+
+    # Set resource limits
+    try:
+        # Set memory limit warning threshold
+        if hasattr(resource, 'RLIMIT_AS'):
+            resource.setrlimit(resource.RLIMIT_AS, (8 * 1024 * 1024 * 1024, -1))  # 8GB soft limit
+        logger.info("Resource limits configured")
+    except Exception as e:
+        logger.warning(f"Could not set resource limits: {e}")
+
     # Log the detected architecture
     detected_arch = get_server_architecture()
     logger.info(f"Detected server architecture: {detected_arch}")
-    
+
     # Setup buildroot during startup
     logger.info("Setting up buildroot...")
     if not setup_buildroot(args.buildroot):
         logger.error("Failed to setup buildroot during startup")
         sys.exit(1)
     logger.info("Buildroot setup complete")
-    
-    # Start server
+
+    # Start server with improved configuration
     try:
         uvicorn.run(
             app,
             host=args.host,
             port=args.port,
-            log_level="info" if not args.debug else "debug"
+            log_level="info" if not args.debug else "debug",
+            workers=1,  # Explicit single worker
+            timeout_keep_alive=60,  # Keep connections alive longer
+            access_log=True if args.debug else False,
+            limit_max_requests=1000,  # Restart worker after 1000 requests to prevent memory leaks
+            limit_concurrency=100  # Limit concurrent connections
         )
     except KeyboardInterrupt:
         logger.info("Server interrupted by user")
@@ -1284,4 +1811,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

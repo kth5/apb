@@ -23,11 +23,23 @@ python apb.py --arch x86_64,aarch64 /path/to/package/
 # Build with verbose output
 python apb.py --verbose /path/to/package/
 
+# Use APB Farm (recommended for multi-server setups)
+python apb.py --farm /path/to/package/
+
 # Monitor existing build
 python apb.py --monitor 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 
 # Download build results
 python apb.py --download 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3 --output-dir ./downloads/
+
+# Check build status
+python apb.py --status 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
+
+# Cancel running build
+python apb.py --cancel 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
+
+# List and test servers
+python apb.py --list-servers
 ```
 
 ### Python Library
@@ -54,6 +66,7 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 
 ### Basic Options
 
+- `pkgbuild_path` (positional): Path to PKGBUILD or package directory (optional if PKGBUILD in current dir)
 - `--server URL`: Server URL (default: from config or http://localhost:8000)
 - `--arch ARCH`: Target architecture(s) (comma-separated)
 - `--config PATH`: Path to configuration file
@@ -62,24 +75,87 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 
 ### Build Options
 
-- `--output-dir PATH`: Output directory for downloaded files
+- `--output-dir PATH`: Output directory for downloaded files (default: ./output)
 - `--detach`: Submit build and exit (don't wait for completion)
 - `--no-download`: Don't download build results
 - `--force`: Force rebuild even if package exists
 
 ### Monitoring Options
 
-- `--monitor BUILD_ID`: Monitor existing build
-- `--download BUILD_ID`: Download build results
+- `--monitor BUILD_ID`: Monitor existing build with real-time output
+- `--download BUILD_ID`: Download build results only
 - `--status BUILD_ID`: Check build status
 - `--cancel BUILD_ID`: Cancel running build
 
 ### Advanced Options
 
-- `--farm`: Use APB Farm instead of direct server
-- `--list-servers`: List available servers
+- `--farm`: Use APB Farm instead of direct server (recommended)
+- `--list-servers`: List and test available servers
 - `--cleanup`: Trigger server cleanup
 - `--test-arch`: Test architecture compatibility
+
+---
+
+## Enhanced Configuration
+
+### Configuration File Locations
+
+The client searches for configuration files in this order:
+1. `./apb.json` (current directory)
+2. `~/.config/apb.json` (user config directory)
+3. `/etc/apb.json` (system-wide config)
+
+### Configuration Schema
+
+```json
+{
+  "servers": {
+    "x86_64": ["http://server1:8000", "http://server2:8000"],
+    "aarch64": ["http://arm-server:8000"],
+    "powerpc64le": ["http://power-server:8000"]
+  },
+  "farm_url": "http://farm.example.com:8080",
+  "default_server": "http://localhost:8000",
+  "default_arch": "x86_64",
+  "output_dir": "./output"
+}
+```
+
+### Configuration Options
+
+- **`servers`**: Map of architectures to server URLs for direct connections
+- **`farm_url`**: APB Farm URL (used with `--farm` flag)
+- **`default_server`**: Default server URL when no farm is configured
+- **`default_arch`**: Default architecture for builds
+- **`output_dir`**: Default output directory for downloaded files
+
+---
+
+## Architecture-Specific Output Organization
+
+The client automatically organizes downloaded files by architecture:
+
+```
+output/
+├── x86_64/
+│   ├── package-1.0.0-1-x86_64.pkg.tar.zst
+│   ├── package-debug-1.0.0-1-x86_64.pkg.tar.zst
+│   ├── build.log
+│   └── PKGBUILD
+├── aarch64/
+│   ├── package-1.0.0-1-aarch64.pkg.tar.zst
+│   └── build.log
+└── powerpc64le/
+    ├── package-1.0.0-1-powerpc64le.pkg.tar.zst
+    └── build.log
+```
+
+### Organization Features
+
+- **Architecture Separation**: Each architecture gets its own subdirectory
+- **Automatic Detection**: Architecture detected from build status or command line
+- **Consistent Naming**: Predictable directory structure for automation
+- **Fallback Handling**: Uses default architecture if detection fails
 
 ---
 
@@ -119,7 +195,7 @@ def build_package(self, files: List[Path]) -> str
 - `files` (List[Path]): List of file paths to upload (first should be PKGBUILD)
 
 **Returns:**
-- `str`: Build UUID (provided by APB Farm)
+- `str`: Build UUID
 
 **Raises:**
 - `requests.HTTPError`: On HTTP errors
@@ -142,7 +218,7 @@ def get_build_status(self, build_id: str) -> Dict
 ```
 
 **Parameters:**
-- `build_id` (str): Build UUID (provided by APB Farm)
+- `build_id` (str): Build UUID
 
 **Returns:**
 - `Dict`: Build status information
@@ -178,7 +254,7 @@ def cancel_build(self, build_id: str) -> bool
 ```
 
 **Parameters:**
-- `build_id` (str): Build UUID (provided by APB Farm)
+- `build_id` (str): Build UUID
 
 **Returns:**
 - `bool`: True if cancellation was successful
@@ -203,7 +279,7 @@ def download_file(self, build_id: str, filename: str, output_dir: Path) -> bool
 ```
 
 **Parameters:**
-- `build_id` (str): Build UUID (provided by APB Farm)
+- `build_id` (str): Build UUID
 - `filename` (str): Name of the file to download
 - `output_dir` (Path): Directory to save the file
 
@@ -219,34 +295,52 @@ success = client.download_file(
 )
 ```
 
-#### download_latest_build_files()
+#### get_build_output()
 
-Download all files from the latest build of a package.
+Get build output/logs.
 
 ```python
-def download_latest_build_files(self, pkgname: str, output_dir: Path, successful_only: bool = True) -> bool
+def get_build_output(self, build_id: str, start_index: int = 0, limit: int = 50) -> Dict
 ```
 
 **Parameters:**
-- `pkgname` (str): Package name
-- `output_dir` (Path): Directory to save files
-- `successful_only` (bool): Only consider successful builds
+- `build_id` (str): Build UUID
+- `start_index` (int): Starting line index
+- `limit` (int): Maximum number of lines
 
 **Returns:**
-- `bool`: True if download was successful
+- `Dict`: Build output with metadata
 
 **Example:**
 ```python
-success = client.download_latest_build_files(
-    "example-package",
-    Path("./downloads/"),
-    successful_only=True
-)
+output = client.get_build_output("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3", start_index=0, limit=100)
+for line in output['output']:
+    print(line)
+```
+
+#### stream_output()
+
+Stream build output in real-time.
+
+```python
+def stream_output(self, build_id: str) -> Generator[str, None, None]
+```
+
+**Parameters:**
+- `build_id` (str): Build UUID
+
+**Returns:**
+- `Generator[str, None, None]`: Generator yielding output lines
+
+**Example:**
+```python
+for line in client.stream_output("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3"):
+    print(line, end='')
 ```
 
 ---
 
-### Information Methods
+### Enhanced Information Methods
 
 #### get_build_by_id()
 
@@ -257,10 +351,10 @@ def get_build_by_id(self, build_id: str) -> Dict
 ```
 
 **Parameters:**
-- `build_id` (str): Build UUID (provided by APB Farm)
+- `build_id` (str): Build UUID
 
 **Returns:**
-- `Dict`: Detailed build information
+- `Dict`: Detailed build information including packages, logs, and metadata
 
 #### get_builds_by_pkgname()
 
@@ -292,52 +386,34 @@ def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True
 **Returns:**
 - `Dict`: Latest build information
 
+#### download_latest_build_files()
+
+Download all files from the latest build of a package.
+
+```python
+def download_latest_build_files(self, pkgname: str, output_dir: Path, successful_only: bool = True) -> bool
+```
+
+**Parameters:**
+- `pkgname` (str): Package name
+- `output_dir` (Path): Directory to save files
+- `successful_only` (bool): Only consider successful builds
+
+**Returns:**
+- `bool`: True if download was successful
+
+**Example:**
+```python
+success = client.download_latest_build_files(
+    "example-package",
+    Path("./downloads/"),
+    successful_only=True
+)
+```
+
 ---
 
-### Output Methods
-
-#### get_build_output()
-
-Get build output/logs.
-
-```python
-def get_build_output(self, build_id: str, start_index: int = 0, limit: int = 50) -> Dict
-```
-
-**Parameters:**
-- `build_id` (str): Build UUID (provided by APB Farm)
-- `start_index` (int): Starting line index
-- `limit` (int): Maximum number of lines
-
-**Returns:**
-- `Dict`: Build output with metadata
-
-**Example:**
-```python
-output = client.get_build_output("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3", start_index=0, limit=100)
-for line in output['output']:
-    print(line)
-```
-
-#### stream_output()
-
-Stream build output in real-time.
-
-```python
-def stream_output(self, build_id: str) -> Generator[str, None, None]
-```
-
-**Parameters:**
-- `build_id` (str): Build UUID (provided by APB Farm)
-
-**Returns:**
-- `Generator[str, None, None]`: Generator yielding output lines
-
-**Example:**
-```python
-for line in client.stream_output("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3"):
-    print(line, end='')
-```
+### Real-time Monitoring Methods
 
 #### stream_build_updates()
 
@@ -348,7 +424,7 @@ def stream_build_updates(self, build_id: str) -> Generator[Dict, None, None]
 ```
 
 **Parameters:**
-- `build_id` (str): Build UUID (provided by APB Farm)
+- `build_id` (str): Build UUID
 
 **Returns:**
 - `Generator[Dict, None, None]`: Generator yielding status updates
@@ -360,10 +436,6 @@ for update in client.stream_build_updates("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3"
     if update['status'] in ['completed', 'failed', 'cancelled']:
         break
 ```
-
----
-
-### Utility Methods
 
 #### get_latest_successful_build_id()
 
@@ -379,6 +451,10 @@ def get_latest_successful_build_id(self, is_interactive: bool = True) -> str
 **Returns:**
 - `str`: Build ID of the latest successful build
 
+---
+
+### Utility Methods
+
 #### cleanup_server()
 
 Trigger server cleanup.
@@ -389,37 +465,6 @@ def cleanup_server(self) -> bool
 
 **Returns:**
 - `bool`: True if cleanup was triggered successfully
-
----
-
-## Configuration
-
-### Configuration File
-
-The client looks for configuration files in these locations:
-1. `./apb.json` (current directory)
-2. `~/.config/apb.json` (user config directory)
-3. `/etc/apb.json` (system-wide config)
-
-### Configuration Schema
-
-```json
-{
-  "servers": {
-    "x86_64": [
-      "http://server1.example.com:8000",
-      "http://server2.example.com:8000"
-    ],
-    "aarch64": [
-      "http://arm-server1.example.com:8000"
-    ]
-  },
-  "default_server": "http://localhost:8000",
-  "default_arch": "x86_64",
-  "output_dir": "./output",
-  "farm_url": "http://farm.example.com:8080"
-}
-```
 
 ---
 
@@ -446,8 +491,8 @@ def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path])
 Monitor a build with optional real-time output and automatic downloading.
 
 ```python
-def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None, 
-                 verbose: bool = False, allow_toggle: bool = True, 
+def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
+                 verbose: bool = False, allow_toggle: bool = True,
                  status_callback = None, pkgname: str = None) -> bool
 ```
 
@@ -458,18 +503,25 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
 - `verbose` (bool): Enable verbose output
 - `allow_toggle` (bool): Allow toggling output display
 - `status_callback` (callable, optional): Callback for status updates
-- `pkgname` (str, optional): Package name to display (if not provided, will try to get from server)
+- `pkgname` (str, optional): Package name to display
 
 **Returns:**
 - `bool`: True if build was successful
+
+**Enhanced Monitoring Features:**
+- **Interactive Controls**: Press 'd' to toggle detailed output, 's' for summary only
+- **Real-time Updates**: Live build status and progress tracking
+- **Automatic Downloads**: Downloads artifacts when build completes successfully
+- **Error Handling**: Graceful handling of connection issues and server unavailability
+- **Status Callbacks**: Custom callbacks for build status changes
 
 ### build_for_multiple_arches()
 
 Build a package for multiple architectures using available servers.
 
 ```python
-def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict, 
-                            verbose: bool = False, detach: bool = False, 
+def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
+                            verbose: bool = False, detach: bool = False,
                             specific_arch: str = None) -> bool
 ```
 
@@ -484,6 +536,90 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
 **Returns:**
 - `bool`: True if all builds were successful
 
+**Multi-Architecture Features:**
+- **Automatic Server Selection**: Chooses best server for each architecture
+- **Parallel Processing**: Handles multiple builds concurrently
+- **Progress Tracking**: Shows progress for all builds simultaneously
+- **Architecture Filtering**: Can build for specific architectures only
+- **Intelligent Fallback**: Falls back to farm if direct servers unavailable
+
+---
+
+## Enhanced PKGBUILD Processing
+
+### parse_pkgbuild_info()
+
+Parse PKGBUILD file to extract package information.
+
+```python
+def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]
+```
+
+**Parameters:**
+- `pkgbuild_path` (Path): Path to PKGBUILD file
+
+**Returns:**
+- `Dict`: Package information including name, version, and architectures
+
+**Enhanced Parsing Features:**
+- **pkgbase Support**: Prefers pkgbase over pkgname when defined
+- **Array Handling**: Properly handles pkgname arrays and architecture arrays
+- **Version Detection**: Extracts pkgver and pkgrel information
+- **Architecture Analysis**: Parses target architectures for build routing
+
+**Example:**
+```python
+info = parse_pkgbuild_info(Path("PKGBUILD"))
+print(f"Package: {info['pkgname']}")
+print(f"Version: {info['pkgver']}-{info['pkgrel']}")
+print(f"Architectures: {info['arch']}")
+```
+
+---
+
+## Configuration Management
+
+### load_config()
+
+Load configuration from file with fallback handling.
+
+```python
+def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]
+```
+
+**Parameters:**
+- `config_path` (Path, optional): Specific config file path
+
+**Returns:**
+- `Dict`: Configuration dictionary with defaults
+
+**Configuration Features:**
+- **Multiple Locations**: Searches standard configuration locations
+- **Fallback Defaults**: Provides sensible defaults when config is missing
+- **Validation**: Validates configuration structure and values
+- **Environment Variables**: Supports environment variable overrides
+
+### determine_server_url()
+
+Determine which server URL to use based on configuration and options.
+
+```python
+def determine_server_url(args: argparse.Namespace, config: Dict) -> str
+```
+
+**Parameters:**
+- `args` (argparse.Namespace): Command line arguments
+- `config` (Dict): Configuration dictionary
+
+**Returns:**
+- `str`: Server URL to use
+
+**Server Selection Logic:**
+1. Use `--server` flag if provided
+2. Use farm URL if `--farm` flag is provided
+3. Use `default_server` from config
+4. Fall back to localhost:8000
+
 ---
 
 ## Error Handling
@@ -497,19 +633,31 @@ The client raises standard `requests` exceptions:
 - `requests.Timeout`: Request timeouts
 - `requests.RequestException`: General request errors
 
-### Error Handling Examples
+### Enhanced Error Handling
 
 ```python
 try:
     build_id = client.build_package([Path("PKGBUILD")])
 except requests.HTTPError as e:
-    print(f"HTTP Error: {e.response.status_code}")
-    print(f"Response: {e.response.text}")
+    if e.response.status_code == 503:
+        print("Server unavailable - try again later")
+    elif e.response.status_code == 400:
+        print("Invalid PKGBUILD or build request")
+    else:
+        print(f"HTTP Error: {e.response.status_code}")
+        print(f"Response: {e.response.text}")
 except requests.ConnectionError:
-    print("Could not connect to server")
+    print("Could not connect to server - check URL and network")
 except requests.RequestException as e:
     print(f"Request error: {e}")
 ```
+
+### Server Unavailability Handling
+
+- **Cached Responses**: Uses cached build status during server outages
+- **Graceful Degradation**: Continues operation with limited functionality
+- **Retry Logic**: Automatic retries for transient network issues
+- **Fallback Mechanisms**: Falls back to alternative servers when available
 
 ---
 
@@ -533,10 +681,10 @@ print(f"Build started: {build_id}")
 while True:
     status = client.get_build_status(build_id)
     print(f"Status: {status['status']}")
-    
+
     if status['status'] in ['completed', 'failed', 'cancelled']:
         break
-    
+
     time.sleep(5)
 
 # Download results if successful
@@ -552,21 +700,26 @@ if status['status'] == 'completed':
 ### Real-time Build Monitoring
 
 ```python
-from apb import APBotClient
+from apb import APBotClient, monitor_build
 
 client = APBotClient("http://build-server.example.com:8000")
 
 # Submit build
 build_id = client.build_package([Path("PKGBUILD")])
 
-# Stream output
-print("Build output:")
-for line in client.stream_output(build_id):
-    print(line, end='')
+# Monitor with real-time output and automatic downloading
+success = monitor_build(
+    build_id,
+    client,
+    output_dir=Path("./output/x86_64"),
+    verbose=True,
+    allow_toggle=True
+)
 
-# Check final status
-status = client.get_build_status(build_id)
-print(f"\nFinal status: {status['status']}")
+if success:
+    print("Build completed successfully!")
+else:
+    print("Build failed or was cancelled")
 ```
 
 ### Multi-Architecture Build
@@ -583,13 +736,30 @@ success = build_for_multiple_arches(
     build_path=Path("./my-package/"),
     output_dir=Path("./output/"),
     config=config,
-    verbose=True
+    verbose=True,
+    specific_arch="x86_64,aarch64"  # Optional: build only these architectures
 )
 
 if success:
     print("All builds completed successfully")
 else:
     print("Some builds failed")
+```
+
+### Using APB Farm
+
+```python
+from apb import APBotClient
+
+# Connect to farm instead of individual server
+client = APBotClient("http://farm.example.com:8080")
+
+# Farm automatically routes builds to appropriate servers
+build_id = client.build_package([Path("PKGBUILD")])
+
+# Monitor as usual - farm handles server unavailability
+status = client.get_build_status(build_id)
+print(f"Build routed to: {status.get('server_url', 'unknown')}")
 ```
 
 ---
@@ -600,18 +770,34 @@ else:
 - Always wrap API calls in try-except blocks
 - Check build status before attempting downloads
 - Handle connection errors gracefully
+- Use retry logic for transient failures
 
 ### Performance
 - Use streaming methods for large outputs
 - Implement proper timeout handling
 - Cache server information when possible
+- Use farms for automatic load balancing
+
+### Configuration
+- Use configuration files for consistent settings
+- Set appropriate default architectures
+- Configure output directories for organization
+- Use farms for multi-server environments
+
+### Monitoring
+- Implement status callbacks for long-running builds
+- Use real-time streaming for immediate feedback
+- Enable interactive controls for manual monitoring
+- Set up automatic downloading for completed builds
 
 ### Security
 - Use HTTPS in production
 - Validate server certificates
 - Implement proper authentication if required
+- Sanitize file paths and names
 
-### Monitoring
-- Implement status callbacks for long-running builds
-- Use appropriate polling intervals
-- Clean up resources after build completion 
+### Architecture Management
+- Specify target architectures explicitly when needed
+- Use farm routing for automatic architecture selection
+- Organize output by architecture for clarity
+- Test builds on multiple architectures when possible

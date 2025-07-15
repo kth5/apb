@@ -37,7 +37,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Version and constants
-VERSION = "2025-07-11"
+VERSION = "2025-07-15"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_CONFIG_PATHS = [
@@ -46,6 +46,33 @@ DEFAULT_CONFIG_PATHS = [
     Path.home() / ".apb" / "apb.json",
     Path.home() / ".apb-farm" / "apb.json"
 ]
+
+# Classes need to be defined before global state to avoid NameError
+class BuildStatus:
+    QUEUED = "queued"
+    BUILDING = "building"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ServerHealth(Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+    MISCONFIGURED = "misconfigured"
+
+
+@dataclass
+class ServerStatus:
+    url: str
+    last_successful_contact: Optional[float] = None
+    last_failed_contact: Optional[float] = None
+    consecutive_failures: int = 0
+    last_known_architecture: Optional[str] = None
+    health: ServerHealth = ServerHealth.HEALTHY
+    last_response: Optional[Dict] = None
+
 
 # Global state
 config: Dict[str, Any] = {}
@@ -84,7 +111,8 @@ async def lifespan(app: FastAPI):
     background_tasks.extend([
         asyncio.create_task(process_build_queue()),
         asyncio.create_task(update_build_status()),
-        asyncio.create_task(discover_builds())
+        asyncio.create_task(discover_builds()),
+        asyncio.create_task(handle_unavailable_servers())
     ])
 
     logger.info(f"APB Farm started with {len(config.get('servers', {}))} architecture groups")
@@ -92,22 +120,42 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    logger.info("Starting APB Farm shutdown...")
+
     # Signal shutdown
     shutdown_event.set()
 
-    # Cancel background tasks
-    for task in background_tasks:
-        task.cancel()
+    # Cancel background tasks with timeout
+    if background_tasks:
+        logger.info(f"Cancelling {len(background_tasks)} background tasks...")
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
 
-    # Wait for tasks to complete
-    await asyncio.gather(*background_tasks, return_exceptions=True)
+        # Wait for tasks to complete with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*background_tasks, return_exceptions=True),
+                timeout=10  # Give tasks 10 seconds to clean up
+            )
+            logger.info("Background tasks cancelled successfully")
+        except asyncio.TimeoutError:
+            logger.warning("Some background tasks did not complete within timeout")
 
     # Cleanup HTTP session
-    await cleanup_http_session()
+    try:
+        await cleanup_http_session()
+        logger.info("HTTP session cleaned up")
+    except Exception as e:
+        logger.warning(f"Error cleaning up HTTP session: {e}")
 
     # Close database
     if build_database:
-        build_database.close()
+        try:
+            build_database.close()
+            logger.info("Database connection closed")
+        except Exception as e:
+            logger.warning(f"Error closing database: {e}")
 
     logger.info("APB Farm shutdown complete")
 
@@ -130,32 +178,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-class BuildStatus:
-    QUEUED = "queued"
-    BUILDING = "building"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-class ServerHealth(Enum):
-    HEALTHY = "healthy"
-    DEGRADED = "degraded" 
-    UNAVAILABLE = "unavailable"
-    MISCONFIGURED = "misconfigured"
-
-
-@dataclass
-class ServerStatus:
-    url: str
-    last_successful_contact: Optional[float] = None
-    last_failed_contact: Optional[float] = None
-    consecutive_failures: int = 0
-    last_known_architecture: Optional[str] = None
-    health: ServerHealth = ServerHealth.HEALTHY
-    last_response: Optional[Dict] = None
 
 
 def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -195,16 +217,43 @@ def init_database() -> sqlite3.Connection:
             end_time REAL,
             created_at REAL,
             queue_position INTEGER,
-            submission_group TEXT
+            submission_group TEXT,
+            last_known_status TEXT,
+            last_status_update REAL,
+            server_available BOOLEAN DEFAULT 1,
+            cached_response TEXT
         )
     ''')
 
-    # Add the submission_group column if it doesn't exist (for existing databases)
+    # Add new columns if they don't exist (for existing databases)
     try:
         conn.execute('ALTER TABLE builds ADD COLUMN submission_group TEXT')
         conn.commit()
     except sqlite3.OperationalError:
-        # Column already exists
+        pass
+
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN last_known_status TEXT')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN last_status_update REAL')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN server_available BOOLEAN DEFAULT 1')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN cached_response TEXT')
+        conn.commit()
+    except sqlite3.OperationalError:
         pass
 
     conn.commit()
@@ -303,92 +352,120 @@ async def get_server_info(server_url: str) -> Optional[Dict]:
     if cached_info:
         cache_age = current_time - cached_info.get('_cached_at', 0)
 
-        # Use cached successful response if still valid (60 seconds)
-        if cached_info.get('_success', False) and cache_age < 60:
+        # Use cached successful response if still valid (increased from 60 to 90 seconds)
+        if cached_info.get('_success', False) and cache_age < 90:
             return cached_info
 
-        # Use cached failure for shorter time (30 seconds) to reduce server load
-        if not cached_info.get('_success', True) and cache_age < 30:
+        # Use cached failure for longer time (increased from 30 to 45 seconds)
+        if not cached_info.get('_success', True) and cache_age < 45:
             return None
 
-    # Attempt to contact server
-    try:
-        async with http_session.get(f"{server_url}/", timeout=10) as response:
-            if response.status == 200:
-                info = await response.json()
+    # Attempt to contact server with reduced retries and faster timeouts
+    max_retries = 2  # Reduced from 3 to 2
+    for attempt in range(max_retries):
+        try:
+            # Reduced timeout to prevent blocking (was 30 seconds, now 8 seconds)
+            timeout = aiohttp.ClientTimeout(total=8, connect=3)
 
-                # Successful contact - update health tracking
-                status.last_successful_contact = current_time
-                status.consecutive_failures = 0
-                status.last_response = info
+            async with http_session.get(f"{server_url}/", timeout=timeout) as response:
+                if response.status == 200:
+                    info = await response.json()
 
-                # Track architecture if provided
-                if 'supported_architecture' in info:
-                    status.last_known_architecture = info['supported_architecture']
+                    # Successful contact - update health tracking
+                    status.last_successful_contact = current_time
+                    status.consecutive_failures = 0
+                    status.last_response = info
 
-                # Update health status (recovery)
-                if status.health in [ServerHealth.DEGRADED, ServerHealth.UNAVAILABLE]:
-                    status.health = ServerHealth.HEALTHY
-                    logger.info(f"Server {server_url} recovered to healthy state")
+                    # Track architecture if provided
+                    if 'supported_architecture' in info:
+                        status.last_known_architecture = info['supported_architecture']
 
-                # Cache successful response
-                info['_cached_at'] = current_time
-                info['_success'] = True
-                server_info_cache[cache_key] = info
+                    # Update health status (recovery)
+                    if status.health in [ServerHealth.DEGRADED, ServerHealth.UNAVAILABLE]:
+                        status.health = ServerHealth.HEALTHY
+                        logger.info(f"Server {server_url} recovered to healthy state")
 
-                return info
+                    # Cache successful response
+                    info['_cached_at'] = current_time
+                    info['_success'] = True
+                    server_info_cache[cache_key] = info
+
+                    return info
+                else:
+                    raise Exception(f"HTTP {response.status}")
+
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                # Shorter backoff: wait 0.5, 1 second
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
             else:
-                raise Exception(f"HTTP {response.status}")
+                raise Exception("Timeout after retries")
+        except Exception as e:
+            if attempt < max_retries - 1:
+                # Shorter backoff for other errors too
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            else:
+                # Failed contact - update health tracking
+                status.last_failed_contact = current_time
+                status.consecutive_failures += 1
 
-    except Exception as e:
-        # Failed contact - update health tracking
-        status.last_failed_contact = current_time
-        status.consecutive_failures += 1
+                # Be more conservative about marking servers as degraded
+                # Only mark as degraded/unavailable if we have multiple consecutive failures
+                # Special handling for HTTP 502 errors - these are often temporary
+                if "502" in str(e) and status.consecutive_failures < 10:
+                    # For HTTP 502 errors, don't mark as degraded immediately
+                    status.health = ServerHealth.UNAVAILABLE
+                    logger.debug(f"Server {server_url} returning HTTP 502 (failure #{status.consecutive_failures}), likely busy processing builds")
+                elif status.consecutive_failures >= 15:  # Increased from 10 to 15
+                    if status.health != ServerHealth.DEGRADED:
+                        status.health = ServerHealth.DEGRADED
+                        logger.error(f"Server {server_url} marked as SEVERELY DEGRADED after {status.consecutive_failures} consecutive failures")
+                elif status.consecutive_failures >= 5:  # Increased from 3 to 5
+                    if status.health != ServerHealth.DEGRADED:
+                        status.health = ServerHealth.DEGRADED
+                        logger.warning(f"Server {server_url} marked as DEGRADED after {status.consecutive_failures} consecutive failures")
+                else:
+                    status.health = ServerHealth.UNAVAILABLE
 
-        # Update health status based on failure count
-        if status.consecutive_failures >= 10:  # 10 failures = misconfigured
-            if status.health != ServerHealth.MISCONFIGURED:
-                status.health = ServerHealth.MISCONFIGURED
-                logger.error(f"Server {server_url} marked as MISCONFIGURED after {status.consecutive_failures} consecutive failures")
-        elif status.consecutive_failures >= 3:  # 3 failures = degraded
-            if status.health != ServerHealth.DEGRADED:
-                status.health = ServerHealth.DEGRADED
-                logger.warning(f"Server {server_url} marked as DEGRADED after {status.consecutive_failures} consecutive failures")
-        else:
-            status.health = ServerHealth.UNAVAILABLE
+                # Use debug level for frequent timeout errors to reduce log noise
+                if "Timeout" in str(e):
+                    logger.debug(f"Timeout fetching info from {server_url} (failure #{status.consecutive_failures}): {e}")
+                else:
+                    logger.warning(f"Error fetching info from {server_url} (failure #{status.consecutive_failures}): {e}")
 
-        logger.error(f"Error fetching info from {server_url} (failure #{status.consecutive_failures}): {e}")
+                # Cache failure with shorter TTL
+                failure_info = {
+                    '_cached_at': current_time,
+                    '_success': False,
+                    '_error': str(e)
+                }
+                server_info_cache[cache_key] = failure_info
 
-        # Cache failure with shorter TTL
-        failure_info = {
-            '_cached_at': current_time,
-            '_success': False,
-            '_error': str(e)
-        }
-        server_info_cache[cache_key] = failure_info
-
-        return None
+                return None
 
 
 async def find_build_server(build_id: str) -> Optional[str]:
     """Find which server is handling a build"""
-    # First check database
+    # Check database for server assignment
     cursor = build_database.cursor()
-    cursor.execute("SELECT server_url FROM builds WHERE id = ?", (build_id,))
+    cursor.execute("SELECT server_url, server_available FROM builds WHERE id = ?", (build_id,))
     result = cursor.fetchone()
+
     if result:
-        return result[0]
+        server_url, server_available = result
+        if server_url:
+            # We know which server should have this build
+            if server_available is False:
+                logger.warning(f"Build {build_id} is on server {server_url} but server is marked unavailable")
+            return server_url
 
-    # Search all servers
-    for arch_servers in config.get("servers", {}).values():
-        for server_url in arch_servers:
-            try:
-                async with http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10) as response:
-                    if response.status == 200:
-                        return server_url
-            except Exception:
-                continue
-
+    # Build not found in our database - this means it was either:
+    # 1. Never submitted through this farm
+    # 2. Submitted but failed before server assignment
+    # 3. Database was corrupted/reset
+    logger.warning(f"Build {build_id} not found in farm database - may not have been submitted through this farm")
     return None
 
 
@@ -396,67 +473,113 @@ async def get_available_architectures() -> Dict[str, List[str]]:
     """
     Get available architectures with resilient logic that uses last known
     good architecture information during temporary server failures.
+    Process servers concurrently to avoid blocking.
     """
     global server_status_tracker
 
     available_archs = {}
     degraded_servers = []
 
-    # Query all configured servers to get their actual supported architectures
+    # Collect all server URLs for concurrent processing
+    all_servers = []
     for config_arch, server_urls in config.get("servers", {}).items():
         for server_url in server_urls:
+            all_servers.append((config_arch, server_url))
+
+    # Process all servers concurrently with timeout protection
+    async def check_server(config_arch: str, server_url: str):
+        try:
+            # Get current server info (this updates health tracking)
+            server_info = await get_server_info(server_url)
+
+            # Get server status for health tracking
+            status = server_status_tracker.get(server_url)
+            if not status:
+                return None
+
+            # Determine supported architecture
+            supported_arch = None
+
+            if server_info and 'supported_architecture' in server_info:
+                # Use current response
+                supported_arch = server_info['supported_architecture']
+            elif status.last_known_architecture:
+                # Fall back to last known good architecture for temporarily unavailable servers
+                supported_arch = status.last_known_architecture
+                if status.health == ServerHealth.UNAVAILABLE:
+                    logger.debug(f"Using last known architecture {supported_arch} for temporarily unavailable server {server_url}")
+
+            if supported_arch:
+                # Log if there's a mismatch between config and actual
+                if config_arch != supported_arch:
+                    logger.warning(f"Server {server_url} configured for {config_arch} but supports {supported_arch}")
+
+                return {
+                    'server_url': server_url,
+                    'supported_arch': supported_arch,
+                    'status': status,
+                    'config_arch': config_arch
+                }
+            else:
+                # Only warn if we've never successfully contacted this server
+                if not status.last_known_architecture:
+                    logger.warning(f"Server {server_url} did not report supported architecture and has no known architecture")
+                return None
+
+        except Exception as e:
+            logger.debug(f"Error checking server {server_url}: {e}")
+            return None
+
+    # Process all servers concurrently
+    if all_servers:
+        # Create actual tasks from coroutines so we can properly cancel them on timeout
+        tasks = [asyncio.create_task(check_server(config_arch, server_url)) for config_arch, server_url in all_servers]
+
+        try:
+            # Set a reasonable timeout for the entire architecture discovery process
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=15  # Maximum 15 seconds for all server checks
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Global timeout reached while checking {len(all_servers)} servers for available architectures")
+            # Cancel any remaining tasks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait a bit for tasks to finish cancellation
             try:
-                # Get current server info (this updates health tracking)
-                server_info = await get_server_info(server_url)
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+            results = []
 
-                # Get server status for health tracking
-                status = server_status_tracker.get(server_url)
-                if not status:
-                    continue
+        # Process results
+        for result in results:
+            if isinstance(result, dict) and result:
+                server_url = result['server_url']
+                supported_arch = result['supported_arch']
+                status = result['status']
 
-                # Determine supported architecture
-                supported_arch = None
+                if supported_arch not in available_archs:
+                    available_archs[supported_arch] = []
 
-                if server_info and 'supported_architecture' in server_info:
-                    # Use current response
-                    supported_arch = server_info['supported_architecture']
-                elif status.last_known_architecture:
-                    # Fall back to last known good architecture for temporarily unavailable servers
-                    supported_arch = status.last_known_architecture
-                    if status.health == ServerHealth.UNAVAILABLE:
-                        logger.info(f"Using last known architecture {supported_arch} for temporarily unavailable server {server_url}")
+                # Include server based on health status
+                if status.health == ServerHealth.HEALTHY:
+                    available_archs[supported_arch].append(server_url)
+                elif status.health == ServerHealth.DEGRADED:
+                    # Include degraded servers but track them
+                    available_archs[supported_arch].append(server_url)
+                    degraded_servers.append(server_url)
+                elif status.health == ServerHealth.UNAVAILABLE:
+                    # Include temporarily unavailable servers with last known architecture
+                    # This prevents them from being marked as misconfigured
+                    available_archs[supported_arch].append(server_url)
+                # MISCONFIGURED servers are NOT included
 
-                if supported_arch:
-                    if supported_arch not in available_archs:
-                        available_archs[supported_arch] = []
-
-                    # Include server based on health status
-                    if status.health == ServerHealth.HEALTHY:
-                        available_archs[supported_arch].append(server_url)
-                    elif status.health == ServerHealth.DEGRADED:
-                        # Include degraded servers but track them
-                        available_archs[supported_arch].append(server_url)
-                        degraded_servers.append(server_url)
-                    elif status.health == ServerHealth.UNAVAILABLE:
-                        # Include temporarily unavailable servers with last known architecture
-                        # This prevents them from being marked as misconfigured
-                        available_archs[supported_arch].append(server_url)
-                    # MISCONFIGURED servers are NOT included
-
-                    # Log if there's a mismatch between config and actual
-                    if config_arch != supported_arch:
-                        logger.warning(f"Server {server_url} configured for {config_arch} but supports {supported_arch}")
-                else:
-                    # Only warn if we've never successfully contacted this server
-                    if not status.last_known_architecture:
-                        logger.warning(f"Server {server_url} did not report supported architecture and has no known architecture")
-
-            except Exception as e:
-                logger.error(f"Error checking server {server_url}: {e}")
-
-    # Log degraded servers for monitoring
+    # Log degraded servers for monitoring (reduce log frequency)
     if degraded_servers:
-        logger.warning(f"Degraded servers (high failure rate): {degraded_servers}")
+        logger.debug(f"Degraded servers (high failure rate): {degraded_servers}")
 
     return available_archs
 
@@ -540,11 +663,11 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     # Store in database
     cursor = build_database.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO builds 
+        INSERT OR REPLACE INTO builds
         (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        build_id, None, None, pkgname, BuildStatus.QUEUED, 
+        build_id, None, None, pkgname, BuildStatus.QUEUED,
         None, None, time.time(), len(build_queue), None
     ))
     build_database.commit()
@@ -558,8 +681,11 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
     submission_group = str(uuid.uuid4())  # Group ID to track related builds
     queued_builds = []
 
+    logger.info(f"Starting build submission for package '{pkgname}' with target architectures: {target_archs}")
+
     # Get actual available architectures from servers
     available_archs = await get_available_architectures()
+    logger.info(f"Available server architectures: {list(available_archs.keys())}")
 
     # Find architectures that have available servers
     buildable_archs = []
@@ -605,14 +731,18 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
                     logger.info(f"Selected architecture '{best_arch}' for 'any' architecture package (lowest load: {best_load:.1f})")
                 else:
                     skipped_archs.append(arch)
+                    logger.warning(f"No available servers for 'any' architecture")
             else:
                 skipped_archs.append(arch)
+                logger.warning(f"No server architectures available for 'any' architecture")
         else:
             # Check if this specific architecture has available servers
             if arch in available_archs and available_archs[arch]:
                 buildable_archs.append(arch)
+                logger.info(f"Architecture '{arch}' has {len(available_archs[arch])} available server(s)")
             else:
                 skipped_archs.append(arch)
+                logger.warning(f"No available servers for architecture '{arch}'")
 
     # Remove duplicates while preserving order
     buildable_archs = list(dict.fromkeys(buildable_archs))
@@ -621,7 +751,7 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
     if buildable_archs:
         logger.info(f"Queuing builds for architectures: {buildable_archs}")
     if skipped_archs:
-        logger.info(f"Skipping architectures (no available servers): {skipped_archs}")
+        logger.warning(f"Skipping architectures (no available servers): {skipped_archs}")
 
     # Create a separate build for each available architecture
     for arch in buildable_archs:
@@ -644,11 +774,11 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         # Store in database
         cursor = build_database.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO builds 
+            INSERT OR REPLACE INTO builds
             (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            build_id, None, arch, pkgname, BuildStatus.QUEUED, 
+            build_id, None, arch, pkgname, BuildStatus.QUEUED,
             None, None, time.time(), len(build_queue), submission_group
         ))
         build_database.commit()
@@ -662,6 +792,9 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             "created_at": time.time()
         })
 
+        logger.info(f"Created build {build_id} for architecture '{arch}' (package: {pkgname})")
+
+    logger.info(f"Submission complete: {len(queued_builds)} build(s) queued for package '{pkgname}' with submission group {submission_group}")
     return queued_builds
 
 
@@ -673,13 +806,15 @@ async def process_build_queue():
                 build_info = build_queue.pop(0)
                 build_id = build_info["build_id"]
                 target_arch = build_info["target_architectures"][0]  # Now each build has exactly one architecture
+                retry_count = build_info.get("retry_count", 0)
+                max_retries = 3
 
                 # Get actual available architectures from servers
                 available_archs = await get_available_architectures()
 
                 # Check if we have servers for this architecture
                 if target_arch not in available_archs or not available_archs[target_arch]:
-                    logger.error(f"No available servers for architecture {target_arch}")
+                    logger.error(f"No available servers for architecture {target_arch}, build {build_id} failed")
                     # Mark build as failed
                     cursor = build_database.cursor()
                     cursor.execute('''
@@ -694,12 +829,61 @@ async def process_build_queue():
 
                 if server_url:
                     # Forward build to server
-                    await forward_build_to_server(build_info, server_url)
+                    result = await forward_build_to_server(build_info, server_url)
+
+                    if result is True:
+                        # Successfully submitted
+                        logger.info(f"Build {build_id} successfully queued on {server_url}")
+
+                    elif result is False:
+                        # Server rejected the build - don't retry, mark as failed
+                        logger.error(f"Build {build_id} permanently rejected by {server_url}")
+
+                    elif result is None:
+                        # Temporary error (timeout, network) - retry with exponential backoff
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            build_info["retry_count"] = retry_count
+                            delay = min(30 * (2 ** (retry_count - 1)), 300)  # Cap at 5 minutes
+
+                            logger.warning(f"Build {build_id} submission failed (retry {retry_count}/{max_retries}), "
+                                         f"requeueing with {delay}s delay")
+
+                            # Wait and requeue
+                            await asyncio.sleep(delay)
+                            build_queue.append(build_info)
+                        else:
+                            # Max retries reached - mark as failed
+                            logger.error(f"Build {build_id} failed after {max_retries} retry attempts")
+                            cursor = build_database.cursor()
+                            cursor.execute('''
+                                UPDATE builds SET status = ?, end_time = ?
+                                WHERE id = ?
+                            ''', (BuildStatus.FAILED, time.time(), build_id))
+                            build_database.commit()
+
                 else:
-                    # No suitable server available, requeue with delay
-                    logger.warning(f"No available server for architecture {target_arch}, requeueing build {build_id}")
-                    await asyncio.sleep(30)
-                    build_queue.append(build_info)
+                    # No suitable server available
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        build_info["retry_count"] = retry_count
+                        delay = min(30 * retry_count, 180)  # Cap at 3 minutes for server availability
+
+                        logger.warning(f"No available server for architecture {target_arch}, "
+                                     f"requeueing build {build_id} (attempt {retry_count}/{max_retries + 1}) "
+                                     f"with {delay}s delay")
+
+                        await asyncio.sleep(delay)
+                        build_queue.append(build_info)
+                    else:
+                        logger.error(f"No servers available for architecture {target_arch} after {max_retries + 1} attempts, "
+                                   f"marking build {build_id} as failed")
+                        cursor = build_database.cursor()
+                        cursor.execute('''
+                            UPDATE builds SET status = ?, end_time = ?
+                            WHERE id = ?
+                        ''', (BuildStatus.FAILED, time.time(), build_id))
+                        build_database.commit()
 
             await asyncio.sleep(5)
         except Exception as e:
@@ -709,24 +893,29 @@ async def process_build_queue():
 
 async def forward_build_to_server(build_info: Dict, server_url: str):
     """Forward a build to a specific server"""
-    try:
-        build_id = build_info["build_id"]
+    build_id = build_info["build_id"]
 
+    try:
         # Create form data
         data = aiohttp.FormData()
         data.add_field('build_id', build_id)
-        data.add_field('pkgbuild', build_info["pkgbuild_content"], 
+        data.add_field('pkgbuild', build_info["pkgbuild_content"],
                       filename='PKGBUILD', content_type='text/plain')
 
         # Add source files
         for source_file in build_info.get("source_files", []):
-            data.add_field('sources', source_file["content"], 
-                          filename=source_file["filename"], 
+            data.add_field('sources', source_file["content"],
+                          filename=source_file["filename"],
                           content_type=source_file["content_type"])
 
-        async with http_session.post(f"{server_url}/build", data=data, timeout=30) as response:
+        # Use longer timeout for build submissions (increased from 30 to 60 seconds)
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+
+        logger.info(f"Forwarding build {build_id} to {server_url}")
+
+        async with http_session.post(f"{server_url}/build", data=data, timeout=timeout) as response:
             if response.status == 200:
-                # Update database
+                # Successful submission - update database
                 cursor = build_database.cursor()
                 cursor.execute('''
                     UPDATE builds SET server_url = ?, status = ?, start_time = ?
@@ -734,46 +923,140 @@ async def forward_build_to_server(build_info: Dict, server_url: str):
                 ''', (server_url, BuildStatus.BUILDING, time.time(), build_id))
                 build_database.commit()
 
-                logger.info(f"Build {build_id} forwarded to {server_url}")
+                logger.info(f"Build {build_id} successfully forwarded to {server_url}")
+                return True
+
             else:
-                logger.error(f"Failed to forward build {build_id} to {server_url}: {response.status}")
-                # Requeue with delay
-                await asyncio.sleep(30)
-                build_queue.append(build_info)
+                # Server returned error - log details and mark as failed
+                try:
+                    error_text = await response.text()
+                    logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}: {error_text}")
+                except:
+                    logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}")
+
+                # Update database to mark build as failed
+                cursor = build_database.cursor()
+                cursor.execute('''
+                    UPDATE builds SET status = ?, end_time = ?
+                    WHERE id = ?
+                ''', (BuildStatus.FAILED, time.time(), build_id))
+                build_database.commit()
+
+                return False
+
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout forwarding build {build_id} to {server_url}")
+        # Mark server as temporarily unavailable but don't fail the build immediately
+        # Instead, requeue for retry with another server
+        return None
+
     except Exception as e:
-        logger.error(f"Error forwarding build {build_info['build_id']} to {server_url}: {e}")
-        # Requeue with delay
-        await asyncio.sleep(30)
-        build_queue.append(build_info)
+        logger.error(f"Error forwarding build {build_id} to {server_url}: {e}")
+        # Network or other error - requeue for retry
+        return None
+
+
+async def update_single_build_status(build_id: str, server_url: str):
+    """Update status for a single build with proper error isolation"""
+    try:
+        # Use shorter timeout specifically for status checks to avoid blocking
+        timeout = aiohttp.ClientTimeout(total=10, connect=3)
+
+        async with http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=timeout) as response:
+            if response.status == 200:
+                build_status = await response.json()
+                status = build_status.get("status", BuildStatus.QUEUED)
+                current_time = time.time()
+
+                # Update database with comprehensive status information
+                cursor = build_database.cursor()
+                cursor.execute('''
+                    UPDATE builds SET
+                        status = ?,
+                        end_time = ?,
+                        last_known_status = ?,
+                        last_status_update = ?,
+                        server_available = 1,
+                        cached_response = ?
+                    WHERE id = ?
+                ''', (status,
+                         current_time if status in [BuildStatus.COMPLETED, BuildStatus.FAILED] else None,
+                         status,
+                         current_time,
+                         json.dumps(build_status),
+                         build_id))
+                build_database.commit()
+                logger.debug(f"Updated status for build {build_id}: {status}")
+            else:
+                logger.warning(f"Server {server_url} returned HTTP {response.status} for build {build_id}")
+                # Update last status check time
+                cursor = build_database.cursor()
+                cursor.execute('''
+                    UPDATE builds SET
+                        last_status_update = ?
+                    WHERE id = ?
+                ''', (time.time(), build_id))
+                build_database.commit()
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout updating status for build {build_id} on {server_url}")
+        cursor = build_database.cursor()
+        cursor.execute('''
+            UPDATE builds SET
+                last_status_update = ?
+            WHERE id = ?
+        ''', (time.time(), build_id))
+        build_database.commit()
+    except Exception as e:
+        logger.warning(f"Error updating status for build {build_id}: {e}")
+        cursor = build_database.cursor()
+        cursor.execute('''
+            UPDATE builds SET
+                last_status_update = ?
+            WHERE id = ?
+        ''', (time.time(), build_id))
+        build_database.commit()
 
 
 async def update_build_status():
-    """Background task to update build status"""
+    """Background task to update build status with concurrent processing"""
     while not shutdown_event.is_set():
         try:
             cursor = build_database.cursor()
             cursor.execute('''
-                SELECT id, server_url FROM builds 
+                SELECT id, server_url FROM builds
                 WHERE status IN (?, ?) AND server_url IS NOT NULL
             ''', (BuildStatus.QUEUED, BuildStatus.BUILDING))
 
-            for build_id, server_url in cursor.fetchall():
-                try:
-                    async with http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10) as response:
-                        if response.status == 200:
-                            build_status = await response.json()
-                            status = build_status.get("status", BuildStatus.QUEUED)
+            builds_to_update = cursor.fetchall()
 
-                            # Update database
-                            cursor.execute('''
-                                UPDATE builds SET status = ?, end_time = ?
-                                WHERE id = ?
-                            ''', (status, 
-                                 time.time() if status in [BuildStatus.COMPLETED, BuildStatus.FAILED] else None,
-                                 build_id))
-                            build_database.commit()
-                except Exception as e:
-                    logger.error(f"Error updating status for build {build_id}: {e}")
+            if builds_to_update:
+                logger.debug(f"Updating status for {len(builds_to_update)} builds")
+
+                # Process all builds concurrently with timeout protection
+                # Create actual tasks from coroutines so we can properly cancel them on timeout
+                tasks = [
+                    asyncio.create_task(update_single_build_status(build_id, server_url))
+                    for build_id, server_url in builds_to_update
+                ]
+
+                # Use asyncio.gather with return_exceptions to prevent one failure from blocking others
+                # Also add a global timeout to prevent the entire batch from hanging
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=30  # Maximum 30 seconds for all status updates
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Global timeout reached while updating {len(builds_to_update)} build statuses")
+                    # Cancel any remaining tasks
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    # Wait a bit for tasks to finish cancellation
+                    try:
+                        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=1)
+                    except asyncio.TimeoutError:
+                        pass
 
             await asyncio.sleep(120)  # Check every 2 minutes
         except Exception as e:
@@ -804,11 +1087,11 @@ async def discover_builds():
                                         if not cursor.fetchone():
                                             # New build discovered
                                             cursor.execute('''
-                                                INSERT INTO builds 
+                                                INSERT INTO builds
                                                 (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at)
                                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                                             ''', (
-                                                build_id, server_url, arch, 
+                                                build_id, server_url, arch,
                                                 build.get("pkgname", "unknown"),
                                                 build.get("status", BuildStatus.QUEUED),
                                                 build.get("start_time", time.time()),
@@ -823,6 +1106,82 @@ async def discover_builds():
         except Exception as e:
             logger.error(f"Error in build discovery: {e}")
             await asyncio.sleep(300)
+
+
+async def handle_unavailable_servers():
+    """Background task to monitor and handle builds on unavailable servers"""
+    while not shutdown_event.is_set():
+        try:
+            current_time = time.time()
+
+            # Check for builds on servers that have become unavailable
+            cursor = build_database.cursor()
+            cursor.execute('''
+                SELECT id, server_url, server_arch, pkgname, status, start_time, last_status_update
+                FROM builds
+                WHERE status IN (?, ?) AND server_url IS NOT NULL
+            ''', (BuildStatus.QUEUED, BuildStatus.BUILDING))
+
+            active_builds_on_servers = cursor.fetchall()
+
+            for build_id, server_url, server_arch, pkgname, status, start_time, last_status_update in active_builds_on_servers:
+                # Check if this server is marked as unavailable
+                server_status = server_status_tracker.get(server_url)
+
+                if server_status and server_status.health in [ServerHealth.UNAVAILABLE, ServerHealth.MISCONFIGURED]:
+                    # Server is unavailable - check how long the build has been without status update
+                    time_since_last_update = current_time - (last_status_update or start_time or current_time)
+
+                    # If no status update for more than 10 minutes, mark as potentially lost
+                    if time_since_last_update > 600:  # 10 minutes
+                        logger.warning(f"Build {build_id} on unavailable server {server_url} - no status update for {time_since_last_update:.0f} seconds")
+
+                        # Try to get one more status update
+                        try:
+                            async with http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10) as response:
+                                if response.status == 200:
+                                    build_status = await response.json()
+                                    # Update database with latest status
+                                    cursor.execute('''
+                                        UPDATE builds SET
+                                            last_known_status = ?,
+                                            last_status_update = ?,
+                                            server_available = 1,
+                                            cached_response = ?
+                                        WHERE id = ?
+                                    ''', (build_status.get('status', status), current_time,
+                                         json.dumps(build_status), build_id))
+                                    build_database.commit()
+                                    logger.info(f"Successfully updated status for build {build_id} on server {server_url}")
+                                    continue
+                        except Exception as e:
+                            logger.error(f"Failed to get status for build {build_id} on server {server_url}: {e}")
+
+                        # Mark server as unavailable for this build
+                        cursor.execute('''
+                            UPDATE builds SET
+                                server_available = 0,
+                                last_status_update = ?
+                            WHERE id = ?
+                        ''', (current_time, build_id))
+                        build_database.commit()
+
+                        # If server has been unavailable for more than 30 minutes, consider the build lost
+                        if time_since_last_update > 1800:  # 30 minutes
+                            logger.error(f"Marking build {build_id} as failed - server {server_url} unavailable for {time_since_last_update:.0f} seconds")
+                            cursor.execute('''
+                                UPDATE builds SET
+                                    status = ?,
+                                    end_time = ?,
+                                    last_known_status = 'failed_server_unavailable'
+                                WHERE id = ?
+                            ''', (BuildStatus.FAILED, current_time, build_id))
+                            build_database.commit()
+
+            await asyncio.sleep(120)  # Check every 2 minutes
+        except Exception as e:
+            logger.error(f"Error in handle_unavailable_servers: {e}")
+            await asyncio.sleep(120)
 
 
 # API Endpoints
@@ -849,7 +1208,7 @@ async def get_farm_info():
         for server_url in server_urls:
             # Check if this server is already properly listed
             already_listed = any(
-                server["url"] == obfuscate_server_url(server_url) 
+                server["url"] == obfuscate_server_url(server_url)
                 for server in servers
             )
 
@@ -875,11 +1234,14 @@ async def get_farm_info():
                     server_info = await get_server_info(server_url)
                     if not server_info:
                         # Initial failure - don't immediately mark as misconfigured
+                        current_builds = running_builds_by_server.get(server_url, [])
                         servers.append({
                             "url": obfuscate_server_url(server_url),
                             "arch": f"{config_arch} (checking...)",
                             "status": "initializing",
-                            "info": None
+                            "info": None,
+                            "current_builds": current_builds,
+                            "real_server_url": server_url
                         })
 
     return {
@@ -941,14 +1303,38 @@ async def get_dashboard(page: int = Query(1, ge=1)):
     available_archs = await get_available_architectures()
     servers_by_arch = {}
 
+    # Get currently running builds for all servers
+    cursor = build_database.cursor()
+    cursor.execute('''
+        SELECT id, server_url, pkgname, start_time, created_at
+        FROM builds
+        WHERE status = ? AND server_url IS NOT NULL
+        ORDER BY start_time DESC
+    ''', (BuildStatus.BUILDING,))
+
+    running_builds_by_server = {}
+    for build_id, server_url, pkgname, start_time, created_at in cursor.fetchall():
+        if server_url not in running_builds_by_server:
+            running_builds_by_server[server_url] = []
+        running_builds_by_server[server_url].append({
+            "id": build_id,
+            "pkgname": pkgname,
+            "start_time": safe_timestamp_to_datetime(start_time),
+            "created_at": safe_timestamp_to_datetime(created_at)
+        })
+
     for arch, server_urls in available_archs.items():
         servers_by_arch[arch] = []
         for server_url in server_urls:
             server_info = await get_server_info(server_url)
+            # Get running builds for this server
+            current_builds = running_builds_by_server.get(server_url, [])
             servers_by_arch[arch].append({
                 "url": obfuscate_server_url(server_url),
                 "status": "online" if server_info else "offline",
-                "info": server_info
+                "info": server_info,
+                "current_builds": current_builds,
+                "real_server_url": server_url  # Keep for matching builds
             })
 
     # Check for truly misconfigured servers (conservative dashboard logic)
@@ -956,7 +1342,7 @@ async def get_dashboard(page: int = Query(1, ge=1)):
         for server_url in server_urls:
             # Check if this server is already listed in available architectures
             already_listed = any(
-                server_url in arch_servers 
+                server_url in arch_servers
                 for arch_servers in available_archs.values()
             )
             if not already_listed:
@@ -967,10 +1353,14 @@ async def get_dashboard(page: int = Query(1, ge=1)):
                 if status and status.health == ServerHealth.MISCONFIGURED:
                     if "misconfigured" not in servers_by_arch:
                         servers_by_arch["misconfigured"] = []
+                    # Get running builds for misconfigured server too
+                    current_builds = running_builds_by_server.get(server_url, [])
                     servers_by_arch["misconfigured"].append({
                         "url": obfuscate_server_url(server_url),
                         "status": f"misconfigured ({status.consecutive_failures} failures)",
-                        "info": None
+                        "info": None,
+                        "current_builds": current_builds,
+                        "real_server_url": server_url
                     })
                 elif not status or status.consecutive_failures < 3:
                     # Don't show servers that are just initializing or have few failures
@@ -1017,13 +1407,23 @@ async def get_dashboard(page: int = Query(1, ge=1)):
             .offline {{ background-color: #f8d7da; }}
             .misconfigured {{ background-color: #fff3cd; }}
             .builds {{ margin-top: 30px; }}
-            .build {{ margin: 5px 0; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }}
+            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
             .completed {{ background-color: #d4edda; }}
             .failed {{ background-color: #f8d7da; }}
             .building {{ background-color: #fff3cd; }}
             .queued {{ background-color: #d1ecf1; }}
+            .cancelled {{ background-color: #e2e3e5; }}
+            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+            .build a:hover {{ text-decoration: underline; }}
+            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
             .pagination {{ text-align: center; margin: 20px 0; }}
             .pagination a {{ margin: 0 5px; padding: 5px 10px; text-decoration: none; border: 1px solid #ddd; }}
+            .running-builds {{ margin-top: 8px; padding: 8px; background-color: #f8f9fa; border-radius: 3px; border-left: 3px solid #007bff; }}
+            .running-builds ul {{ margin: 5px 0 0 0; padding-left: 20px; }}
+            .running-builds li {{ margin: 2px 0; font-size: 0.9em; }}
+            .running-builds a {{ color: #007bff; text-decoration: none; }}
+            .running-builds a:hover {{ text-decoration: underline; }}
+            .running-builds small {{ color: #666; margin-left: 5px; }}
         </style>
     </head>
     <body>
@@ -1049,9 +1449,26 @@ async def get_dashboard(page: int = Query(1, ge=1)):
                 queue_status = server["info"].get("queue_status", {})
                 queue_info = f" - Builds: {queue_status.get('current_builds_count', 0)}, Queued: {queue_status.get('queued_builds', 0)}"
 
+            # Show currently running builds
+            current_builds_html = ""
+            if server.get("current_builds"):
+                current_builds_html = "<div class='running-builds'><strong>Currently Building:</strong><ul>"
+                for build in server["current_builds"][:3]:  # Show max 3 builds to avoid clutter
+                    start_time = build["start_time"] or "unknown"
+                    current_builds_html += f"""
+                        <li>
+                            <a href="/build/{build['id']}/status" target="_blank">{build['pkgname']}</a>
+                            <small>(started: {start_time})</small>
+                        </li>
+                    """
+                if len(server["current_builds"]) > 3:
+                    current_builds_html += f"<li><em>... and {len(server['current_builds']) - 3} more</em></li>"
+                current_builds_html += "</ul></div>"
+
             html += f"""
                 <div class="server {status_class}">
                     <strong>{server['url']}</strong> ({server['status']}){queue_info}
+                    {current_builds_html}
                 </div>
             """
         html += "</div>"
@@ -1066,11 +1483,16 @@ async def get_dashboard(page: int = Query(1, ge=1)):
     for build in builds:
         html += f"""
             <div class="build {build['status']}">
-                <strong>{build['pkgname']}</strong> 
-                ({build['id'][:8]}...) - 
-                {build['status']} on {build['server_url']} ({build['server_arch']})
+                <strong>{build['pkgname']}</strong> - {build['status']} on {build['server_url']} ({build['server_arch']})
+                <br>
+                <span class="build-id">Build ID: {build['id']}</span>
                 <br>
                 <small>Created: {build['created_at']}</small>
+                <br>
+                <small>
+                    <a href="/build/{build['id']}/status" target="_blank">📋 View Details & Logs</a>
+                    {' | <a href="/build/{build["id"]}/output" target="_blank">📜 Raw Output</a>' if build['status'] in ['building', 'completed', 'failed'] else ''}
+                </small>
             </div>
         """
 
@@ -1183,22 +1605,178 @@ async def submit_build(
 @app.get("/build/{build_id}/status")
 async def get_build_status(build_id: str, format: str = Query("html")):
     """Get build status"""
-    server_url = await find_build_server(build_id)
+    # First check our database for build information
+    cursor = build_database.cursor()
+    cursor.execute('''
+        SELECT server_url, server_arch, pkgname, status, last_known_status,
+               server_available, cached_response, last_status_update, created_at
+        FROM builds WHERE id = ?
+    ''', (build_id,))
+    result = cursor.fetchone()
 
+    if not result:
+        # Build not found in our database
+        error_detail = {
+            "error": "Build not found",
+            "detail": f"Build {build_id} was not found in the farm database. "
+                     "This build may not have been submitted through this farm, "
+                     "or the submission may have failed before being recorded.",
+            "build_id": build_id
+        }
+        if format == "json":
+            raise HTTPException(status_code=404, detail=error_detail)
+        else:
+            return HTMLResponse(f"""
+            <html>
+            <head><title>Build Not Found</title></head>
+            <body>
+                <h1>Build Not Found</h1>
+                <p><strong>Build ID:</strong> {build_id}</p>
+                <p>{error_detail['detail']}</p>
+                <p>Please check that you're using the correct build ID and that the build was submitted to this farm.</p>
+            </body>
+            </html>
+            """, status_code=404)
+
+    server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response, last_status_update, created_at = result
+
+    # If we don't have a server_url, the build failed during submission
     if not server_url:
-        raise HTTPException(status_code=404, detail="Build not found")
+        error_detail = {
+            "error": "Build submission failed",
+            "detail": f"Build {build_id} failed during submission and was never assigned to a server. "
+                     f"Current status: {status}",
+            "build_id": build_id,
+            "status": status,
+            "created_at": created_at
+        }
+        if format == "json":
+            raise HTTPException(status_code=404, detail=error_detail)
+        else:
+            return HTMLResponse(f"""
+            <html>
+            <head><title>Build Submission Failed - {pkgname}</title></head>
+            <body>
+                <h1>Build Submission Failed: {pkgname}</h1>
+                <div style="background-color: #f8d7da; padding: 10px; border: 1px solid #f5c6cb; margin: 10px 0;">
+                    <strong>❌ Build Submission Failed</strong><br>
+                    This build failed during submission and was never assigned to a server.
+                </div>
+                <p><strong>Build ID:</strong> {build_id}</p>
+                <p><strong>Status:</strong> {status}</p>
+                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                <p><strong>Created:</strong> {datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S') if created_at else 'unknown'}</p>
+            </body>
+            </html>
+            """, status_code=404)
 
+    # We have a server assignment - check if server is available
+    if server_available is False:
+        # Server is marked as unavailable, use cached data if available
+        if cached_response:
+            try:
+                build_status = json.loads(cached_response)
+                build_status["server_unavailable"] = True
+                build_status["last_status_update"] = last_status_update
+                build_status["server_url"] = obfuscate_server_url(server_url)
+
+                if format == "json":
+                    return build_status
+                else:
+                    return HTMLResponse(f"""
+                    <html>
+                    <head><title>Build Status (Server Unavailable) - {pkgname}</title></head>
+                    <body>
+                        <h1>Build Status: {pkgname}</h1>
+                        <div style="background-color: #fff3cd; padding: 10px; border: 1px solid #ffeaa7; margin: 10px 0;">
+                            <strong>⚠️ Server Currently Unavailable</strong><br>
+                            The build server is currently unavailable. Showing last known status.
+                        </div>
+                        <p><strong>Build ID:</strong> {build_id}</p>
+                        <p><strong>Status:</strong> {build_status.get('status', 'unknown')}</p>
+                        <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_status_update).strftime('%Y-%m-%d %H:%M:%S') if last_status_update else 'unknown'}</p>
+                        <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
+                        <p><em>This information may be outdated due to server unavailability.</em></p>
+                    </body>
+                    </html>
+                    """)
+            except json.JSONDecodeError:
+                pass
+
+        # No cached data and server unavailable
+        error_detail = {
+            "error": "Server unavailable",
+            "detail": f"Build {build_id} is assigned to server {obfuscate_server_url(server_url)} "
+                     "but the server is currently unavailable and no cached status is available.",
+            "build_id": build_id,
+            "server_url": obfuscate_server_url(server_url),
+            "last_known_status": last_known_status or status
+        }
+        if format == "json":
+            raise HTTPException(status_code=503, detail=error_detail)
+        else:
+            return HTMLResponse(f"""
+            <html>
+            <head><title>Server Unavailable - {pkgname}</title></head>
+            <body>
+                <h1>Server Unavailable: {pkgname}</h1>
+                <div style="background-color: #f8d7da; padding: 10px; border: 1px solid #f5c6cb; margin: 10px 0;">
+                    <strong>❌ Server Unavailable</strong><br>
+                    The server handling this build is currently unavailable.
+                </div>
+                <p><strong>Build ID:</strong> {build_id}</p>
+                <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
+                <p><strong>Last Known Status:</strong> {last_known_status or status}</p>
+                <p>Please try again later when the server recovers.</p>
+            </body>
+            </html>
+            """, status_code=503)
+
+    # Server should be available - try to contact it
     if format == "json":
         try:
             async with http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10) as response:
                 if response.status == 200:
                     build_status = await response.json()
                     build_status["server_url"] = obfuscate_server_url(server_url)
+
+                    # Update our cache with the latest status
+                    cursor = build_database.cursor()
+                    cursor.execute('''
+                        UPDATE builds SET
+                            last_known_status = ?,
+                            last_status_update = ?,
+                            server_available = 1,
+                            cached_response = ?
+                        WHERE id = ?
+                    ''', (build_status.get('status', 'unknown'), time.time(),
+                         json.dumps(build_status), build_id))
+                    build_database.commit()
+
                     return build_status
                 else:
                     raise HTTPException(status_code=response.status, detail="Build not found")
         except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Error contacting server: {e}")
+            # Server is unavailable, try to return cached response
+            cursor = build_database.cursor()
+            cursor.execute('''
+                SELECT cached_response, last_status_update, server_arch, pkgname
+                FROM builds WHERE id = ?
+            ''', (build_id,))
+            result = cursor.fetchone()
+
+            if result and result[0]:  # cached_response exists
+                try:
+                    build_status = json.loads(result[0])
+                    build_status["server_unavailable"] = True
+                    build_status["last_status_update"] = result[1]
+                    build_status["server_url"] = obfuscate_server_url(server_url)
+                    build_status["error_message"] = f"Server unavailable: {str(e)}"
+                    return build_status
+                except json.JSONDecodeError:
+                    pass
+
+            raise HTTPException(status_code=503, detail=f"Server unavailable: {str(e)}")
     else:
         # Forward to server's HTML page
         try:
@@ -1209,7 +1787,42 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 else:
                     raise HTTPException(status_code=response.status, detail="Build not found")
         except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Error contacting server: {e}")
+            # Server is unavailable, try to return cached response as HTML
+            cursor = build_database.cursor()
+            cursor.execute('''
+                SELECT cached_response, last_status_update, server_arch, pkgname
+                FROM builds WHERE id = ?
+            ''', (build_id,))
+            result = cursor.fetchone()
+
+            if result and result[0]:  # cached_response exists
+                try:
+                    build_status = json.loads(result[0])
+                    pkgname = result[3] or 'unknown'
+                    last_update = result[1]
+
+                    return HTMLResponse(f"""
+                    <html>
+                    <head><title>Build Status (Server Unavailable) - {pkgname}</title></head>
+                    <body>
+                        <h1>Build Status: {pkgname}</h1>
+                        <div style="background-color: #fff3cd; padding: 10px; border: 1px solid #ffeaa7; margin: 10px 0;">
+                            <strong>⚠️ Server Currently Unavailable</strong><br>
+                            The build server is currently unavailable. Showing last known status.
+                        </div>
+                        <p><strong>Build ID:</strong> {build_id}</p>
+                        <p><strong>Status:</strong> {build_status.get('status', 'unknown')}</p>
+                        <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S') if last_update else 'unknown'}</p>
+                        <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
+                        <p><em>This information may be outdated due to server unavailability.</em></p>
+                        <p><strong>Error:</strong> {str(e)}</p>
+                    </body>
+                    </html>
+                    """)
+                except json.JSONDecodeError:
+                    pass
+
+            raise HTTPException(status_code=503, detail=f"Server unavailable: {str(e)}")
 
 
 @app.get("/build/{build_id}/status-api")
@@ -1243,6 +1856,27 @@ async def stream_build_output(build_id: str):
     server_url = await find_build_server(build_id)
 
     if not server_url:
+        # Check if we have build information in database
+        cursor = build_database.cursor()
+        cursor.execute('''
+            SELECT server_url, server_available, pkgname
+            FROM builds WHERE id = ?
+        ''', (build_id,))
+        result = cursor.fetchone()
+
+        if result:
+            server_url, server_available, pkgname = result
+            if not server_available:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "Server unavailable",
+                        "message": f"The server handling build {build_id} is currently unavailable",
+                        "pkgname": pkgname,
+                        "suggestion": "Please try again later when the server recovers"
+                    }
+                )
+
         raise HTTPException(status_code=404, detail="Build not found")
 
     try:
@@ -1256,7 +1890,26 @@ async def stream_build_output(build_id: str):
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Error contacting server: {e}")
+        if "503" in str(e) or "502" in str(e) or "Connection" in str(e):
+            # Server unavailable
+            cursor = build_database.cursor()
+            cursor.execute('''
+                SELECT pkgname FROM builds WHERE id = ?
+            ''', (build_id,))
+            result = cursor.fetchone()
+            pkgname = result[0] if result else "unknown"
+
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "Server unavailable",
+                    "message": f"The server handling build {build_id} is currently unavailable",
+                    "pkgname": pkgname,
+                    "suggestion": "Please try again later when the server recovers"
+                }
+            )
+        else:
+            raise HTTPException(status_code=503, detail=f"Error contacting server: {e}")
 
 
 @app.get("/build/{build_id}/download/{filename}")
@@ -1265,6 +1918,27 @@ async def download_file(build_id: str, filename: str):
     server_url = await find_build_server(build_id)
 
     if not server_url:
+        # Check if we have build information in database
+        cursor = build_database.cursor()
+        cursor.execute('''
+            SELECT server_url, server_available, pkgname
+            FROM builds WHERE id = ?
+        ''', (build_id,))
+        result = cursor.fetchone()
+
+        if result:
+            server_url, server_available, pkgname = result
+            if not server_available:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "Server unavailable",
+                        "message": f"The server handling build {build_id} is currently unavailable",
+                        "pkgname": pkgname,
+                        "suggestion": "Please try again later when the server recovers"
+                    }
+                )
+
         raise HTTPException(status_code=404, detail="Build not found")
 
     # Retry logic for file downloads
@@ -1287,10 +1961,29 @@ async def download_file(build_id: str, filename: str):
                         continue
                     raise HTTPException(status_code=response.status, detail="Download failed")
         except Exception as e:
-            if attempt < max_retries - 1:
+            if "503" in str(e) or "502" in str(e) or "Connection" in str(e):
+                # Server unavailable
+                cursor = build_database.cursor()
+                cursor.execute('''
+                    SELECT pkgname FROM builds WHERE id = ?
+                ''', (build_id,))
+                result = cursor.fetchone()
+                pkgname = result[0] if result else "unknown"
+
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "Server unavailable",
+                        "message": f"The server handling build {build_id} is currently unavailable",
+                        "pkgname": pkgname,
+                        "suggestion": "Please try again later when the server recovers"
+                    }
+                )
+            elif attempt < max_retries - 1:
                 await asyncio.sleep(1)
                 continue
-            raise HTTPException(status_code=503, detail=f"Error downloading file: {e}")
+            else:
+                raise HTTPException(status_code=503, detail=f"Error downloading file: {e}")
 
 
 @app.get("/builds/latest")
@@ -1330,10 +2023,31 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
 
 
 async def setup_http_session():
-    """Setup HTTP session for server communication"""
+    """Setup HTTP session with optimized timeouts and connection pooling for farm responsiveness"""
     global http_session
-    timeout = aiohttp.ClientTimeout(total=30)
-    http_session = aiohttp.ClientSession(timeout=timeout)
+
+    # Optimize connector for farm use case - many short requests to potentially slow servers
+    connector = aiohttp.TCPConnector(
+        limit=50,  # Reduced total connection pool size to prevent resource exhaustion
+        limit_per_host=5,  # Reduced per-host limit to prevent single slow server from hogging connections
+        ttl_dns_cache=300,  # DNS cache TTL
+        use_dns_cache=True,
+        keepalive_timeout=15,  # Reduced keepalive to free up connections faster
+        enable_cleanup_closed=True
+    )
+
+    # Use conservative default timeout - individual operations will override as needed
+    timeout = aiohttp.ClientTimeout(
+        total=30,  # Reduced default timeout to prevent blocking
+        connect=5,  # Faster connection timeout
+        sock_read=15   # Faster socket read timeout
+    )
+
+    http_session = aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        trust_env=True
+    )
 
 
 async def cleanup_http_session():
@@ -1354,7 +2068,7 @@ def main():
     parser = argparse.ArgumentParser(description="APB Farm - Arch Package Builder Farm")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Host to bind to")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind to")
-    parser.add_argument("--log-level", default="INFO", 
+    parser.add_argument("--log-level", default="INFO",
                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                        help="Logging level")
     parser.add_argument("--config", type=Path, help="Configuration file path")

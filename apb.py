@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Generator, Any
 from urllib.parse import urljoin
 import requests
 import re
+from datetime import datetime
 
 
 def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
@@ -32,9 +33,9 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
             content = f.read()
 
         info = {
-            "pkgname": "unknown", 
-            "pkgver": "1.0.0", 
-            "pkgrel": "1", 
+            "pkgname": "unknown",
+            "pkgver": "1.0.0",
+            "pkgrel": "1",
             "arch": ["x86_64"],
             "pkgname_list": []  # For filename checking
         }
@@ -86,9 +87,9 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
     except Exception as e:
         print(f"Error parsing PKGBUILD {pkgbuild_path}: {e}")
         return {
-            "pkgname": "unknown", 
-            "pkgver": "1.0.0", 
-            "pkgrel": "1", 
+            "pkgname": "unknown",
+            "pkgver": "1.0.0",
+            "pkgrel": "1",
             "arch": ["x86_64"],
             "pkgname_list": []
         }
@@ -122,10 +123,19 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
 
         # Look for packages in all subdirectories of output_dir
         for pkgname in pkgname_list:
+            # Check "any" subdirectory first for arch=(any) packages
+            any_arch_dir = output_dir / "any"
+            if any_arch_dir.is_dir():
+                for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
+                    package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{potential_suffix}.pkg.tar.zst"
+                    package_path = any_arch_dir / package_filename
+                    if package_path.exists():
+                        return True, f"{package_filename} (found in any)"
+
             # Check all architecture subdirectories
             try:
                 for arch_dir in output_dir.iterdir():
-                    if arch_dir.is_dir():
+                    if arch_dir.is_dir() and arch_dir.name != "any":  # Skip "any" as we checked it above
                         # Try different architecture suffixes
                         for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
                             package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{potential_suffix}.pkg.tar.zst"
@@ -206,7 +216,7 @@ def should_skip_build(output_dir: Path, pkgbuild_path: Path, arch: str, force: b
     if not pkgname_list:
         pkgname_list = [pkg_info["pkgname"]]
 
-    exists, found_filename = check_package_exists(output_dir, pkgname_list, pkg_info["pkgver"], 
+    exists, found_filename = check_package_exists(output_dir, pkgname_list, pkg_info["pkgver"],
                                                  pkg_info["pkgrel"], arch)
     if exists:
         return True, f"Package already exists: {found_filename}"
@@ -366,7 +376,7 @@ class APBotClient:
         except requests.RequestException:
             return False
 
-    def download_latest_build_files(self, pkgname: str, output_dir: Path, 
+    def download_latest_build_files(self, pkgname: str, output_dir: Path,
                                    successful_only: bool = True) -> bool:
         """
         Download all files from the latest build of a package.
@@ -666,8 +676,8 @@ def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: Lis
         return None
 
 
-def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Path = None, 
-                       verbose: bool = False) -> bool:
+def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Path = None,
+                       verbose: bool = False, pkgbuild_path: Path = None) -> bool:
     """
     Monitor multiple builds from a farm submission.
 
@@ -676,6 +686,7 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
         client: Client instance
         output_dir: Base output directory
         verbose: Enable verbose output
+        pkgbuild_path: Path to PKGBUILD file (to check original architecture)
 
     Returns:
         True if all builds were successful
@@ -712,18 +723,61 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
         build_id = build_info['build_id']
 
         try:
-            arch_output_dir = output_dir / arch if output_dir else None
+            # Check if original package had arch=(any) to determine output folder
+            is_any_arch_package = False
+            if pkgbuild_path and pkgbuild_path.exists():
+                pkg_info = parse_pkgbuild_info(pkgbuild_path)
+                original_archs = pkg_info.get("arch", [])
+                is_any_arch_package = "any" in original_archs
+
+            if output_dir:
+                if is_any_arch_package:
+                    arch_output_dir = output_dir / "any"
+                else:
+                    arch_output_dir = output_dir / arch
+            else:
+                arch_output_dir = None
 
             print(f"[{arch}] Starting monitoring...")
 
-            # Monitor with parallel-friendly approach
+            # Monitor with enhanced error handling for server unavailability
             last_status = None
             consecutive_errors = 0
-            max_consecutive_errors = 3
+            max_consecutive_errors = 5
+            server_unavailable_count = 0
+            max_server_unavailable = 8  # More lenient for farm builds
 
             while not stop_event.is_set():
                 try:
                     status = client.get_build_status(build_id)
+
+                    # Check if server is unavailable but we have cached data
+                    if status.get('server_unavailable'):
+                        server_unavailable_count += 1
+                        if server_unavailable_count >= max_server_unavailable:
+                            print(f"[{arch}] Server has been unavailable for {server_unavailable_count} consecutive checks")
+                            cached_status = status.get('status', 'unknown')
+                            print(f"[{arch}] Last known status: {cached_status}")
+
+                            # If we have a final status, use it
+                            if cached_status in ['completed', 'failed', 'cancelled']:
+                                success = cached_status == 'completed'
+                                print(f"[{arch}] Build appears to be {'SUCCESS' if success else 'FAILED'} based on cached data")
+                                result_queue.put((arch, success))
+                                arch_build_info[arch]['status'] = cached_status
+                                break
+                            else:
+                                print(f"[{arch}] Giving up monitoring due to prolonged server unavailability")
+                                result_queue.put((arch, False))
+                                arch_build_info[arch]['status'] = 'failed_server_unavailable'
+                                break
+                        else:
+                            print(f"[{arch}] Server unavailable ({server_unavailable_count}/{max_server_unavailable}), using cached data")
+                            if verbose:
+                                print(f"[{arch}] Cached status: {status.get('status', 'unknown')}")
+                    else:
+                        server_unavailable_count = 0  # Reset counter on successful response
+
                     consecutive_errors = 0  # Reset error count on success
 
                     if status['status'] != last_status:
@@ -737,31 +791,40 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                             try:
                                 downloaded_files = []
 
-                                # Download packages (for successful builds)
-                                if 'packages' in status and status['packages']:
-                                    for package in status['packages']:
-                                        if client.download_file(build_id, package['filename'], arch_output_dir):
-                                            print(f"[{arch}] Downloaded: {package['filename']}")
-                                            downloaded_files.append(package['filename'])
-                                        else:
-                                            print(f"[{arch}] Failed to download: {package['filename']}")
-
-                                # Download logs (for all builds, including failed ones)
-                                if 'logs' in status and status['logs']:
-                                    for log in status['logs']:
-                                        if client.download_file(build_id, log['filename'], arch_output_dir):
-                                            print(f"[{arch}] Downloaded: {log['filename']}")
-                                            downloaded_files.append(log['filename'])
-                                        else:
-                                            print(f"[{arch}] Failed to download: {log['filename']}")
-
-                                if downloaded_files:
-                                    print(f"[{arch}] Downloaded {len(downloaded_files)} files")
+                                # Check if server is unavailable
+                                if status.get('server_unavailable'):
+                                    print(f"[{arch}] Server unavailable - cannot download build artifacts")
+                                    print(f"[{arch}] You may need to download files manually when server recovers")
                                 else:
-                                    print(f"[{arch}] No files available for download")
+                                    # Download packages (for successful builds)
+                                    if 'packages' in status and status['packages']:
+                                        for package in status['packages']:
+                                            if client.download_file(build_id, package['filename'], arch_output_dir):
+                                                print(f"[{arch}] Downloaded: {package['filename']}")
+                                                downloaded_files.append(package['filename'])
+                                            else:
+                                                print(f"[{arch}] Failed to download: {package['filename']}")
+
+                                    # Download logs (for all builds, including failed ones)
+                                    if 'logs' in status and status['logs']:
+                                        for log in status['logs']:
+                                            if client.download_file(build_id, log['filename'], arch_output_dir):
+                                                print(f"[{arch}] Downloaded: {log['filename']}")
+                                                downloaded_files.append(log['filename'])
+                                            else:
+                                                print(f"[{arch}] Failed to download: {log['filename']}")
+
+                                    if downloaded_files:
+                                        print(f"[{arch}] Downloaded {len(downloaded_files)} files")
+                                    else:
+                                        print(f"[{arch}] No files available for download")
 
                             except requests.RequestException as e:
-                                print(f"[{arch}] Error downloading files: {e}")
+                                if "503" in str(e) or "502" in str(e):
+                                    print(f"[{arch}] Server unavailable - cannot download build artifacts: {e}")
+                                    print(f"[{arch}] You may need to download files manually when server recovers")
+                                else:
+                                    print(f"[{arch}] Error downloading files: {e}")
 
                         # Build finished
                         success = status['status'] == 'completed'
@@ -774,12 +837,36 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                     stop_event.wait(5)
 
                 except requests.RequestException as e:
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        print(f"[{arch}] Error monitoring build after {max_consecutive_errors} attempts: {e}")
-                        result_queue.put((arch, False))
-                        arch_build_info[arch]['status'] = 'failed'
-                        break
+                    if "503" in str(e) or "502" in str(e):
+                        # Server unavailable - these are expected during outages
+                        server_unavailable_count += 1
+                        if server_unavailable_count >= max_server_unavailable:
+                            print(f"[{arch}] Server has been unavailable for {server_unavailable_count} consecutive attempts")
+                            print(f"[{arch}] Build may be running but server is unreachable")
+                            result_queue.put((arch, False))
+                            arch_build_info[arch]['status'] = 'failed_server_unavailable'
+                            break
+                        else:
+                            print(f"[{arch}] Server unavailable (attempt {server_unavailable_count}/{max_server_unavailable}), retrying...")
+                    elif "404" in str(e):
+                        # Build not found - could be because server is unavailable or build was never submitted
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            print(f"[{arch}] Build not found (404) after {max_consecutive_errors} attempts")
+                            print(f"[{arch}] Server may be unavailable or build was not submitted")
+                            result_queue.put((arch, False))
+                            arch_build_info[arch]['status'] = 'failed'
+                            break
+                        else:
+                            print(f"[{arch}] Build not found (404), retrying... (attempt {consecutive_errors}/{max_consecutive_errors})")
+                    else:
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            print(f"[{arch}] Error monitoring build after {max_consecutive_errors} attempts: {e}")
+                            result_queue.put((arch, False))
+                            arch_build_info[arch]['status'] = 'failed'
+                            break
+
                     # Wait longer before retrying on error
                     stop_event.wait(10)
 
@@ -868,8 +955,8 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
     return all(build_results.values())
 
 
-def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None, 
-                 verbose: bool = False, allow_toggle: bool = True, 
+def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
+                 verbose: bool = False, allow_toggle: bool = True,
                  status_callback = None, pkgname: str = None, arch: str = None) -> bool:
     """
     Monitor a build with optional real-time output and automatic downloading.
@@ -895,10 +982,42 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
     # Get initial build info with retry logic
     max_retries = 10
     retry_delay = 1.0
+    server_unavailable_count = 0
+    max_server_unavailable = 5  # Maximum consecutive server unavailable responses
 
     for attempt in range(max_retries):
         try:
             initial_status = client.get_build_status(build_id)
+
+            # Check if server is unavailable but we have cached data
+            if initial_status.get('server_unavailable'):
+                server_unavailable_count += 1
+                if server_unavailable_count >= max_server_unavailable:
+                    print(f"{arch_prefix}Server has been unavailable for {server_unavailable_count} consecutive checks")
+                    print(f"{arch_prefix}Last known status: {initial_status.get('status', 'unknown')}")
+                    last_update = initial_status.get('last_status_update')
+                    if last_update:
+                        try:
+                            last_update_str = datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S')
+                            print(f"{arch_prefix}Last status update: {last_update_str}")
+                        except:
+                            print(f"{arch_prefix}Last status update: {last_update}")
+
+                    # Check if build might be completed based on cached data
+                    cached_status = initial_status.get('status', 'unknown')
+                    if cached_status in ['completed', 'failed', 'cancelled']:
+                        print(f"{arch_prefix}Build appears to be {cached_status} based on cached data")
+                        return cached_status == 'completed'
+                    else:
+                        print(f"{arch_prefix}Build status unclear due to server unavailability")
+                        return False
+                else:
+                    print(f"{arch_prefix}Server unavailable (attempt {server_unavailable_count}/{max_server_unavailable}), using cached data")
+                    if verbose:
+                        print(f"{arch_prefix}Cached status: {initial_status.get('status', 'unknown')}")
+            else:
+                server_unavailable_count = 0  # Reset counter on successful response
+
             if not pkgname:
                 pkgname = initial_status.get('pkgname', 'unknown')
 
@@ -907,19 +1026,65 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                 print(f"{arch_prefix}Initial status: {initial_status['status']}")
             break
         except requests.RequestException as e:
-            if attempt < max_retries - 1:
-                if verbose:
-                    print(f"{arch_prefix}Waiting for build to be available (attempt {attempt + 1}/{max_retries})...")
-                time.sleep(retry_delay)
-                retry_delay = min(retry_delay * 1.5, 5.0)  # Exponential backoff, max 5 seconds
+            if "503" in str(e) or "502" in str(e):
+                # Server unavailable - these are expected during outages
+                server_unavailable_count += 1
+                if server_unavailable_count >= max_server_unavailable:
+                    print(f"{arch_prefix}Server has been unavailable for {server_unavailable_count} consecutive attempts")
+                    print(f"{arch_prefix}Build may be running but server is unreachable")
+                    return False
+                else:
+                    print(f"{arch_prefix}Server unavailable (attempt {server_unavailable_count}/{max_server_unavailable}), retrying...")
+            elif "404" in str(e):
+                # Build not found - could be because server is unavailable or build was never submitted
+                print(f"{arch_prefix}Build not found (404). Server may be unavailable or build was not submitted.")
+                if attempt < max_retries - 1:
+                    print(f"{arch_prefix}Retrying in {retry_delay:.1f} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 1.5, 10.0)
+                    continue
+                else:
+                    print(f"{arch_prefix}Build not found after {max_retries} attempts")
+                    return False
             else:
-                print(f"{arch_prefix}Error getting build status after {max_retries} attempts: {e}")
-                return False
+                if attempt < max_retries - 1:
+                    if verbose:
+                        print(f"{arch_prefix}Waiting for build to be available (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 1.5, 5.0)
+                else:
+                    print(f"{arch_prefix}Error getting build status after {max_retries} attempts: {e}")
+                    return False
 
     # Monitor build progress
     last_status = None
+    consecutive_server_errors = 0
+    max_consecutive_server_errors = 10
+
     try:
         for update in client.stream_build_updates(build_id):
+            # Check if server is unavailable
+            if update.get('server_unavailable'):
+                consecutive_server_errors += 1
+                if consecutive_server_errors >= max_consecutive_server_errors:
+                    print(f"{arch_prefix}Server has been unavailable for {consecutive_server_errors} consecutive status checks")
+                    print(f"{arch_prefix}Last known status: {update.get('status', 'unknown')}")
+
+                    # If we have a final status, use it
+                    cached_status = update.get('status', 'unknown')
+                    if cached_status in ['completed', 'failed', 'cancelled']:
+                        print(f"{arch_prefix}Build appears to be {cached_status} based on cached data")
+                        last_status = cached_status
+                        break
+                    else:
+                        print(f"{arch_prefix}Giving up monitoring due to prolonged server unavailability")
+                        return False
+                else:
+                    if verbose:
+                        print(f"{arch_prefix}Server unavailable ({consecutive_server_errors}/{max_consecutive_server_errors}), status: {update.get('status', 'unknown')}")
+            else:
+                consecutive_server_errors = 0  # Reset on successful response
+
             if update['status'] != last_status:
                 print(f"{arch_prefix}Status: {update['status']}")
                 last_status = update['status']
@@ -943,20 +1108,43 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
         # Re-raise the KeyboardInterrupt to allow calling code to handle it
         raise
     except requests.RequestException as e:
-        print(f"{arch_prefix}Error monitoring build: {e}")
-        # Try to get final status
-        try:
-            final_status = client.get_build_status(build_id)
-            last_status = final_status['status']
-            print(f"{arch_prefix}Final status: {last_status}")
-        except requests.RequestException:
-            pass
+        if "503" in str(e) or "502" in str(e):
+            print(f"{arch_prefix}Server became unavailable during monitoring: {e}")
+            # Try to get final status
+            try:
+                final_status = client.get_build_status(build_id)
+                if final_status.get('server_unavailable'):
+                    cached_status = final_status.get('status', 'unknown')
+                    print(f"{arch_prefix}Using cached status: {cached_status}")
+                    last_status = cached_status
+                else:
+                    last_status = final_status['status']
+                    print(f"{arch_prefix}Final status: {last_status}")
+            except requests.RequestException:
+                print(f"{arch_prefix}Unable to get final status due to server unavailability")
+                return False
+        else:
+            print(f"{arch_prefix}Error monitoring build: {e}")
+            # Try to get final status
+            try:
+                final_status = client.get_build_status(build_id)
+                last_status = final_status['status']
+                print(f"{arch_prefix}Final status: {last_status}")
+            except requests.RequestException:
+                print(f"{arch_prefix}Unable to get final status")
+                return False
 
     # Download results if output_dir provided
     if output_dir and last_status in ['completed', 'failed']:
         try:
             final_status = client.get_build_status(build_id)
             downloaded_files = []
+
+            # Check if server is unavailable
+            if final_status.get('server_unavailable'):
+                print(f"{arch_prefix}Server unavailable - cannot download build artifacts")
+                print(f"{arch_prefix}You may need to download files manually when server recovers")
+                return last_status == 'completed'
 
             # Download packages (for successful builds)
             if 'packages' in final_status and final_status['packages']:
@@ -982,13 +1170,17 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                 print(f"{arch_prefix}No files available for download")
 
         except requests.RequestException as e:
-            print(f"{arch_prefix}Error downloading files: {e}")
+            if "503" in str(e) or "502" in str(e):
+                print(f"{arch_prefix}Server unavailable - cannot download build artifacts: {e}")
+                print(f"{arch_prefix}You may need to download files manually when server recovers")
+            else:
+                print(f"{arch_prefix}Error downloading files: {e}")
 
     return last_status == 'completed'
 
 
-def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict, 
-                            verbose: bool = False, detach: bool = False, 
+def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
+                            verbose: bool = False, detach: bool = False,
                             specific_arch: str = None, force: bool = False) -> bool:
     """
     Build a package for multiple architectures using available servers.
@@ -1017,11 +1209,28 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
             source_files.append(file_path)
 
     servers = config.get("servers", {})
-    architectures = [specific_arch] if specific_arch else list(servers.keys())
 
-    if not architectures:
-        print("Error: No architectures configured")
-        return False
+    # Use architectures from PKGBUILD if no specific architecture is requested
+    if specific_arch:
+        architectures = [specific_arch]
+    else:
+        # Parse PKGBUILD to get target architectures
+        pkg_info = parse_pkgbuild_info(pkgbuild_path)
+        pkgbuild_archs = pkg_info.get("arch", ["x86_64"])
+
+        # Filter to only include architectures we have servers for
+        # Special case: "any" architecture can be built on any available server
+        if "any" in pkgbuild_archs:
+            # For "any" architecture, we can use any available server
+            architectures = ["any"]
+        else:
+            # For specific architectures, only use those we have servers for
+            architectures = [arch for arch in pkgbuild_archs if arch in servers]
+
+        if not architectures:
+            print(f"Error: No servers configured for PKGBUILD architectures: {pkgbuild_archs}")
+            print(f"Available server architectures: {list(servers.keys())}")
+            return False
 
     # Show which architectures will be built
     print(f"Building for architectures: {', '.join(architectures)}")
@@ -1031,14 +1240,28 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
 
     # Submit builds for all architectures
     for arch in architectures:
-        if arch not in servers:
-            print(f"[{arch}] No servers configured for architecture: {arch}")
-            continue
+        # Special handling for "any" architecture
+        if arch == "any":
+            # For "any" architecture, we can use any available server
+            # Pick the first available server architecture
+            available_server_archs = [k for k, v in servers.items() if v]
+            if not available_server_archs:
+                print(f"[{arch}] No servers available for any architecture")
+                continue
+            # Use the first available server architecture
+            server_arch = available_server_archs[0]
+            server_urls = servers[server_arch]
+            if verbose:
+                print(f"[{arch}] Using {server_arch} servers for 'any' architecture build")
+        else:
+            if arch not in servers:
+                print(f"[{arch}] No servers configured for architecture: {arch}")
+                continue
 
-        server_urls = servers[arch]
-        if not server_urls:
-            print(f"[{arch}] No servers available for architecture: {arch}")
-            continue
+            server_urls = servers[arch]
+            if not server_urls:
+                print(f"[{arch}] No servers available for architecture: {arch}")
+                continue
 
         # Check if package already exists (unless force is specified)
         should_skip, reason = should_skip_build(output_dir, pkgbuild_path, arch, force)
@@ -1101,7 +1324,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         return True
 
     # Monitor all builds
-    builds_to_monitor = {arch: info for arch, info in arch_build_info.items() 
+    builds_to_monitor = {arch: info for arch, info in arch_build_info.items()
                         if info['build_id'] and info['status'] != 'skipped'}
 
     if builds_to_monitor:
@@ -1118,14 +1341,18 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
 
         try:
             client = APBotClient(info['server_url'])
-            arch_output_dir = output_dir / arch
+            # For "any" architecture, download to "any" subdirectory
+            if arch == "any":
+                arch_output_dir = output_dir / "any"
+            else:
+                arch_output_dir = output_dir / arch
 
             print(f"\n--- Starting monitoring for {arch} ---")
             success = monitor_build(
-                info['build_id'], 
-                client, 
-                arch_output_dir, 
-                verbose, 
+                info['build_id'],
+                client,
+                arch_output_dir,
+                verbose,
                 arch=arch
             )
             print(f"--- Finished monitoring for {arch}: {'SUCCESS' if success else 'FAILED'} ---\n")
@@ -1193,7 +1420,7 @@ def main():
     parser = argparse.ArgumentParser(description="APB Client - Build packages using APB servers")
 
     # Basic options
-    parser.add_argument("pkgbuild_path", nargs="?", type=Path, 
+    parser.add_argument("pkgbuild_path", nargs="?", type=Path,
                        help="Path to PKGBUILD or package directory")
     parser.add_argument("--server", type=str, help="Server URL")
     parser.add_argument("--arch", type=str, help="Target architecture(s) (comma-separated)")
@@ -1204,7 +1431,7 @@ def main():
     # Build options
     parser.add_argument("--output-dir", type=Path, default=Path("./output"),
                        help="Output directory for downloaded files")
-    parser.add_argument("--detach", action="store_true", 
+    parser.add_argument("--detach", action="store_true",
                        help="Submit build and exit (don't wait for completion)")
     parser.add_argument("--no-download", action="store_true",
                        help="Don't download build results")
@@ -1255,7 +1482,7 @@ def main():
             output_dir = args.output_dir / build_arch
 
         try:
-            success = monitor_build(args.monitor, client, output_dir, 
+            success = monitor_build(args.monitor, client, output_dir,
                                   args.verbose, allow_toggle=True)
             sys.exit(0 if success else 1)
         except KeyboardInterrupt:
@@ -1457,7 +1684,7 @@ def main():
                                 output_dir = args.output_dir
 
                             try:
-                                success = monitor_farm_builds(builds, client, output_dir, args.verbose)
+                                success = monitor_farm_builds(builds, client, output_dir, args.verbose, pkgbuild_path)
                                 sys.exit(0 if success else 1)
                             except KeyboardInterrupt:
                                 print("\nBuilds interrupted by user")
@@ -1496,7 +1723,7 @@ def main():
                                 try:
                                     # Use first needed architecture for display
                                     display_arch = architectures_needing_build[0] if architectures_needing_build else None
-                                    success = monitor_build(build_id, client, output_dir, 
+                                    success = monitor_build(build_id, client, output_dir,
                                                           args.verbose, allow_toggle=True, arch=display_arch)
                                     sys.exit(0 if success else 1)
                                 except KeyboardInterrupt:
@@ -1529,7 +1756,7 @@ def main():
                             output_dir = args.output_dir / build_arch
 
                         try:
-                            success = monitor_build(build_id, client, output_dir, 
+                            success = monitor_build(build_id, client, output_dir,
                                                   args.verbose, allow_toggle=True, arch=target_arch)
                             sys.exit(0 if success else 1)
                         except KeyboardInterrupt:
@@ -1552,7 +1779,7 @@ def main():
             if len(architectures) == 1:
                 # Single architecture build
                 success = build_for_multiple_arches(
-                    build_path, args.output_dir, config, 
+                    build_path, args.output_dir, config,
                     args.verbose, args.detach, architectures[0], args.force
                 )
             else:
@@ -1563,7 +1790,7 @@ def main():
                     print(f"Building for architecture: {arch}")
                     print(f"{'='*50}")
                     arch_success = build_for_multiple_arches(
-                        build_path, args.output_dir, config, 
+                        build_path, args.output_dir, config,
                         args.verbose, args.detach, arch, args.force
                     )
                     success = success and arch_success
@@ -1571,7 +1798,7 @@ def main():
                         print(f"Build failed for architecture: {arch}")
         else:
             success = build_for_multiple_arches(
-                build_path, args.output_dir, config, 
+                build_path, args.output_dir, config,
                 args.verbose, args.detach, None, args.force
             )
     except KeyboardInterrupt:
