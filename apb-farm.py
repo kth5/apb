@@ -97,6 +97,7 @@ class User:
     role: UserRole
     created_at: float
     last_login: Optional[float] = None
+    email: Optional[str] = None
 
 
 # Pydantic models for API requests/responses
@@ -115,6 +116,7 @@ class CreateUserRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=8, max_length=100)
     role: str = Field(default="user", pattern="^(user|admin)$")
+    email: Optional[str] = Field(None, max_length=255)
 
 
 class ChangeRoleRequest(BaseModel):
@@ -127,12 +129,17 @@ class UserResponse(BaseModel):
     role: str
     created_at: float
     last_login: Optional[float]
+    email: Optional[str]
 
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., min_length=8, max_length=100)
     new_password: str = Field(..., min_length=8, max_length=100)
     confirm_password: str = Field(..., min_length=8, max_length=100)
+
+
+class UpdateEmailRequest(BaseModel):
+    email: Optional[str] = Field(None, max_length=255)
 
 
 # Global state
@@ -160,6 +167,15 @@ class AuthManager:
         self._init_auth_tables()
         self._create_default_admin()
 
+    def _validate_email(self, email: str) -> bool:
+        """Validate email format"""
+        if not email:
+            return True  # Email is optional
+
+        # Simple email validation regex
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(email_pattern, email) is not None
+
     def _init_auth_tables(self):
         """Initialize authentication tables"""
         try:
@@ -172,9 +188,17 @@ class AuthManager:
                     role TEXT NOT NULL DEFAULT 'user',
                     created_at REAL NOT NULL,
                     last_login REAL,
-                    is_active BOOLEAN DEFAULT 1
+                    is_active BOOLEAN DEFAULT 1,
+                    email TEXT
                 )
             ''')
+
+            # Add email column if it doesn't exist (for existing databases)
+            try:
+                self.db.execute('ALTER TABLE users ADD COLUMN email TEXT')
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
             # Tokens table
             self.db.execute('''
@@ -246,12 +270,14 @@ class AuthManager:
         """Hash token for storage"""
         return hashlib.sha256(token.encode()).hexdigest()
 
-    def create_user(self, username: str, password: str, role: UserRole = UserRole.USER) -> User:
+    def create_user(self, username: str, password: str, role: UserRole = UserRole.USER, email: Optional[str] = None) -> User:
         """Create a new user"""
         if len(username) < 3:
             raise ValueError("Username must be at least 3 characters")
         if len(password) < 8:
             raise ValueError("Password must be at least 8 characters")
+        if email and not self._validate_email(email):
+            raise ValueError("Invalid email format")
 
         password_hash = self._hash_password(password)
         current_time = time.time()
@@ -259,19 +285,20 @@ class AuthManager:
         try:
             cursor = self.db.cursor()
             cursor.execute('''
-                INSERT INTO users (username, password_hash, role, created_at)
-                VALUES (?, ?, ?, ?)
-            ''', (username, password_hash, role.value, current_time))
+                INSERT INTO users (username, password_hash, role, created_at, email)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (username, password_hash, role.value, current_time, email))
 
             user_id = cursor.lastrowid
             self.db.commit()
 
-            logger.info(f"Created user '{username}' with role '{role.value}'")
+            logger.info(f"Created user '{username}' with role '{role.value}' and email '{email or 'none'}'")
             return User(
                 id=user_id,
                 username=username,
                 role=role,
-                created_at=current_time
+                created_at=current_time,
+                email=email
             )
 
         except sqlite3.IntegrityError:
@@ -284,7 +311,7 @@ class AuthManager:
         """Authenticate user with username and password"""
         cursor = self.db.cursor()
         cursor.execute('''
-            SELECT id, username, password_hash, role, created_at, last_login
+            SELECT id, username, password_hash, role, created_at, last_login, email
             FROM users WHERE username = ? AND is_active = 1
         ''', (username,))
 
@@ -292,7 +319,7 @@ class AuthManager:
         if not row:
             return None
 
-        user_id, username, stored_hash, role, created_at, last_login = row
+        user_id, username, stored_hash, role, created_at, last_login, email = row
 
         if not self._verify_password(password, stored_hash):
             return None
@@ -307,7 +334,8 @@ class AuthManager:
             username=username,
             role=UserRole(role),
             created_at=created_at,
-            last_login=current_time
+            last_login=current_time,
+            email=email
         )
 
     def create_token(self, user: User) -> str:
@@ -400,7 +428,7 @@ class AuthManager:
         """Get user by ID"""
         cursor = self.db.cursor()
         cursor.execute('''
-            SELECT id, username, role, created_at, last_login
+            SELECT id, username, role, created_at, last_login, email
             FROM users WHERE id = ? AND is_active = 1
         ''', (user_id,))
 
@@ -411,7 +439,8 @@ class AuthManager:
                 username=row[1],
                 role=UserRole(row[2]),
                 created_at=row[3],
-                last_login=row[4]
+                last_login=row[4],
+                email=row[5]
             )
         return None
 
@@ -419,7 +448,7 @@ class AuthManager:
         """List all users"""
         cursor = self.db.cursor()
         query = '''
-            SELECT id, username, role, created_at, last_login
+            SELECT id, username, role, created_at, last_login, email
             FROM users
         '''
         if not include_inactive:
@@ -434,7 +463,8 @@ class AuthManager:
                 username=row[1],
                 role=UserRole(row[2]),
                 created_at=row[3],
-                last_login=row[4]
+                last_login=row[4],
+                email=row[5]
             ))
         return users
 
@@ -454,6 +484,17 @@ class AuthManager:
         cursor = self.db.cursor()
         cursor.execute('UPDATE users SET role = ? WHERE id = ? AND is_active = 1',
                       (new_role.value, user_id))
+        self.db.commit()
+        return cursor.rowcount > 0
+
+    def update_user_email(self, user_id: int, email: Optional[str]) -> bool:
+        """Update user email address"""
+        if email and not self._validate_email(email):
+            raise ValueError("Invalid email format")
+
+        cursor = self.db.cursor()
+        cursor.execute('UPDATE users SET email = ? WHERE id = ? AND is_active = 1',
+                      (email, user_id))
         self.db.commit()
         return cursor.rowcount > 0
 
@@ -1720,7 +1761,8 @@ async def login(login_data: LoginRequest):
             "username": user.username,
             "role": user.role.value,
             "created_at": user.created_at,
-            "last_login": user.last_login
+            "last_login": user.last_login,
+            "email": user.email
         }
     )
 
@@ -1762,7 +1804,8 @@ async def get_current_user_info(current_user: User = Depends(require_auth)):
         username=current_user.username,
         role=current_user.role.value,
         created_at=current_user.created_at,
-        last_login=current_user.last_login
+        last_login=current_user.last_login,
+        email=current_user.email
     )
 
 
@@ -1777,7 +1820,8 @@ async def list_users(current_user: User = Depends(require_admin)):
             username=user.username,
             role=user.role.value,
             created_at=user.created_at,
-            last_login=user.last_login
+            last_login=user.last_login,
+            email=user.email
         )
         for user in users
     ]
@@ -1792,14 +1836,15 @@ async def create_user(
     global auth_manager
     try:
         role = UserRole(user_data.role)
-        new_user = auth_manager.create_user(user_data.username, user_data.password, role)
+        new_user = auth_manager.create_user(user_data.username, user_data.password, role, user_data.email)
 
         return UserResponse(
             id=new_user.id,
             username=new_user.username,
             role=new_user.role.value,
             created_at=new_user.created_at,
-            last_login=new_user.last_login
+            last_login=new_user.last_login,
+            email=new_user.email
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1895,6 +1940,39 @@ async def change_password(
     auth_manager.revoke_user_tokens(current_user.id)
 
     return {"message": "Password changed successfully. Please log in again."}
+
+
+@app.put("/auth/users/{user_id}/email")
+async def update_user_email(
+    user_id: int,
+    email_data: UpdateEmailRequest,
+    current_user: User = Depends(require_admin)
+):
+    """Update user email (admin only)"""
+    global auth_manager
+    try:
+        if auth_manager.update_user_email(user_id, email_data.email):
+            return {"message": f"Email updated for user {user_id}"}
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/auth/my/email")
+async def update_my_email(
+    email_data: UpdateEmailRequest,
+    current_user: User = Depends(require_auth)
+):
+    """Update current user's email"""
+    global auth_manager
+    try:
+        if auth_manager.update_user_email(current_user.id, email_data.email):
+            return {"message": "Email updated successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # API Endpoints
@@ -3492,7 +3570,8 @@ async def get_admin_panel(
             "username": user.username,
             "role": user.role.value,
             "created_at": datetime.fromtimestamp(user.created_at).strftime('%Y-%m-%d %H:%M:%S') if user.created_at else 'unknown',
-            "last_login": datetime.fromtimestamp(user.last_login).strftime('%Y-%m-%d %H:%M:%S') if user.last_login else 'never'
+            "last_login": datetime.fromtimestamp(user.last_login).strftime('%Y-%m-%d %H:%M:%S') if user.last_login else 'never',
+            "email": user.email or 'none'
         })
 
     html = f"""
@@ -3508,10 +3587,11 @@ async def get_admin_panel(
             .admin-section {{ margin: 20px 0; }}
             .admin-section h2 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 5px; }}
             .user-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-            .user-table th, .user-table td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+            .user-table th, .user-table td {{ border: 1px solid #ddd; padding: 8px; text-align: left; word-wrap: break-word; }}
             .user-table th {{ background-color: #f8f9fa; font-weight: bold; }}
             .user-table tr:nth-child(even) {{ background-color: #f8f9fa; }}
             .user-table tr:hover {{ background-color: #e9ecef; }}
+            .email-cell {{ max-width: 150px; overflow: hidden; text-overflow: ellipsis; }}
             .action-button {{ padding: 5px 10px; margin: 2px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; }}
             .edit-button {{ background-color: #ffc107; color: #000; }}
             .delete-button {{ background-color: #dc3545; color: white; }}
@@ -3527,7 +3607,7 @@ async def get_admin_panel(
             .nav-links a:hover {{ text-decoration: underline; }}
             .error-message {{ color: #dc3545; margin: 10px 0; }}
             .success-message {{ color: #28a745; margin: 10px 0; font-weight: bold; }}
-            .modal {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; display: none; }}
+            .modal {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; display: none; max-width: 90%; max-height: 90%; overflow-y: auto; }}
             .modal-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; display: none; }}
         </style>
     </head>
@@ -3544,6 +3624,8 @@ async def get_admin_panel(
                     <option value="user">User</option>
                     <option value="admin">Admin</option>
                 </select>
+                <label>Email:</label>
+                <input type="email" id="editEmail" placeholder="user@example.com">
                 <div class="error-message" id="editError"></div>
                 <div class="success-message" id="editSuccess"></div>
                 <button type="submit" class="submit-button">Update User</button>
@@ -3572,6 +3654,8 @@ async def get_admin_panel(
                     <input type="text" id="newUsername" placeholder="Username (min 3 characters)" required>
                     <label>Password:</label>
                     <input type="password" id="newPassword" placeholder="Password (min 8 characters)" required>
+                    <label>Email:</label>
+                    <input type="email" id="newEmail" placeholder="user@example.com (optional)">
                     <label>Role:</label>
                     <select id="newRole" required>
                         <option value="user">User</option>
@@ -3589,6 +3673,7 @@ async def get_admin_panel(
                     <tr>
                         <th>ID</th>
                         <th>Username</th>
+                        <th>Email</th>
                         <th>Role</th>
                         <th>Created</th>
                         <th>Last Login</th>
@@ -3601,16 +3686,18 @@ async def get_admin_panel(
     for user in users_data:
         role_badge = f'<span class="admin-badge">ADMIN</span>' if user["role"] == "admin" else f'<span class="user-badge">USER</span>'
         delete_disabled = 'disabled title="Cannot delete yourself"' if user["id"] == current_user.id else ''
+        email_display = user["email"] if user["email"] != "none" else '<em>none</em>'
 
         html += f"""
                     <tr>
                         <td>{user["id"]}</td>
                         <td>{user["username"]}</td>
+                        <td class="email-cell" title="{user['email']}">{email_display}</td>
                         <td>{role_badge}</td>
                         <td>{user["created_at"]}</td>
                         <td>{user["last_login"]}</td>
                         <td>
-                            <button class="action-button edit-button" onclick="editUser({user['id']}, '{user['username']}', '{user['role']}')">Edit</button>
+                            <button class="action-button edit-button" onclick="editUser({user['id']}, '{user['username']}', '{user['role']}', '{user['email'] if user['email'] != 'none' else ''}')">Edit</button>
                             <button class="action-button delete-button" onclick="deleteUser({user['id']}, '{user['username']}')" {delete_disabled}>Delete</button>
                         </td>
                     </tr>
@@ -3648,6 +3735,7 @@ async def get_admin_panel(
 
                 const username = document.getElementById('newUsername').value;
                 const password = document.getElementById('newPassword').value;
+                const email = document.getElementById('newEmail').value || null;
                 const role = document.getElementById('newRole').value;
                 const errorDiv = document.getElementById('addError');
                 const successDiv = document.getElementById('addSuccess');
@@ -3663,7 +3751,7 @@ async def get_admin_panel(
                             'Content-Type': 'application/json',
                             'Authorization': `Bearer ${{token}}`
                         }},
-                        body: JSON.stringify({{ username, password, role }})
+                        body: JSON.stringify({{ username, password, email, role }})
                     }});
 
                     if (response.ok) {{
@@ -3681,10 +3769,11 @@ async def get_admin_panel(
                 }}
             }}
 
-            function editUser(id, username, role) {{
+            function editUser(id, username, role, email) {{
                 document.getElementById('editUserId').value = id;
                 document.getElementById('editUsername').value = username;
                 document.getElementById('editRole').value = role;
+                document.getElementById('editEmail').value = email || '';
                 document.getElementById('editError').textContent = '';
                 document.getElementById('editSuccess').textContent = '';
 
@@ -3702,6 +3791,7 @@ async def get_admin_panel(
 
                 const userId = document.getElementById('editUserId').value;
                 const role = document.getElementById('editRole').value;
+                const email = document.getElementById('editEmail').value || null;
                 const errorDiv = document.getElementById('editError');
                 const successDiv = document.getElementById('editSuccess');
 
@@ -3710,7 +3800,9 @@ async def get_admin_panel(
 
                 try {{
                     const token = getAuthToken();
-                    const response = await fetch(`/auth/users/${{userId}}/role`, {{
+
+                    // Update role
+                    const roleResponse = await fetch(`/auth/users/${{userId}}/role`, {{
                         method: 'PUT',
                         headers: {{
                             'Content-Type': 'application/json',
@@ -3719,15 +3811,31 @@ async def get_admin_panel(
                         body: JSON.stringify({{ role }})
                     }});
 
-                    if (response.ok) {{
-                        successDiv.textContent = 'User role updated successfully!';
+                    if (!roleResponse.ok) {{
+                        const errorData = await roleResponse.json();
+                        errorDiv.textContent = errorData.detail || 'Failed to update role';
+                        return;
+                    }}
+
+                    // Update email
+                    const emailResponse = await fetch(`/auth/users/${{userId}}/email`, {{
+                        method: 'PUT',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: JSON.stringify({{ email }})
+                    }});
+
+                    if (emailResponse.ok) {{
+                        successDiv.textContent = 'User updated successfully!';
                         setTimeout(() => {{
                             hideModal();
                             window.location.reload();
                         }}, 1500);
                     }} else {{
-                        const errorData = await response.json();
-                        errorDiv.textContent = errorData.detail || 'Failed to update user';
+                        const errorData = await emailResponse.json();
+                        errorDiv.textContent = errorData.detail || 'Failed to update email';
                     }}
                 }} catch (error) {{
                     errorDiv.textContent = 'Network error. Please try again.';
