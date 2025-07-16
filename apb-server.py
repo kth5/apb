@@ -75,7 +75,19 @@ last_cleanup_time = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan"""
-    global resource_monitor_thread
+    global resource_monitor_thread, build_executor
+
+    # Update executor with correct max_workers from server_config
+    if "max_concurrent" in server_config:
+        # Shutdown old executor
+        build_executor.shutdown(wait=False)
+        # Create new executor with correct worker count
+        # IMPORTANT: This must be done here in the lifespan manager, not in main(),
+        # because the process_build_queue thread (started below) captures the global
+        # reference to build_executor. If we recreate it in main() after the app
+        # starts, the queue processor will still use the old executor.
+        build_executor = ThreadPoolExecutor(max_workers=server_config["max_concurrent"])
+        logger.info(f"Build executor updated with {server_config['max_concurrent']} max workers")
 
     # Start resource monitoring
     resource_monitor_thread = threading.Thread(target=monitor_resources, daemon=True)
@@ -84,6 +96,7 @@ async def lifespan(app: FastAPI):
     # Start queue processor
     queue_thread = threading.Thread(target=process_build_queue, daemon=True)
     queue_thread.start()
+    logger.info(f"Queue processor thread started: {queue_thread.is_alive()}")
 
     logger.info("APB Server background tasks started")
 
@@ -739,11 +752,128 @@ def lock_srcdest(srcdest_path: str) -> Optional[int]:
     """Lock SRCDEST directory"""
     try:
         lock_file = os.path.join(srcdest_path, '.apb-lock')
+
+        # Try to acquire lock
         fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fd
-    except (OSError, IOError):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except (OSError, IOError) as e:
+            # Lock failed - check if it's an orphaned lock
+            os.close(fd)
+
+            # Check if any process is actually holding the lock file
+            try:
+                import subprocess
+                result = subprocess.run(['lsof', lock_file],
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode != 0:
+                    # No process is holding the lock - it's orphaned
+                    logger.warning(f"Detected orphaned SRCDEST lock file {lock_file}, removing it")
+                    try:
+                        os.unlink(lock_file)
+                        # Try to acquire lock again after cleanup
+                        fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        logger.info(f"Successfully acquired SRCDEST lock after cleanup")
+                        return fd
+                    except Exception as cleanup_error:
+                        logger.error(f"Failed to clean up orphaned lock: {cleanup_error}")
+                        if 'fd' in locals():
+                            try:
+                                os.close(fd)
+                            except:
+                                pass
+                        return None
+                else:
+                    # A process is actually holding the lock
+                    logger.debug(f"SRCDEST lock is held by another process")
+                    return None
+            except FileNotFoundError:
+                # lsof not available - use file age as fallback
+                try:
+                    stat_info = os.stat(lock_file)
+                    age_seconds = time.time() - stat_info.st_mtime
+                    # If lock file is older than 30 minutes, consider it orphaned
+                    if age_seconds > 600:
+                        logger.warning(f"SRCDEST lock file is {age_seconds:.0f}s old, considering it orphaned")
+                        try:
+                            os.unlink(lock_file)
+                            # Try to acquire lock again after cleanup
+                            fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            logger.info(f"Successfully acquired SRCDEST lock after age-based cleanup")
+                            return fd
+                        except Exception as cleanup_error:
+                            logger.error(f"Failed to clean up old lock: {cleanup_error}")
+                            return None
+                    else:
+                        logger.debug(f"SRCDEST lock file is recent ({age_seconds:.0f}s old), assuming it's valid")
+                        return None
+                except Exception as stat_error:
+                    logger.debug(f"Could not check lock file age: {stat_error}")
+                    return None
+            except Exception as lsof_error:
+                logger.debug(f"Could not check lock file status: {lsof_error}")
+                return None
+
+    except (OSError, IOError) as e:
+        logger.error(f"Error accessing SRCDEST lock file: {e}")
         return None
+
+
+def cleanup_orphaned_srcdest_locks():
+    """Clean up orphaned SRCDEST lock files during server startup"""
+    try:
+        makepkg_config = get_makepkg_config()
+        if 'SRCDEST' not in makepkg_config:
+            return
+
+        srcdest_path = makepkg_config['SRCDEST']
+        lock_file = os.path.join(srcdest_path, '.apb-lock')
+
+        if not os.path.exists(lock_file):
+            return
+
+        logger.info(f"Found existing SRCDEST lock file: {lock_file}")
+
+        # Check if any process is holding the lock
+        try:
+            import subprocess
+            result = subprocess.run(['lsof', lock_file],
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                # No process is holding the lock - it's orphaned
+                logger.warning(f"Removing orphaned SRCDEST lock file from previous session")
+                os.unlink(lock_file)
+                logger.info(f"Orphaned SRCDEST lock cleaned up successfully")
+            else:
+                logger.warning(f"SRCDEST lock is held by another process - not removing")
+                # Log which process is holding it
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        logger.info(f"Lock held by: {line.strip()}")
+        except FileNotFoundError:
+            # lsof not available - use file age as fallback
+            try:
+                stat_info = os.stat(lock_file)
+                age_seconds = time.time() - stat_info.st_mtime
+                # If lock file is older than 30 minutes, consider it orphaned
+                if age_seconds > 1800:
+                    logger.warning(f"SRCDEST lock file is {age_seconds:.0f}s old, removing orphaned lock from previous session")
+                    os.unlink(lock_file)
+                    logger.info(f"Old SRCDEST lock cleaned up successfully")
+                else:
+                    logger.info(f"SRCDEST lock file is recent ({age_seconds:.0f}s old), leaving in place")
+            except Exception as stat_error:
+                logger.warning(f"Could not check lock file age: {stat_error}")
+                logger.info(f"Leaving lock file in place to be safe")
+        except Exception as e:
+            logger.warning(f"Could not check SRCDEST lock status during startup: {e}")
+            logger.info(f"Leaving lock file in place to be safe")
+
+    except Exception as e:
+        logger.error(f"Error during SRCDEST lock cleanup: {e}")
 
 
 def unlock_srcdest(lock_fd: int):
@@ -758,6 +888,8 @@ def unlock_srcdest(lock_fd: int):
 def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any], build_timeout: int = BUILD_TIMEOUT):
     """Build package using makechrootpkg"""
     global build_counter
+
+    logger.info(f"build_package called for build {build_id}")
 
     try:
         # Update build status
@@ -777,6 +909,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     pass
 
         log_output(f"Starting build for {pkgbuild_info['pkgname']}")
+        logger.info(f"Build {build_id} status updated to BUILDING")
 
         # Check if buildroot needs recreation
         buildroot_path = Path(server_config["buildroot"])
@@ -828,6 +961,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         # Lock SRCDEST if it exists with timeout
         srcdest_lock = None
         if 'SRCDEST' in makepkg_config:
+            log_output(f"Attempting to acquire SRCDEST lock for {makepkg_config['SRCDEST']}")
             srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'])
             if srcdest_lock is None:
                 log_output("Waiting for SRCDEST lock...")
@@ -840,6 +974,11 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     time.sleep(5)  # Check every 5 seconds instead of 1
                     srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'])
 
+            if srcdest_lock is not None:
+                log_output("SRCDEST lock acquired successfully")
+            else:
+                log_output("Proceeding without SRCDEST lock (timeout or unavailable)")
+
         try:
             # Download GPG keys if specified in PKGBUILD
             if pkgbuild_info.get("validpgpkeys"):
@@ -848,7 +987,13 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     log_output("GPG key download failed, continuing build (may fail during source validation)")
 
             # Build makechrootpkg command with correct flags
-            cmd = ["sudo", "makechrootpkg", "-cuT", "-r", str(buildroot_path)]
+            # Check if we need to prefix with ppc32 for PowerPC architectures
+            server_arch = get_server_architecture()
+            if server_arch in ["powerpc", "espresso"]:
+                cmd = ["sudo", "ppc32", "makechrootpkg", "-cuT", "-r", str(buildroot_path)]
+                log_output(f"Using ppc32 prefix for {server_arch} architecture to ensure 32-bit detection")
+            else:
+                cmd = ["sudo", "makechrootpkg", "-cuT", "-r", str(buildroot_path)]
 
             # Add bind mounts
             if 'CCACHE_DIR' in makepkg_config:
@@ -1011,24 +1156,38 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
 def process_build_queue():
     """Process builds from queue"""
+    logger.info("Build queue processor thread started")
     while not shutdown_event.is_set():
         try:
             # Get build from queue
+            if logger.level <= logging.DEBUG:
+                logger.debug(f"Checking queue for builds (queue size: {build_queue.qsize()})")
             build_data = build_queue.get(timeout=1)
 
+            build_id = build_data["build_id"]
+            logger.info(f"Processing build {build_id} from queue")
+
             # Submit to executor
-            build_executor.submit(
+            if logger.level <= logging.DEBUG:
+                logger.debug(f"Executor state - max_workers: {build_executor._max_workers}, active threads: {len(build_executor._threads)}")
+            future = build_executor.submit(
                 build_package,
                 build_data["build_id"],
                 build_data["build_dir"],
                 build_data["pkgbuild_info"],
                 build_data.get("build_timeout", BUILD_TIMEOUT)
             )
+            logger.info(f"Build {build_id} submitted to executor")
 
         except queue.Empty:
             continue
         except Exception as e:
             logger.error(f"Error processing build queue: {e}")
+            # Log more details about the error
+            import traceback
+            logger.error(f"Queue processor traceback: {traceback.format_exc()}")
+
+    logger.info("Build queue processor thread stopped")
 
 
 # Queue processor is now started in the lifespan manager
@@ -1308,6 +1467,8 @@ async def submit_build(
             "pkgbuild_info": pkgbuild_info,
             "build_timeout": timeout_seconds
         })
+
+        logger.info(f"Build {build_id} added to queue (queue size now: {build_queue.qsize()})")
 
         return {
             "build_id": build_id,
@@ -1798,7 +1959,7 @@ def signal_handler(signum, frame):
 
 def main():
     """Main entry point"""
-    global server_config, build_executor
+    global server_config
 
     parser = argparse.ArgumentParser(description="APB Server - Arch Package Builder")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Host to bind to")
@@ -1818,6 +1979,7 @@ def main():
     # Setup logging
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("Debug logging enabled")
 
     # Setup signal handlers
     signal.signal(signal.SIGINT, signal_handler)
@@ -1843,9 +2005,6 @@ def main():
         "build_timeout": args.build_timeout
     }
 
-    # Update executor with correct max_workers
-    build_executor = ThreadPoolExecutor(max_workers=args.max_concurrent)
-
     # Create directories
     args.buildroot.mkdir(parents=True, exist_ok=True)
     args.builds_dir.mkdir(parents=True, exist_ok=True)
@@ -1858,14 +2017,39 @@ def main():
     logger.info(f"Max request size: {args.max_request_size // (1024*1024)} MB")
     logger.info(f"Build timeout: {args.build_timeout} seconds")
 
-    # Set resource limits
+    # Set resource limits to unlimited
     try:
-        # Set memory limit warning threshold
-        if hasattr(resource, 'RLIMIT_AS'):
-            resource.setrlimit(resource.RLIMIT_AS, (8 * 1024 * 1024 * 1024, -1))  # 8GB soft limit
-        logger.info("Resource limits configured")
+        limits_set = []
+
+        # Set various ulimits to unlimited for build server operations
+        ulimits_to_set = [
+            ('RLIMIT_AS', 'address space'),
+            ('RLIMIT_DATA', 'data segment size'),
+            ('RLIMIT_STACK', 'stack size'),
+            ('RLIMIT_CORE', 'core file size'),
+            ('RLIMIT_FSIZE', 'file size'),
+            ('RLIMIT_NOFILE', 'number of open files'),
+            ('RLIMIT_NPROC', 'number of processes')
+        ]
+
+        for limit_name, description in ulimits_to_set:
+            if hasattr(resource, limit_name):
+                try:
+                    current_soft, current_hard = resource.getrlimit(getattr(resource, limit_name))
+                    # Set both soft and hard limits to unlimited (RLIM_INFINITY)
+                    resource.setrlimit(getattr(resource, limit_name), (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+                    limits_set.append(f"{description} (was {current_soft}/{current_hard}, now unlimited)")
+                except (OSError, ValueError) as e:
+                    # Some limits might not be settable due to permissions
+                    logger.warning(f"Could not set {description} to unlimited: {e}")
+
+        if limits_set:
+            logger.info(f"Resource limits set to unlimited: {', '.join(limits_set)}")
+        else:
+            logger.warning("No resource limits could be set to unlimited")
+
     except Exception as e:
-        logger.warning(f"Could not set resource limits: {e}")
+        logger.warning(f"Error configuring resource limits: {e}")
 
     # Log the detected architecture
     detected_arch = get_server_architecture()
@@ -1877,6 +2061,10 @@ def main():
         logger.error("Failed to setup buildroot during startup")
         sys.exit(1)
     logger.info("Buildroot setup complete")
+
+    # Clean up any orphaned SRCDEST locks from previous sessions
+    logger.info("Checking for orphaned SRCDEST locks...")
+    cleanup_orphaned_srcdest_locks()
 
     # Start server with improved configuration
     try:
