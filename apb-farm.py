@@ -2692,6 +2692,13 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
             .running-builds a {{ color: #007bff; text-decoration: none; }}
             .running-builds a:hover {{ text-decoration: underline; }}
             .running-builds small {{ color: #666; margin-left: 5px; }}
+            .tabs {{ margin: 20px 0; }}
+            .tab-buttons {{ display: flex; border-bottom: 2px solid #ddd; margin-bottom: 20px; }}
+            .tab-button {{ padding: 12px 24px; background: #f8f9fa; border: 1px solid #ddd; border-bottom: none; cursor: pointer; margin-right: 2px; border-radius: 8px 8px 0 0; transition: all 0.3s; }}
+            .tab-button:hover {{ background: #e9ecef; }}
+            .tab-button.active {{ background: white; border-bottom: 2px solid white; margin-bottom: -2px; font-weight: bold; color: #007bff; }}
+            .tab-content {{ display: none; }}
+            .tab-content.active {{ display: block; }}
         </style>
     </head>
     <body>
@@ -2729,8 +2736,14 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
             <p>Available Architectures: {', '.join(available_archs.keys())}</p>
         </div>
 
-        <div class="servers">
-            <h2>Servers by Architecture</h2>
+        <div class="tabs">
+            <div class="tab-buttons">
+                <div class="tab-button active" onclick="switchTab('servers-tab')">🌾 Servers by Architecture</div>
+                <div class="tab-button" onclick="switchTab('builds-tab')">📋 Recent Builds</div>
+            </div>
+
+            <div id="servers-tab" class="tab-content active">
+                <div class="servers">
     """
 
     for arch, servers in servers_by_arch.items():
@@ -2777,10 +2790,11 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
         html += "</div>"
 
     html += """
-        </div>
+                </div>
+            </div>
 
-        <div class="builds">
-            <h2>Recent Builds</h2>
+            <div id="builds-tab" class="tab-content">
+                <div class="builds">
     """
 
     for build in builds:
@@ -2799,15 +2813,37 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
         """
 
     html += f"""
-        </div>
-
-        <div class="pagination">
-            <a href="/dashboard?page={max(1, page-1)}">&laquo; Previous</a>
-            <span>Page {page}</span>
-            <a href="/dashboard?page={page+1}">Next &raquo;</a>
+                </div>
+                <div class="pagination">
+                    <a href="/dashboard?page={max(1, page-1)}">&laquo; Previous</a>
+                    <span>Page {page}</span>
+                    <a href="/dashboard?page={page+1}">Next &raquo;</a>
+                </div>
+            </div>
         </div>
 
         <script>
+            // Tab switching function
+            function switchTab(tabId) {{
+                // Hide all tab contents
+                const tabContents = document.querySelectorAll('.tab-content');
+                tabContents.forEach(content => {{
+                    content.classList.remove('active');
+                }});
+
+                // Remove active class from all tab buttons
+                const tabButtons = document.querySelectorAll('.tab-button');
+                tabButtons.forEach(button => {{
+                    button.classList.remove('active');
+                }});
+
+                // Show selected tab content
+                document.getElementById(tabId).classList.add('active');
+
+                // Add active class to clicked tab button
+                event.target.classList.add('active');
+            }}
+
             function showLoginForm() {{
                 document.getElementById('loginOverlay').style.display = 'block';
                 document.getElementById('loginForm').style.display = 'block';
