@@ -563,7 +563,7 @@ class AuthManager:
         """Get builds created by a specific user"""
         cursor = self.db.cursor()
         cursor.execute('''
-            SELECT id, server_url, server_arch, pkgname, status, start_time, end_time, created_at
+            SELECT id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, epoch, pkgver, pkgrel
             FROM builds
             WHERE user_id = ?
             ORDER BY created_at DESC
@@ -572,11 +572,19 @@ class AuthManager:
 
         builds = []
         for row in cursor.fetchall():
+            # Format package name with version
+            pkgname = row[3]
+            epoch = row[8]
+            pkgver = row[9]
+            pkgrel = row[10]
+            display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
+
             builds.append({
                 "id": row[0],
                 "server_url": row[1],
                 "server_arch": row[2],
-                "pkgname": row[3],
+                "pkgname": pkgname,
+                "display_name": display_name,
                 "status": row[4],
                 "start_time": row[5],
                 "end_time": row[6],
@@ -1046,6 +1054,24 @@ def init_database() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
 
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN epoch TEXT')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN pkgver TEXT')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN pkgrel TEXT')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     return conn
 
@@ -1122,6 +1148,49 @@ def parse_pkgbuild_name(pkgbuild_content: str) -> str:
     except Exception as e:
         logger.error(f"Error parsing PKGBUILD name: {e}")
         return "unknown"
+
+
+def parse_pkgbuild_version(pkgbuild_content: str) -> Dict[str, str]:
+    """Parse PKGBUILD content to extract version information"""
+    try:
+        epoch = None
+        pkgver = None
+        pkgrel = None
+
+        for line in pkgbuild_content.split('\n'):
+            line = line.strip()
+            if line.startswith('epoch='):
+                epoch = line.split('=', 1)[1].strip('\'"')
+            elif line.startswith('pkgver='):
+                pkgver = line.split('=', 1)[1].strip('\'"')
+            elif line.startswith('pkgrel='):
+                pkgrel = line.split('=', 1)[1].strip('\'"')
+
+        return {
+            'epoch': epoch,
+            'pkgver': pkgver or "unknown",
+            'pkgrel': pkgrel or "1"
+        }
+    except Exception as e:
+        logger.error(f"Error parsing PKGBUILD version: {e}")
+        return {
+            'epoch': None,
+            'pkgver': "unknown",
+            'pkgrel': "1"
+        }
+
+
+def format_package_name_with_version(pkgname: str, epoch: str = None, pkgver: str = None, pkgrel: str = None) -> str:
+    """Format package name with version in epoch:pkgver-pkgrel format"""
+    if not pkgver or pkgver == "unknown":
+        return pkgname
+
+    version_str = ""
+    if epoch:
+        version_str += f"{epoch}:"
+    version_str += f"{pkgver}-{pkgrel or '1'}"
+
+    return f"{pkgname} ({version_str})"
 
 
 async def get_server_info(server_url: str) -> Optional[Dict]:
@@ -1457,15 +1526,21 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
 
     build_queue.append(build_info)
 
+    # Parse version information from PKGBUILD
+    version_info = parse_pkgbuild_version(pkgbuild_content)
+    epoch = version_info.get('epoch')
+    pkgver = version_info.get('pkgver')
+    pkgrel = version_info.get('pkgrel')
+
     # Store in database
     cursor = build_database.cursor()
     cursor.execute('''
         INSERT OR REPLACE INTO builds
-        (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id, epoch, pkgver, pkgrel)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         build_id, None, None, pkgname, BuildStatus.QUEUED,
-        None, None, time.time(), len(build_queue), None, user_id
+        None, None, time.time(), len(build_queue), None, user_id, epoch, pkgver, pkgrel
     ))
     build_database.commit()
 
@@ -1479,6 +1554,12 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
     queued_builds = []
 
     logger.info(f"Starting build submission for package '{pkgname}' with target architectures: {target_archs}")
+
+    # Parse version information from PKGBUILD
+    version_info = parse_pkgbuild_version(pkgbuild_content)
+    epoch = version_info.get('epoch')
+    pkgver = version_info.get('pkgver')
+    pkgrel = version_info.get('pkgrel')
 
     # Get actual available architectures from servers
     available_archs = await get_available_architectures()
@@ -1573,11 +1654,11 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         cursor = build_database.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO builds
-            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id, build_timeout)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id, build_timeout, epoch, pkgver, pkgrel)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             build_id, None, arch, pkgname, BuildStatus.QUEUED,
-            None, None, time.time(), len(build_queue), submission_group, user_id, build_timeout
+            None, None, time.time(), len(build_queue), submission_group, user_id, build_timeout, epoch, pkgver, pkgrel
         ))
         build_database.commit()
 
@@ -2535,7 +2616,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
     # Get currently running builds for all servers
     cursor = build_database.cursor()
     cursor.execute('''
-        SELECT b.id, b.server_url, b.pkgname, b.start_time, b.created_at, u.username
+        SELECT b.id, b.server_url, b.pkgname, b.start_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
         FROM builds b
         LEFT JOIN users u ON b.user_id = u.id
         WHERE b.status = ? AND b.server_url IS NOT NULL
@@ -2543,12 +2624,17 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
     ''', (BuildStatus.BUILDING,))
 
     running_builds_by_server = {}
-    for build_id, server_url, pkgname, start_time, created_at, username in cursor.fetchall():
+    for build_id, server_url, pkgname, start_time, created_at, username, epoch, pkgver, pkgrel in cursor.fetchall():
         if server_url not in running_builds_by_server:
             running_builds_by_server[server_url] = []
+
+        # Format package name with version
+        display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
+
         running_builds_by_server[server_url].append({
             "id": build_id,
             "pkgname": pkgname,
+            "display_name": display_name,
             "start_time": safe_timestamp_to_datetime(start_time),
             "created_at": safe_timestamp_to_datetime(created_at),
             "username": username if username else "#anon#"
@@ -2605,7 +2691,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
     cursor = build_database.cursor()
     offset = (page - 1) * 20
     cursor.execute('''
-        SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
+        SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
         FROM builds b
         LEFT JOIN users u ON b.user_id = u.id
         ORDER BY b.created_at DESC LIMIT 20 OFFSET ?
@@ -2618,12 +2704,20 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
         display_url = "unknown"
         if server_url:
             display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
-        
+
+        # Format package name with version
+        pkgname = row[3]
+        epoch = row[9]
+        pkgver = row[10]
+        pkgrel = row[11]
+        display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
+
         builds.append({
             "id": row[0],
             "server_url": display_url,
             "server_arch": row[2],
-            "pkgname": row[3],
+            "pkgname": pkgname,
+            "display_name": display_name,
             "status": row[4],
             "start_time": safe_timestamp_to_datetime(row[5]),
             "end_time": safe_timestamp_to_datetime(row[6]),
@@ -2836,9 +2930,10 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                 for build in server["current_builds"][:3]:  # Show max 3 builds to avoid clutter
                     start_time = build["start_time"] or "unknown"
                     username = build.get("username", "#anon#")
+                    display_name = build.get("display_name", build["pkgname"])
                     current_builds_html += f"""
                         <li>
-                            <a href="/build/{build['id']}/status">{build['pkgname']}</a> by <strong>{username}</strong>
+                            <a href="/build/{build['id']}/status">{display_name}</a> by <strong>{username}</strong>
                             <small>(started: {start_time})</small>
                         </li>
                     """
@@ -2863,9 +2958,10 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
     """
 
     for build in builds:
+        display_name = build.get('display_name', build['pkgname'])
         html += f"""
             <div class="build {build['status']}">
-                <strong>{build['pkgname']}</strong> - {build['status']} on {build['server_url']} ({build['server_arch']})
+                <strong>{display_name}</strong> - {build['status']} on {build['server_url']} ({build['server_arch']})
                 <br>
                 <span class="build-id">Build ID: {build['id']}</span>
                 <br>
@@ -3253,7 +3349,8 @@ async def get_build_status(build_id: str, format: str = Query("html")):
     cursor = build_database.cursor()
     cursor.execute('''
         SELECT b.server_url, b.server_arch, b.pkgname, b.status, b.last_known_status,
-               b.server_available, b.cached_response, b.last_status_update, b.created_at, u.username
+               b.server_available, b.cached_response, b.last_status_update, b.created_at, u.username,
+               b.epoch, b.pkgver, b.pkgrel
         FROM builds b
         LEFT JOIN users u ON b.user_id = u.id
         WHERE b.id = ?
@@ -3323,8 +3420,11 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             </html>
             """, status_code=404)
 
-    server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response, last_status_update, created_at, username = result
+    server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response, last_status_update, created_at, username, epoch, pkgver, pkgrel = result
     username = username if username else "#anon#"
+
+    # Format package name with version for display
+    display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
 
     # If we don't have a server_url, the build failed during submission
     if not server_url:
@@ -3343,7 +3443,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             <!DOCTYPE html>
             <html>
             <head>
-                <title>Build Submission Failed - {pkgname}</title>
+                <title>Build Submission Failed - {display_name}</title>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <style>
@@ -3366,14 +3466,14 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 </div>
 
                 <div class="build failed">
-                    <h2>❌ Build Submission Failed: {pkgname}</h2>
+                    <h2>❌ Build Submission Failed: {display_name}</h2>
                     <div class="error-detail">
                         <strong>Submission Error:</strong> This build failed during submission and was never assigned to a server.
                     </div>
 
                     <div class="metadata">
                         <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                        <p><strong>Package:</strong> {pkgname}</p>
+                        <p><strong>Package:</strong> {display_name}</p>
                         <p><strong>Status:</strong> {status}</p>
                         <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
                         <p><strong>Created:</strong> {datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S') if created_at else 'unknown'}</p>
@@ -3447,7 +3547,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     <!DOCTYPE html>
                     <html>
                     <head>
-                        <title>Build Status (Server Unavailable) - {pkgname}</title>
+                        <title>Build Status (Server Unavailable) - {display_name}</title>
                         <meta charset="utf-8">
                         <meta name="viewport" content="width=device-width, initial-scale=1">
                         <meta http-equiv="refresh" content="30">
@@ -3478,7 +3578,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     <body>
                         <div class="header">
                             <h1>APB Farm - Build Status</h1>
-                            <p>Package: <strong>{pkgname}</strong></p>
+                            <p>Package: <strong>{display_name}</strong></p>
                         </div>
 
                         <div class="build {status_class}">
@@ -3490,7 +3590,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
 
                             <div class="metadata">
                                 <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                                <p><strong>Package:</strong> {pkgname}</p>
+                                <p><strong>Package:</strong> {display_name}</p>
                                 <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
                                 <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (unavailable)</p>
                                 <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
@@ -3538,7 +3638,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             <!DOCTYPE html>
             <html>
             <head>
-                <title>Server Unavailable - {pkgname}</title>
+                <title>Server Unavailable - {display_name}</title>
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <meta http-equiv="refresh" content="60">
@@ -3561,7 +3661,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             <body>
                 <div class="header">
                     <h1>APB Farm - Build Status</h1>
-                    <p>Package: <strong>{pkgname}</strong></p>
+                    <p>Package: <strong>{display_name}</strong></p>
                 </div>
 
                 <div class="build failed">
@@ -3572,7 +3672,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
 
                     <div class="metadata">
                         <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                        <p><strong>Package:</strong> {pkgname}</p>
+                        <p><strong>Package:</strong> {display_name}</p>
                         <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (unavailable)</p>
                         <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
                         <p><strong>Last Known Status:</strong> {last_known_status or status}</p>
@@ -3718,7 +3818,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     <!DOCTYPE html>
                     <html>
                     <head>
-                        <title>Build Status - {pkgname}</title>
+                        <title>Build Status - {display_name}</title>
                         <meta charset="utf-8">
                         <meta name="viewport" content="width=device-width, initial-scale=1">
                         <meta http-equiv="refresh" content="30">
@@ -3747,7 +3847,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     <body>
                         <div class="header">
                             <h1>APB Farm - Build Status</h1>
-                            <p>Package: <strong>{pkgname}</strong></p>
+                            <p>Package: <strong>{display_name}</strong></p>
                         </div>
 
                         <div class="build {status_class}">
@@ -3755,7 +3855,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
 
                             <div class="metadata">
                                 <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                                <p><strong>Package:</strong> {pkgname}</p>
+                                <p><strong>Package:</strong> {display_name}</p>
                                 <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
                                 <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
                                 <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
@@ -3784,7 +3884,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             # Server is unavailable, try to return cached response as HTML
             cursor = build_database.cursor()
             cursor.execute('''
-                SELECT cached_response, last_status_update, server_arch, pkgname
+                SELECT cached_response, last_status_update, server_arch, pkgname, epoch, pkgver, pkgrel
                 FROM builds WHERE id = ?
             ''', (build_id,))
             result = cursor.fetchone()
@@ -3792,9 +3892,15 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             if result and result[0]:  # cached_response exists
                 try:
                     build_status = json.loads(result[0])
-                    pkgname = result[3] or 'unknown'
+                    cached_pkgname = result[3] or 'unknown'
                     last_update = result[1]
+                    cached_epoch = result[4]
+                    cached_pkgver = result[5]
+                    cached_pkgrel = result[6]
                     status_class = build_status.get('status', 'unknown')
+
+                    # Format package name with version for cached response
+                    cached_display_name = format_package_name_with_version(cached_pkgname, cached_epoch, cached_pkgver, cached_pkgrel)
 
                     # Get detailed status information if available
                     packages = build_status.get('packages', [])
@@ -3823,7 +3929,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     <!DOCTYPE html>
                     <html>
                     <head>
-                        <title>Build Status (Server Unavailable) - {pkgname}</title>
+                        <title>Build Status (Server Unavailable) - {cached_display_name}</title>
                         <meta charset="utf-8">
                         <meta name="viewport" content="width=device-width, initial-scale=1">
                         <meta http-equiv="refresh" content="30">
@@ -3855,7 +3961,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     <body>
                         <div class="header">
                             <h1>APB Farm - Build Status</h1>
-                            <p>Package: <strong>{pkgname}</strong></p>
+                            <p>Package: <strong>{cached_display_name}</strong></p>
                         </div>
 
                         <div class="build {status_class}">
@@ -3867,7 +3973,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
 
                             <div class="metadata">
                                 <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                                <p><strong>Package:</strong> {pkgname}</p>
+                                <p><strong>Package:</strong> {cached_display_name}</p>
                                 <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
                                 <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (connection failed)</p>
                                 <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
@@ -4074,14 +4180,14 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
 
     if status:
         cursor.execute('''
-            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
+            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
             FROM builds b
             LEFT JOIN users u ON b.user_id = u.id
             WHERE b.status = ? ORDER BY b.created_at DESC LIMIT ?
         ''', (status, limit))
     else:
         cursor.execute('''
-            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
+            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
             FROM builds b
             LEFT JOIN users u ON b.user_id = u.id
             ORDER BY b.created_at DESC LIMIT ?
@@ -4093,11 +4199,19 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
         end_time_str = safe_timestamp_to_datetime(row[6])
         created_at_str = safe_timestamp_to_datetime(row[7])
 
+        # Format package name with version
+        pkgname = row[3]
+        epoch = row[9]
+        pkgver = row[10]
+        pkgrel = row[11]
+        display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
+
         builds.append({
             "id": row[0],
             "server_url": obfuscate_server_url(row[1]) if row[1] else "unknown",
             "server_arch": row[2],
-            "pkgname": row[3],
+            "pkgname": pkgname,
+            "display_name": display_name,
             "status": row[4],
             "start_time": f"{start_time_str} UTC" if start_time_str else None,
             "end_time": f"{end_time_str} UTC" if end_time_str else None,
