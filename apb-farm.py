@@ -14,6 +14,10 @@ import time
 import uuid
 import hashlib
 import secrets
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -100,6 +104,20 @@ class User:
     email: Optional[str] = None
 
 
+@dataclass
+class SMTPConfig:
+    id: int
+    server: str
+    port: int
+    username: Optional[str] = None
+    password: Optional[str] = None
+    use_tls: bool = True
+    from_email: Optional[str] = None
+    from_name: Optional[str] = None
+    created_at: float = 0
+    updated_at: float = 0
+
+
 # Pydantic models for API requests/responses
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
@@ -140,6 +158,33 @@ class ChangePasswordRequest(BaseModel):
 
 class UpdateEmailRequest(BaseModel):
     email: Optional[str] = Field(None, max_length=255)
+
+
+class SMTPConfigRequest(BaseModel):
+    server: str = Field(..., min_length=1, max_length=255)
+    port: int = Field(..., ge=1, le=65535)
+    username: Optional[str] = Field(None, max_length=255)
+    password: Optional[str] = Field(None, max_length=255)
+    use_tls: bool = Field(default=True)
+    from_email: Optional[str] = Field(None, max_length=255)
+    from_name: Optional[str] = Field(None, max_length=255)
+
+
+class SMTPConfigResponse(BaseModel):
+    id: int
+    server: str
+    port: int
+    username: Optional[str]
+    use_tls: bool
+    from_email: Optional[str]
+    from_name: Optional[str]
+    created_at: float
+    updated_at: float
+    # Note: password is intentionally excluded from response for security
+
+
+class SMTPTestRequest(BaseModel):
+    test_email: str = Field(..., min_length=1, max_length=255)
 
 
 # Global state
@@ -199,6 +244,22 @@ class AuthManager:
                 self.db.commit()
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+            # SMTP configuration table
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS smtp_config (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    username TEXT,
+                    password TEXT,
+                    use_tls BOOLEAN DEFAULT 1,
+                    from_email TEXT,
+                    from_name TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            ''')
 
             # Tokens table
             self.db.execute('''
@@ -559,6 +620,179 @@ class AuthManager:
 
         logger.info(f"Password changed for user ID {user_id}")
         return True
+
+    # SMTP Configuration Methods
+    def get_smtp_config(self) -> Optional[SMTPConfig]:
+        """Get current SMTP configuration"""
+        cursor = self.db.cursor()
+        cursor.execute('''
+            SELECT id, server, port, username, password, use_tls, from_email, from_name, created_at, updated_at
+            FROM smtp_config ORDER BY updated_at DESC LIMIT 1
+        ''')
+        row = cursor.fetchone()
+        if row:
+            return SMTPConfig(
+                id=row[0],
+                server=row[1],
+                port=row[2],
+                username=row[3],
+                password=row[4],
+                use_tls=bool(row[5]),
+                from_email=row[6],
+                from_name=row[7],
+                created_at=row[8],
+                updated_at=row[9]
+            )
+        return None
+
+    def save_smtp_config(self, server: str, port: int, username: Optional[str] = None,
+                        password: Optional[str] = None, use_tls: bool = True,
+                        from_email: Optional[str] = None, from_name: Optional[str] = None) -> SMTPConfig:
+        """Save SMTP configuration"""
+        if from_email and not self._validate_email(from_email):
+            raise ValueError("Invalid from_email format")
+
+        current_time = time.time()
+        cursor = self.db.cursor()
+
+        # Delete existing config (we only keep one active config)
+        cursor.execute('DELETE FROM smtp_config')
+
+        # Insert new config
+        cursor.execute('''
+            INSERT INTO smtp_config (server, port, username, password, use_tls, from_email, from_name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (server, port, username, password, use_tls, from_email, from_name, current_time, current_time))
+
+        config_id = cursor.lastrowid
+        self.db.commit()
+
+        logger.info(f"SMTP configuration saved: {server}:{port}")
+        return SMTPConfig(
+            id=config_id,
+            server=server,
+            port=port,
+            username=username,
+            password=password,
+            use_tls=use_tls,
+            from_email=from_email,
+            from_name=from_name,
+            created_at=current_time,
+            updated_at=current_time
+        )
+
+    def delete_smtp_config(self) -> bool:
+        """Delete SMTP configuration"""
+        cursor = self.db.cursor()
+        cursor.execute('DELETE FROM smtp_config')
+        self.db.commit()
+        deleted_count = cursor.rowcount
+        if deleted_count > 0:
+            logger.info("SMTP configuration deleted")
+        return deleted_count > 0
+
+    def send_email(self, to_email: str, subject: str, body: str, html_body: Optional[str] = None) -> bool:
+        """Send email using configured SMTP settings"""
+        smtp_config = self.get_smtp_config()
+        if not smtp_config:
+            logger.warning("No SMTP configuration found, cannot send email")
+            return False
+
+        if not to_email or not self._validate_email(to_email):
+            logger.warning(f"Invalid recipient email: {to_email}")
+            return False
+
+        try:
+            # Create message
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = subject
+            msg['From'] = f"{smtp_config.from_name or 'APB Farm'} <{smtp_config.from_email or 'noreply@localhost'}>"
+            msg['To'] = to_email
+
+            # Add text part
+            text_part = MIMEText(body, 'plain')
+            msg.attach(text_part)
+
+            # Add HTML part if provided
+            if html_body:
+                html_part = MIMEText(html_body, 'html')
+                msg.attach(html_part)
+
+            # Send email
+            context = ssl.create_default_context() if smtp_config.use_tls else None
+
+            if smtp_config.use_tls:
+                with smtplib.SMTP(smtp_config.server, smtp_config.port) as server:
+                    server.starttls(context=context)
+                    if smtp_config.username and smtp_config.password:
+                        server.login(smtp_config.username, smtp_config.password)
+                    server.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_config.server, smtp_config.port) as server:
+                    if smtp_config.username and smtp_config.password:
+                        server.login(smtp_config.username, smtp_config.password)
+                    server.send_message(msg)
+
+            logger.info(f"Email sent successfully to {to_email}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to send email to {to_email}: {e}")
+            return False
+
+    def send_user_notification(self, user_email: str, action: str, username: str, admin_user: str):
+        """Send notification email for user account changes"""
+        if not user_email:
+            return False
+
+        # Get dashboard URL from configuration
+        global config
+        farm_url = config.get('farm_url', 'http://localhost:8080')
+        dashboard_url = f"{farm_url.rstrip('/')}/dashboard"
+
+        subject_map = {
+            'created': f'Your APB Farm account has been created',
+            'updated': f'Your APB Farm account has been updated',
+            'deleted': f'Your APB Farm account has been deleted'
+        }
+
+        body_map = {
+            'created': f"""Hello {username},
+
+Your APB Farm account has been created by administrator {admin_user}.
+
+You can now log in to the APB Farm dashboard to submit build requests.
+
+Dashboard URL: {dashboard_url}
+
+Best regards,
+APB Farm System""",
+            'updated': f"""Hello {username},
+
+Your APB Farm account has been updated by administrator {admin_user}.
+
+If you have any questions about these changes, please contact your administrator.
+
+Dashboard URL: {dashboard_url}
+
+Best regards,
+APB Farm System""",
+            'deleted': f"""Hello {username},
+
+Your APB Farm account has been deleted by administrator {admin_user}.
+
+If you believe this was done in error, please contact your administrator.
+
+Dashboard URL: {dashboard_url}
+
+Best regards,
+APB Farm System"""
+        }
+
+        subject = subject_map.get(action, f'APB Farm account {action}')
+        body = body_map.get(action, f'Your APB Farm account has been {action} by administrator {admin_user}.')
+
+        return self.send_email(user_email, subject, body)
 
 
 # FastAPI Dependencies
@@ -1838,6 +2072,18 @@ async def create_user(
         role = UserRole(user_data.role)
         new_user = auth_manager.create_user(user_data.username, user_data.password, role, user_data.email)
 
+        # Send email notification if user has email and SMTP is configured
+        if new_user.email:
+            try:
+                auth_manager.send_user_notification(
+                    new_user.email,
+                    'created',
+                    new_user.username,
+                    current_user.username
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send user creation email to {new_user.email}: {e}")
+
         return UserResponse(
             id=new_user.id,
             username=new_user.username,
@@ -1860,7 +2106,24 @@ async def delete_user(
     if user_id == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
 
+    # Get user info before deletion for email notification
+    user_to_delete = auth_manager.get_user_by_id(user_id)
+    if not user_to_delete:
+        raise HTTPException(status_code=404, detail="User not found")
+
     if auth_manager.delete_user(user_id):
+        # Send email notification if user has email and SMTP is configured
+        if user_to_delete.email:
+            try:
+                auth_manager.send_user_notification(
+                    user_to_delete.email,
+                    'deleted',
+                    user_to_delete.username,
+                    current_user.username
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send user deletion email to {user_to_delete.email}: {e}")
+
         return {"message": f"User {user_id} deleted successfully"}
     else:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1877,7 +2140,24 @@ async def change_user_role(
     try:
         new_role = UserRole(role_data.role)
 
+        # Get user info before update for email notification
+        user_to_update = auth_manager.get_user_by_id(user_id)
+        if not user_to_update:
+            raise HTTPException(status_code=404, detail="User not found")
+
         if auth_manager.change_user_role(user_id, new_role):
+            # Send email notification if user has email and SMTP is configured
+            if user_to_update.email:
+                try:
+                    auth_manager.send_user_notification(
+                        user_to_update.email,
+                        'updated',
+                        user_to_update.username,
+                        current_user.username
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send user update email to {user_to_update.email}: {e}")
+
             return {"message": f"User role changed to {new_role.value}"}
         else:
             raise HTTPException(status_code=404, detail="User not found")
@@ -1951,7 +2231,36 @@ async def update_user_email(
     """Update user email (admin only)"""
     global auth_manager
     try:
+        # Get user info before update for email notification
+        user_to_update = auth_manager.get_user_by_id(user_id)
+        if not user_to_update:
+            raise HTTPException(status_code=404, detail="User not found")
+
         if auth_manager.update_user_email(user_id, email_data.email):
+            # Send email notification to old email if it exists and SMTP is configured
+            if user_to_update.email and user_to_update.email != email_data.email:
+                try:
+                    auth_manager.send_user_notification(
+                        user_to_update.email,
+                        'updated',
+                        user_to_update.username,
+                        current_user.username
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send user update email to old address {user_to_update.email}: {e}")
+
+            # Send email notification to new email if it exists and SMTP is configured
+            if email_data.email and email_data.email != user_to_update.email:
+                try:
+                    auth_manager.send_user_notification(
+                        email_data.email,
+                        'updated',
+                        user_to_update.username,
+                        current_user.username
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send user update email to new address {email_data.email}: {e}")
+
             return {"message": f"Email updated for user {user_id}"}
         else:
             raise HTTPException(status_code=404, detail="User not found")
@@ -1973,6 +2282,103 @@ async def update_my_email(
             raise HTTPException(status_code=404, detail="User not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# SMTP Configuration Endpoints
+
+@app.get("/admin/smtp", response_model=Optional[SMTPConfigResponse])
+async def get_smtp_config(current_user: User = Depends(require_admin)):
+    """Get current SMTP configuration (admin only)"""
+    global auth_manager
+    smtp_config = auth_manager.get_smtp_config()
+
+    if smtp_config:
+        return SMTPConfigResponse(
+            id=smtp_config.id,
+            server=smtp_config.server,
+            port=smtp_config.port,
+            username=smtp_config.username,
+            use_tls=smtp_config.use_tls,
+            from_email=smtp_config.from_email,
+            from_name=smtp_config.from_name,
+            created_at=smtp_config.created_at,
+            updated_at=smtp_config.updated_at
+        )
+    return None
+
+
+@app.post("/admin/smtp", response_model=SMTPConfigResponse)
+async def save_smtp_config(
+    smtp_data: SMTPConfigRequest,
+    current_user: User = Depends(require_admin)
+):
+    """Save SMTP configuration (admin only)"""
+    global auth_manager
+    try:
+        smtp_config = auth_manager.save_smtp_config(
+            server=smtp_data.server,
+            port=smtp_data.port,
+            username=smtp_data.username,
+            password=smtp_data.password,
+            use_tls=smtp_data.use_tls,
+            from_email=smtp_data.from_email,
+            from_name=smtp_data.from_name
+        )
+
+        return SMTPConfigResponse(
+            id=smtp_config.id,
+            server=smtp_config.server,
+            port=smtp_config.port,
+            username=smtp_config.username,
+            use_tls=smtp_config.use_tls,
+            from_email=smtp_config.from_email,
+            from_name=smtp_config.from_name,
+            created_at=smtp_config.created_at,
+            updated_at=smtp_config.updated_at
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/admin/smtp")
+async def delete_smtp_config(current_user: User = Depends(require_admin)):
+    """Delete SMTP configuration (admin only)"""
+    global auth_manager
+    if auth_manager.delete_smtp_config():
+        return {"message": "SMTP configuration deleted successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="No SMTP configuration found")
+
+
+@app.post("/admin/smtp/test")
+async def test_smtp_config(
+    test_data: SMTPTestRequest,
+    current_user: User = Depends(require_admin)
+):
+    """Test SMTP configuration by sending a test email (admin only)"""
+    global auth_manager, config
+
+    # Get dashboard URL from configuration
+    farm_url = config.get('farm_url', 'http://localhost:8080')
+    dashboard_url = f"{farm_url.rstrip('/')}/dashboard"
+
+    subject = "APB Farm SMTP Test"
+    body = f"""This is a test email from APB Farm.
+
+If you received this email, your SMTP configuration is working correctly.
+
+Test sent by: {current_user.username}
+Test time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+APB Farm Dashboard: {dashboard_url}
+
+Best regards,
+APB Farm System"""
+
+    if auth_manager.send_email(test_data.test_email, subject, body):
+        return {"message": f"Test email sent successfully to {test_data.test_email}"}
+    else:
+        raise HTTPException(status_code=400, detail="Failed to send test email. Check SMTP configuration and logs.")
 
 
 # API Endpoints
@@ -3597,9 +4003,11 @@ async def get_admin_panel(
             .delete-button {{ background-color: #dc3545; color: white; }}
             .admin-badge {{ background-color: #28a745; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; }}
             .user-badge {{ background-color: #007bff; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; }}
-            .add-user-form {{ background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }}
-            .add-user-form input, .add-user-form select {{ display: block; width: 200px; margin: 10px 0; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
-            .add-user-form button {{ margin: 5px; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }}
+            .add-user-form, .smtp-config-form {{ background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }}
+            .add-user-form input, .add-user-form select, .smtp-config-form input, .smtp-config-form select {{ display: block; width: 200px; margin: 10px 0; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
+            .add-user-form button, .smtp-config-form button {{ margin: 5px; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }}
+            .smtp-config-form label {{ margin-top: 10px; display: block; font-weight: bold; }}
+            .smtp-config-form input[type="checkbox"] {{ width: auto; display: inline; margin-right: 5px; }}
             .submit-button {{ background-color: #28a745; color: white; }}
             .cancel-button {{ background-color: #6c757d; color: white; }}
             .nav-links {{ margin: 20px 0; text-align: center; }}
@@ -3609,6 +4017,13 @@ async def get_admin_panel(
             .success-message {{ color: #28a745; margin: 10px 0; font-weight: bold; }}
             .modal {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; display: none; max-width: 90%; max-height: 90%; overflow-y: auto; }}
             .modal-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; display: none; }}
+            .tabs {{ margin: 20px 0; }}
+            .tab-buttons {{ display: flex; border-bottom: 2px solid #ddd; margin-bottom: 20px; }}
+            .tab-button {{ padding: 12px 24px; background: #f8f9fa; border: 1px solid #ddd; border-bottom: none; cursor: pointer; margin-right: 2px; border-radius: 8px 8px 0 0; transition: all 0.3s; }}
+            .tab-button:hover {{ background: #e9ecef; }}
+            .tab-button.active {{ background: white; border-bottom: 2px solid white; margin-bottom: -2px; font-weight: bold; color: #007bff; }}
+            .tab-content {{ display: none; }}
+            .tab-content.active {{ display: block; }}
         </style>
     </head>
     <body>
@@ -3644,8 +4059,55 @@ async def get_admin_panel(
             <a href="/builds/latest">📋 Recent Builds</a>
         </div>
 
-        <div class="admin-section">
-            <h2>👥 User Management</h2>
+        <div class="tabs">
+            <div class="tab-buttons">
+                <div class="tab-button active" onclick="switchTab('smtp-tab')">📧 SMTP Configuration</div>
+                <div class="tab-button" onclick="switchTab('users-tab')">👥 User Management</div>
+            </div>
+
+            <div id="smtp-tab" class="tab-content active">
+                <div class="admin-section">
+                    <div class="smtp-config-form">
+                        <h3>Email Server Settings</h3>
+                        <form id="smtpConfigForm" onsubmit="saveSmtpConfig(event)">
+                            <label>SMTP Server:</label>
+                            <input type="text" id="smtpServer" placeholder="mail.example.com" required>
+                            <label>Port:</label>
+                            <input type="number" id="smtpPort" placeholder="587" min="1" max="65535" required>
+                            <label>Username (optional):</label>
+                            <input type="text" id="smtpUsername" placeholder="username@example.com">
+                            <label>Password (optional):</label>
+                            <input type="password" id="smtpPassword" placeholder="password">
+                            <label>From Email:</label>
+                            <input type="email" id="smtpFromEmail" placeholder="noreply@example.com">
+                            <label>From Name:</label>
+                            <input type="text" id="smtpFromName" placeholder="APB Farm">
+                            <label>
+                                <input type="checkbox" id="smtpUseTls" checked> Use TLS/STARTTLS
+                            </label>
+                            <div class="error-message" id="smtpError"></div>
+                            <div class="success-message" id="smtpSuccess"></div>
+                            <button type="submit" class="submit-button">Save SMTP Config</button>
+                            <button type="button" class="cancel-button" onclick="loadSmtpConfig()">Reload</button>
+                            <button type="button" class="cancel-button" onclick="deleteSmtpConfig()">Delete Config</button>
+                        </form>
+
+                        <div style="margin-top: 20px;">
+                            <h4>Test Email</h4>
+                            <form id="smtpTestForm" onsubmit="testSmtpConfig(event)">
+                                <label>Test Email Address:</label>
+                                <input type="email" id="testEmail" placeholder="test@example.com" required>
+                                <div class="error-message" id="testError"></div>
+                                <div class="success-message" id="testSuccess"></div>
+                                <button type="submit" class="submit-button">Send Test Email</button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="users-tab" class="tab-content">
+                <div class="admin-section">
 
             <div class="add-user-form">
                 <h3>Add New User</h3>
@@ -3706,9 +4168,32 @@ async def get_admin_panel(
     html += f"""
                 </tbody>
             </table>
+                </div>
+            </div>
         </div>
 
         <script>
+            // Tab switching function
+            function switchTab(tabId) {{
+                // Hide all tab contents
+                const tabContents = document.querySelectorAll('.tab-content');
+                tabContents.forEach(content => {{
+                    content.classList.remove('active');
+                }});
+
+                // Remove active class from all tab buttons
+                const tabButtons = document.querySelectorAll('.tab-button');
+                tabButtons.forEach(button => {{
+                    button.classList.remove('active');
+                }});
+
+                // Show selected tab content
+                document.getElementById(tabId).classList.add('active');
+
+                // Add active class to clicked tab button
+                event.target.classList.add('active');
+            }}
+
             // Helper function to get auth token
             function getAuthToken() {{
                 let token = localStorage.getItem('authToken');
@@ -3869,6 +4354,141 @@ async def get_admin_panel(
                     console.error('Delete user error:', error);
                 }}
             }}
+
+            // SMTP Configuration Functions
+            async function loadSmtpConfig() {{
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch('/admin/smtp', {{
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }}
+                    }});
+
+                    if (response.ok) {{
+                        const config = await response.json();
+                        if (config) {{
+                            document.getElementById('smtpServer').value = config.server || '';
+                            document.getElementById('smtpPort').value = config.port || 587;
+                            document.getElementById('smtpUsername').value = config.username || '';
+                            document.getElementById('smtpPassword').value = ''; // Don't populate password for security
+                            document.getElementById('smtpFromEmail').value = config.from_email || '';
+                            document.getElementById('smtpFromName').value = config.from_name || '';
+                            document.getElementById('smtpUseTls').checked = config.use_tls !== false;
+                        }}
+                    }}
+                }} catch (error) {{
+                    console.error('Error loading SMTP config:', error);
+                }}
+            }}
+
+            async function saveSmtpConfig(event) {{
+                event.preventDefault();
+
+                const server = document.getElementById('smtpServer').value;
+                const port = parseInt(document.getElementById('smtpPort').value);
+                const username = document.getElementById('smtpUsername').value || null;
+                const password = document.getElementById('smtpPassword').value || null;
+                const fromEmail = document.getElementById('smtpFromEmail').value || null;
+                const fromName = document.getElementById('smtpFromName').value || null;
+                const useTls = document.getElementById('smtpUseTls').checked;
+                const errorDiv = document.getElementById('smtpError');
+                const successDiv = document.getElementById('smtpSuccess');
+
+                errorDiv.textContent = '';
+                successDiv.textContent = '';
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch('/admin/smtp', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: JSON.stringify({{
+                            server, port, username, password, from_email: fromEmail, from_name: fromName, use_tls: useTls
+                        }})
+                    }});
+
+                    if (response.ok) {{
+                        successDiv.textContent = 'SMTP configuration saved successfully!';
+                        // Clear password field for security
+                        document.getElementById('smtpPassword').value = '';
+                    }} else {{
+                        const errorData = await response.json();
+                        errorDiv.textContent = errorData.detail || 'Failed to save SMTP configuration';
+                    }}
+                }} catch (error) {{
+                    errorDiv.textContent = 'Network error. Please try again.';
+                    console.error('Save SMTP config error:', error);
+                }}
+            }}
+
+            async function deleteSmtpConfig() {{
+                if (!confirm('Are you sure you want to delete the SMTP configuration? This will disable email notifications.')) {{
+                    return;
+                }}
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch('/admin/smtp', {{
+                        method: 'DELETE',
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }}
+                    }});
+
+                    if (response.ok) {{
+                        document.getElementById('smtpConfigForm').reset();
+                        document.getElementById('smtpSuccess').textContent = 'SMTP configuration deleted successfully!';
+                        document.getElementById('smtpError').textContent = '';
+                    }} else {{
+                        const errorData = await response.json();
+                        document.getElementById('smtpError').textContent = errorData.detail || 'Failed to delete SMTP configuration';
+                    }}
+                }} catch (error) {{
+                    document.getElementById('smtpError').textContent = 'Network error. Please try again.';
+                    console.error('Delete SMTP config error:', error);
+                }}
+            }}
+
+            async function testSmtpConfig(event) {{
+                event.preventDefault();
+
+                const testEmail = document.getElementById('testEmail').value;
+                const errorDiv = document.getElementById('testError');
+                const successDiv = document.getElementById('testSuccess');
+
+                errorDiv.textContent = '';
+                successDiv.textContent = '';
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch('/admin/smtp/test', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: JSON.stringify({{ test_email: testEmail }})
+                    }});
+
+                    if (response.ok) {{
+                        const data = await response.json();
+                        successDiv.textContent = data.message;
+                    }} else {{
+                        const errorData = await response.json();
+                        errorDiv.textContent = errorData.detail || 'Failed to send test email';
+                    }}
+                }} catch (error) {{
+                    errorDiv.textContent = 'Network error. Please try again.';
+                    console.error('Test SMTP config error:', error);
+                }}
+            }}
+
+            // Load SMTP config on page load
+            window.addEventListener('load', loadSmtpConfig);
         </script>
     </body>
     </html>
