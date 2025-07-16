@@ -163,14 +163,14 @@ Get farm information and status of all managed servers.
 ```json
 {
   "status": "running",
-  "version": "2025-07-15",
+  "version": "2025-07-16",
   "servers": [
     {
       "url": "http://server1.example.com:8000",
       "arch": "x86_64",
       "status": "online",
       "info": {
-        "version": "2025-07-15",
+        "version": "2025-07-16",
         "supported_architecture": "x86_64",
         "queue_status": {
           "current_builds_count": 1,
@@ -199,7 +199,7 @@ Health check endpoint for the farm.
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-15"
+  "version": "2025-07-16"
 }
 ```
 

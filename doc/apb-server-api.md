@@ -151,7 +151,7 @@ Get comprehensive server information and status.
 ```json
 {
   "status": "running",
-  "version": "2025-07-15",
+  "version": "2025-07-16",
   "supported_architecture": "x86_64",
   "system_info": {
     "architecture": "x86_64",
@@ -195,7 +195,7 @@ Simple health check endpoint for monitoring systems.
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-15"
+  "version": "2025-07-16"
 }
 ```
 
