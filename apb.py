@@ -40,6 +40,7 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
             "pkgname": "unknown",
             "pkgver": "1.0.0",
             "pkgrel": "1",
+            "epoch": None,
             "arch": ["x86_64"],
             "pkgname_list": []  # For filename checking
         }
@@ -72,6 +73,8 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
                 info["pkgver"] = line.split('=', 1)[1].strip('\'"')
             elif line.startswith('pkgrel='):
                 info["pkgrel"] = line.split('=', 1)[1].strip('\'"')
+            elif line.startswith('epoch='):
+                info["epoch"] = line.split('=', 1)[1].strip('\'"')
             elif line.startswith('arch='):
                 arch_str = line.split('=', 1)[1].strip()
                 if arch_str.startswith('(') and arch_str.endswith(')'):
@@ -94,12 +97,13 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
             "pkgname": "unknown",
             "pkgver": "1.0.0",
             "pkgrel": "1",
+            "epoch": None,
             "arch": ["x86_64"],
             "pkgname_list": []
         }
 
 
-def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str, pkgrel: str, arch: str) -> tuple[bool, str]:
+def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str, pkgrel: str, arch: str, epoch: str = None) -> tuple[bool, str]:
     """
     Check if package files already exist in the output directory.
 
@@ -109,6 +113,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
         pkgver: Package version
         pkgrel: Package release
         arch: Target architecture (can be "any" to check all architectures)
+        epoch: Package epoch (optional)
 
     Returns:
         Tuple of (exists, found_filename_or_summary)
@@ -118,6 +123,15 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
     arch_suffix_map = {
         'espresso': 'powerpc',  # espresso builds produce powerpc packages
     }
+
+    # Helper function to construct version string with epoch
+    def construct_version_string():
+        if epoch:
+            return f"{epoch}:{pkgver}-{pkgrel}"
+        else:
+            return f"{pkgver}-{pkgrel}"
+
+    version_string = construct_version_string()
 
     if arch == "any":
         # For "any" architecture, check if package exists with any architecture suffix
@@ -131,7 +145,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
             any_arch_dir = output_dir / "any"
             if any_arch_dir.is_dir():
                 for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
-                    package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{potential_suffix}.pkg.tar.zst"
+                    package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
                     package_path = any_arch_dir / package_filename
                     if package_path.exists():
                         return True, f"{package_filename} (found in any)"
@@ -142,7 +156,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
                     if arch_dir.is_dir() and arch_dir.name != "any":  # Skip "any" as we checked it above
                         # Try different architecture suffixes
                         for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
-                            package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{potential_suffix}.pkg.tar.zst"
+                            package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
                             package_path = arch_dir / package_filename
                             if package_path.exists():
                                 return True, f"{package_filename} (found in {arch_dir.name})"
@@ -152,7 +166,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
 
             # Also check main output directory with common suffixes
             for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
-                package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{potential_suffix}.pkg.tar.zst"
+                package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
                 package_path = output_dir / package_filename
                 if package_path.exists():
                     return True, package_filename
@@ -168,7 +182,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
         # Check each package name in the list
         for pkgname in pkgname_list:
             # Standard Arch Linux package filename format
-            package_filename = f"{pkgname}-{pkgver}-{pkgrel}-{package_arch_suffix}.pkg.tar.zst"
+            package_filename = f"{pkgname}-{version_string}-{package_arch_suffix}.pkg.tar.zst"
 
             # Check in architecture-specific output directory first
             arch_output_dir = output_dir / arch
@@ -221,7 +235,7 @@ def should_skip_build(output_dir: Path, pkgbuild_path: Path, arch: str, force: b
         pkgname_list = [pkg_info["pkgname"]]
 
     exists, found_filename = check_package_exists(output_dir, pkgname_list, pkg_info["pkgver"],
-                                                 pkg_info["pkgrel"], arch)
+                                                 pkg_info["pkgrel"], arch, pkg_info.get("epoch"))
     if exists:
         return True, f"Package already exists: {found_filename}"
 

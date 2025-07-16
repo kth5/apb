@@ -2419,8 +2419,10 @@ async def get_farm_info(current_user: Optional[User] = Depends(get_current_user_
     for config_arch, server_urls in config.get("servers", {}).items():
         for server_url in server_urls:
             # Check if this server is already properly listed
+            # For admin users, check against real URL; for non-admin, check against obfuscated URL
+            compare_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
             already_listed = any(
-                server["url"] == obfuscate_server_url(server_url)
+                server["url"] == compare_url
                 for server in servers
             )
 
@@ -2430,8 +2432,10 @@ async def get_farm_info(current_user: Optional[User] = Depends(get_current_user_
 
                 # Only mark as misconfigured if we have strong evidence
                 if status and status.health == ServerHealth.MISCONFIGURED:
+                    # Obfuscate URLs for non-admin users
+                    display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
                     servers.append({
-                        "url": obfuscate_server_url(server_url),
+                        "url": display_url,
                         "arch": f"{config_arch} (misconfigured)",
                         "status": "misconfigured",
                         "consecutive_failures": status.consecutive_failures,
@@ -2447,8 +2451,10 @@ async def get_farm_info(current_user: Optional[User] = Depends(get_current_user_
                     if not server_info:
                         # Initial failure - don't immediately mark as misconfigured
                         current_builds = running_builds_by_server.get(server_url, [])
+                        # Obfuscate URLs for non-admin users
+                        display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
                         servers.append({
-                            "url": obfuscate_server_url(server_url),
+                            "url": display_url,
                             "arch": f"{config_arch} (checking...)",
                             "status": "initializing",
                             "info": None,
@@ -2554,8 +2560,10 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
             server_info = await get_server_info(server_url)
             # Get running builds for this server
             current_builds = running_builds_by_server.get(server_url, [])
+            # Show real URLs to admin users, obfuscated URLs to non-admin users
+            display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
             servers_by_arch[arch].append({
-                "url": obfuscate_server_url(server_url),
+                "url": display_url,
                 "status": "online" if server_info else "offline",
                 "info": server_info,
                 "current_builds": current_builds,
@@ -2580,8 +2588,10 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                         servers_by_arch["misconfigured"] = []
                     # Get running builds for misconfigured server too
                     current_builds = running_builds_by_server.get(server_url, [])
+                    # Show real URLs to admin users, obfuscated URLs to non-admin users
+                    display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
                     servers_by_arch["misconfigured"].append({
-                        "url": obfuscate_server_url(server_url),
+                        "url": display_url,
                         "status": f"misconfigured ({status.consecutive_failures} failures)",
                         "info": None,
                         "current_builds": current_builds,
@@ -2603,9 +2613,15 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
 
     builds = []
     for row in cursor.fetchall():
+        # Show real URLs to admin users, obfuscated URLs to non-admin users
+        server_url = row[1]
+        display_url = "unknown"
+        if server_url:
+            display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else obfuscate_server_url(server_url)
+        
         builds.append({
             "id": row[0],
-            "server_url": obfuscate_server_url(row[1]) if row[1] else "unknown",
+            "server_url": display_url,
             "server_arch": row[2],
             "pkgname": row[3],
             "status": row[4],
