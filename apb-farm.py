@@ -2615,6 +2615,45 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
             "username": row[8] if row[8] else "#anon#"
         })
 
+    # Get user statistics (only for logged-in users)
+    user_stats = {}
+    if current_user:
+        # Top 10 users by total builds
+        cursor.execute('''
+            SELECT u.username, COUNT(b.id) as total_builds
+            FROM users u
+            LEFT JOIN builds b ON u.id = b.user_id
+            WHERE u.is_active = 1
+            GROUP BY u.id, u.username
+            ORDER BY total_builds DESC
+            LIMIT 10
+        ''')
+        user_stats['top_builders'] = [{'username': row[0], 'count': row[1]} for row in cursor.fetchall()]
+
+        # Top 10 users by successful builds
+        cursor.execute('''
+            SELECT u.username, COUNT(b.id) as successful_builds
+            FROM users u
+            LEFT JOIN builds b ON u.id = b.user_id
+            WHERE u.is_active = 1 AND b.status = ?
+            GROUP BY u.id, u.username
+            ORDER BY successful_builds DESC
+            LIMIT 10
+        ''', (BuildStatus.COMPLETED,))
+        user_stats['top_successful'] = [{'username': row[0], 'count': row[1]} for row in cursor.fetchall()]
+
+        # Top 10 users by failed builds
+        cursor.execute('''
+            SELECT u.username, COUNT(b.id) as failed_builds
+            FROM users u
+            LEFT JOIN builds b ON u.id = b.user_id
+            WHERE u.is_active = 1 AND b.status = ?
+            GROUP BY u.id, u.username
+            ORDER BY failed_builds DESC
+            LIMIT 10
+        ''', (BuildStatus.FAILED,))
+        user_stats['top_failed'] = [{'username': row[0], 'count': row[1]} for row in cursor.fetchall()]
+
     # Generate HTML with authentication UI
     auth_section = ""
     if current_user:
@@ -2643,7 +2682,6 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
         <title>APB Farm Dashboard</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta http-equiv="refresh" content="10">
         <style>
             body {{ font-family: Arial, sans-serif; margin: 20px; position: relative; }}
             .header {{ text-align: center; margin-bottom: 30px; position: relative; }}
@@ -2699,6 +2737,16 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
             .tab-button.active {{ background: white; border-bottom: 2px solid white; margin-bottom: -2px; font-weight: bold; color: #007bff; }}
             .tab-content {{ display: none; }}
             .tab-content.active {{ display: block; }}
+            .statistics {{ margin: 20px 0; }}
+            .stat-section {{ margin: 30px 0; }}
+            .stat-section h3 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 5px; margin-bottom: 15px; }}
+            .stats-table {{ width: 100%; border-collapse: collapse; margin: 15px 0; max-width: 600px; }}
+            .stats-table th, .stats-table td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
+            .stats-table th {{ background-color: #f8f9fa; font-weight: bold; }}
+            .stats-table tr:nth-child(even) {{ background-color: #f8f9fa; }}
+            .stats-table tr:hover {{ background-color: #e9ecef; }}
+            .stats-table td:first-child {{ text-align: center; font-weight: bold; }}
+            .stats-table td:last-child {{ text-align: center; }}
         </style>
     </head>
     <body>
@@ -2740,6 +2788,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
             <div class="tab-buttons">
                 <div class="tab-button active" onclick="switchTab('servers-tab')">🌾 Servers by Architecture</div>
                 <div class="tab-button" onclick="switchTab('builds-tab')">📋 Recent Builds</div>
+                {'<div class="tab-button" onclick="switchTab(\'statistics-tab\')">📊 Statistics</div>' if current_user else ''}
             </div>
 
             <div id="servers-tab" class="tab-content active">
@@ -2820,6 +2869,35 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                     <a href="/dashboard?page={page+1}">Next &raquo;</a>
                 </div>
             </div>
+
+            {'<div id="statistics-tab" class="tab-content">' if current_user else ''}
+            {'<div class="statistics">' if current_user else ''}
+
+            {'<div class="stat-section">' if current_user else ''}
+            {'<h3>📈 Top 10 Users by Total Builds</h3>' if current_user else ''}
+            {'<table class="stats-table">' if current_user else ''}
+            {'<thead><tr><th>Rank</th><th>Username</th><th>Total Builds</th></tr></thead>' if current_user else ''}
+            {'<tbody>' if current_user else ''}
+            {''.join([f'<tr><td>{i+1}</td><td>{user["username"]}</td><td>{user["count"]}</td></tr>' for i, user in enumerate(user_stats.get('top_builders', []))]) if current_user else ''}
+            {'</tbody></table></div>' if current_user else ''}
+
+            {'<div class="stat-section">' if current_user else ''}
+            {'<h3>✅ Top 10 Users by Successful Builds</h3>' if current_user else ''}
+            {'<table class="stats-table">' if current_user else ''}
+            {'<thead><tr><th>Rank</th><th>Username</th><th>Successful Builds</th></tr></thead>' if current_user else ''}
+            {'<tbody>' if current_user else ''}
+            {''.join([f'<tr><td>{i+1}</td><td>{user["username"]}</td><td>{user["count"]}</td></tr>' for i, user in enumerate(user_stats.get('top_successful', []))]) if current_user else ''}
+            {'</tbody></table></div>' if current_user else ''}
+
+            {'<div class="stat-section">' if current_user else ''}
+            {'<h3>❌ Top 10 Users by Failed Builds</h3>' if current_user else ''}
+            {'<table class="stats-table">' if current_user else ''}
+            {'<thead><tr><th>Rank</th><th>Username</th><th>Failed Builds</th></tr></thead>' if current_user else ''}
+            {'<tbody>' if current_user else ''}
+            {''.join([f'<tr><td>{i+1}</td><td>{user["username"]}</td><td>{user["count"]}</td></tr>' for i, user in enumerate(user_stats.get('top_failed', []))]) if current_user else ''}
+            {'</tbody></table></div>' if current_user else ''}
+
+            {'</div></div>' if current_user else ''}
         </div>
 
         <script>
