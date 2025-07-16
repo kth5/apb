@@ -1162,7 +1162,7 @@ async def get_best_server_for_arch(target_archs: List[str]) -> Optional[str]:
     return best_server
 
 
-async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None):
+async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None):
     """Queue a build for processing"""
     build_info = {
         "build_id": build_id,
@@ -1180,11 +1180,11 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     cursor = build_database.cursor()
     cursor.execute('''
         INSERT OR REPLACE INTO builds
-        (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         build_id, None, None, pkgname, BuildStatus.QUEUED,
-        None, None, time.time(), len(build_queue), None
+        None, None, time.time(), len(build_queue), None, user_id
     ))
     build_database.commit()
 
@@ -2034,21 +2034,23 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
     # Get currently running builds for all servers
     cursor = build_database.cursor()
     cursor.execute('''
-        SELECT id, server_url, pkgname, start_time, created_at
-        FROM builds
-        WHERE status = ? AND server_url IS NOT NULL
-        ORDER BY start_time DESC
+        SELECT b.id, b.server_url, b.pkgname, b.start_time, b.created_at, u.username
+        FROM builds b
+        LEFT JOIN users u ON b.user_id = u.id
+        WHERE b.status = ? AND b.server_url IS NOT NULL
+        ORDER BY b.start_time DESC
     ''', (BuildStatus.BUILDING,))
 
     running_builds_by_server = {}
-    for build_id, server_url, pkgname, start_time, created_at in cursor.fetchall():
+    for build_id, server_url, pkgname, start_time, created_at, username in cursor.fetchall():
         if server_url not in running_builds_by_server:
             running_builds_by_server[server_url] = []
         running_builds_by_server[server_url].append({
             "id": build_id,
             "pkgname": pkgname,
             "start_time": safe_timestamp_to_datetime(start_time),
-            "created_at": safe_timestamp_to_datetime(created_at)
+            "created_at": safe_timestamp_to_datetime(created_at),
+            "username": username if username else "#anon#"
         })
 
     for arch, server_urls in available_archs.items():
@@ -2094,12 +2096,14 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                     # Don't show servers that are just initializing or have few failures
                     pass
 
-    # Get recent builds
+    # Get recent builds with user information
     cursor = build_database.cursor()
     offset = (page - 1) * 20
     cursor.execute('''
-        SELECT id, server_url, server_arch, pkgname, status, start_time, end_time, created_at
-        FROM builds ORDER BY created_at DESC LIMIT 20 OFFSET ?
+        SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
+        FROM builds b 
+        LEFT JOIN users u ON b.user_id = u.id
+        ORDER BY b.created_at DESC LIMIT 20 OFFSET ?
     ''', (offset,))
 
     builds = []
@@ -2112,7 +2116,8 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
             "status": row[4],
             "start_time": safe_timestamp_to_datetime(row[5]),
             "end_time": safe_timestamp_to_datetime(row[6]),
-            "created_at": safe_timestamp_to_datetime(row[7]) or "unknown"
+            "created_at": safe_timestamp_to_datetime(row[7]) or "unknown",
+            "username": row[8] if row[8] else "#anon#"
         })
 
     # Generate HTML with authentication UI
@@ -2257,9 +2262,10 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                 current_builds_html = "<div class='running-builds'><strong>Currently Building:</strong><ul>"
                 for build in server["current_builds"][:3]:  # Show max 3 builds to avoid clutter
                     start_time = build["start_time"] or "unknown"
+                    username = build.get("username", "#anon#")
                     current_builds_html += f"""
                         <li>
-                            <a href="/build/{build['id']}/status">{build['pkgname']}</a>
+                            <a href="/build/{build['id']}/status">{build['pkgname']}</a> by <strong>{username}</strong>
                             <small>(started: {start_time})</small>
                         </li>
                     """
@@ -2289,7 +2295,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                 <br>
                 <span class="build-id">Build ID: {build['id']}</span>
                 <br>
-                <small>Created: {build['created_at']}</small>
+                <small>Created: {build['created_at']} by <strong>{build['username']}</strong></small>
                 <br>
                 <small>
                     <a href="/build/{build['id']}/status">📋 View Details & Logs</a>
@@ -2593,9 +2599,11 @@ async def get_build_status(build_id: str, format: str = Query("html")):
     # First check our database for build information
     cursor = build_database.cursor()
     cursor.execute('''
-        SELECT server_url, server_arch, pkgname, status, last_known_status,
-               server_available, cached_response, last_status_update, created_at
-        FROM builds WHERE id = ?
+        SELECT b.server_url, b.server_arch, b.pkgname, b.status, b.last_known_status,
+               b.server_available, b.cached_response, b.last_status_update, b.created_at, u.username
+        FROM builds b 
+        LEFT JOIN users u ON b.user_id = u.id
+        WHERE b.id = ?
     ''', (build_id,))
     result = cursor.fetchone()
 
@@ -2662,7 +2670,8 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             </html>
             """, status_code=404)
 
-    server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response, last_status_update, created_at = result
+    server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response, last_status_update, created_at, username = result
+    username = username if username else "#anon#"
 
     # If we don't have a server_url, the build failed during submission
     if not server_url:
@@ -2715,6 +2724,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                         <p><strong>Status:</strong> {status}</p>
                         <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
                         <p><strong>Created:</strong> {datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S') if created_at else 'unknown'}</p>
+                        <p><strong>Triggered by:</strong> {username}</p>
                     </div>
 
                     <h3>Possible Causes</h3>
@@ -2832,6 +2842,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                                 <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (unavailable)</p>
                                 <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
                                 <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_status_update).strftime('%Y-%m-%d %H:%M:%S UTC') if last_status_update else 'unknown'}</p>
+                                <p><strong>Triggered by:</strong> {username}</p>
                                 {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
                                 {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
                                 {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
@@ -2912,6 +2923,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                         <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (unavailable)</p>
                         <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
                         <p><strong>Last Known Status:</strong> {last_known_status or status}</p>
+                        <p><strong>Triggered by:</strong> {username}</p>
                     </div>
 
                     <div class="retry-info">
@@ -3094,6 +3106,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                                 <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
                                 <p><strong>Server:</strong> {obfuscate_server_url(server_url)}</p>
                                 <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                                <p><strong>Triggered by:</strong> {username}</p>
                                 {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
                                 {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
                                 {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
@@ -3206,6 +3219,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                                 <p><strong>Server:</strong> {obfuscate_server_url(server_url)} (connection failed)</p>
                                 <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
                                 <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S UTC') if last_update else 'unknown'}</p>
+                                <p><strong>Triggered by:</strong> {username}</p>
                                 {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
                                 {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
                                 {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
@@ -3407,13 +3421,17 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
 
     if status:
         cursor.execute('''
-            SELECT id, server_url, server_arch, pkgname, status, start_time, end_time, created_at
-            FROM builds WHERE status = ? ORDER BY created_at DESC LIMIT ?
+            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
+            FROM builds b 
+            LEFT JOIN users u ON b.user_id = u.id
+            WHERE b.status = ? ORDER BY b.created_at DESC LIMIT ?
         ''', (status, limit))
     else:
         cursor.execute('''
-            SELECT id, server_url, server_arch, pkgname, status, start_time, end_time, created_at
-            FROM builds ORDER BY created_at DESC LIMIT ?
+            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
+            FROM builds b 
+            LEFT JOIN users u ON b.user_id = u.id
+            ORDER BY b.created_at DESC LIMIT ?
         ''', (limit,))
 
     builds = []
@@ -3430,7 +3448,8 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
             "status": row[4],
             "start_time": f"{start_time_str} UTC" if start_time_str else None,
             "end_time": f"{end_time_str} UTC" if end_time_str else None,
-            "created_at": f"{created_at_str} UTC" if created_at_str else "unknown"
+            "created_at": f"{created_at_str} UTC" if created_at_str else "unknown",
+            "username": row[8] if row[8] else "#anon#"
         })
 
     return {"builds": builds}
