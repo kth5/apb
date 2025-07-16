@@ -2101,7 +2101,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
     offset = (page - 1) * 20
     cursor.execute('''
         SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
-        FROM builds b 
+        FROM builds b
         LEFT JOIN users u ON b.user_id = u.id
         ORDER BY b.created_at DESC LIMIT 20 OFFSET ?
     ''', (offset,))
@@ -2355,7 +2355,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                         }},
                         body: JSON.stringify({{ username, password }})
                     }});
- 
+
                     if (response.ok) {{
                         const data = await response.json();
                         // Store token in localStorage and cookie
@@ -2411,11 +2411,11 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
                             confirm_password: confirmPassword
                         }})
                     }});
- 
+
                     if (response.ok) {{
                         const data = await response.json();
                         successDiv.textContent = data.message;
-     
+
                         // Auto-logout and redirect to login after 3 seconds
                         setTimeout(() => {{
                             localStorage.removeItem('authToken');
@@ -2601,7 +2601,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
     cursor.execute('''
         SELECT b.server_url, b.server_arch, b.pkgname, b.status, b.last_known_status,
                b.server_available, b.cached_response, b.last_status_update, b.created_at, u.username
-        FROM builds b 
+        FROM builds b
         LEFT JOIN users u ON b.user_id = u.id
         WHERE b.id = ?
     ''', (build_id,))
@@ -3422,14 +3422,14 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
     if status:
         cursor.execute('''
             SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
-            FROM builds b 
+            FROM builds b
             LEFT JOIN users u ON b.user_id = u.id
             WHERE b.status = ? ORDER BY b.created_at DESC LIMIT ?
         ''', (status, limit))
     else:
         cursor.execute('''
             SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username
-            FROM builds b 
+            FROM builds b
             LEFT JOIN users u ON b.user_id = u.id
             ORDER BY b.created_at DESC LIMIT ?
         ''', (limit,))
@@ -3665,7 +3665,7 @@ async def get_admin_panel(
                         }},
                         body: JSON.stringify({{ username, password, role }})
                     }});
- 
+
                     if (response.ok) {{
                         const data = await response.json();
                         successDiv.textContent = `User '${{username}}' created successfully!`;
@@ -3718,7 +3718,7 @@ async def get_admin_panel(
                         }},
                         body: JSON.stringify({{ role }})
                     }});
- 
+
                     if (response.ok) {{
                         successDiv.textContent = 'User role updated successfully!';
                         setTimeout(() => {{
@@ -3748,7 +3748,7 @@ async def get_admin_panel(
                             'Authorization': `Bearer ${{token}}`
                         }}
                     }});
- 
+
                     if (response.ok) {{
                         alert(`User '${{username}}' deleted successfully!`);
                         window.location.reload();
