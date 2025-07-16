@@ -150,27 +150,6 @@ The farm looks for `apb.json` in the following locations (in order):
 3. User home: `~/.apb/apb.json`
 4. Farm-specific: `~/.apb-farm/apb.json`
 
-### Farm Features
-
-- **Server Health Monitoring**: Continuously monitors all configured servers
-- **Automatic Failover**: Routes builds away from unhealthy servers
-- **Architecture Validation**: Ensures servers actually support their configured architectures
-- **Load Balancing**: Distributes builds based on server capacity and current load
-- **Build Tracking**: Maintains a database of all builds across all servers
-- **Web Dashboard**: Provides a web interface at `http://farm-host:8080/dashboard`
-- **User Authentication**: Secure login system with role-based permissions
-- **User Management**: Admin interface for creating and managing user accounts
-
-### Authentication Endpoints
-
-- `POST /auth/login` - User login
-- `POST /auth/logout` - User logout
-- `GET /auth/me` - Get current user info
-- `GET /auth/users` - List users (admin only)
-- `POST /auth/users` - Create user (admin only)
-- `DELETE /auth/users/{id}` - Delete user (admin only)
-- `PUT /auth/users/{id}/role` - Change user role (admin only)
-
 ## Running APB Server
 
 The APB Server is the build execution engine that should run on each build machine.
