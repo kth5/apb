@@ -795,7 +795,7 @@ def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path],
         return None
 
 
-def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: List[Path], architectures: List[str] = None, auth_client: Optional[APBAuthClient] = None) -> Optional[Dict]:
+def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: List[Path], architectures: List[str] = None, auth_client: Optional[APBAuthClient] = None, build_timeout: Optional[int] = None) -> Optional[Dict]:
     """
     Submit a build to a farm server and return the full response.
 
@@ -805,11 +805,17 @@ def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: Lis
         source_files: List of source files
         architectures: Optional list of architectures to build for
         auth_client: Optional authentication client for farm access
+        build_timeout: Optional build timeout in seconds (admin only)
 
     Returns:
         Full response dictionary if successful, None otherwise
     """
     try:
+        # Validate timeout parameter if provided
+        if build_timeout is not None:
+            if build_timeout < 300 or build_timeout > 14400:
+                raise ValueError("Build timeout must be between 300 and 14400 seconds (5 minutes to 4 hours)")
+
         client = APBotClient(server_url, auth_client)
         files = [pkgbuild_path] + source_files
 
@@ -830,6 +836,9 @@ def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: Lis
         if architectures:
             # Include architectures list as form data to tell farm which architectures to build
             form_data['architectures'] = ','.join(architectures)
+        if build_timeout is not None:
+            # Include build timeout (only allowed for admin users)
+            form_data['build_timeout'] = str(build_timeout)
 
         # Submit build request
         url = urljoin(server_url, '/build')
@@ -1622,6 +1631,8 @@ def main():
                        help="Don't download build results")
     parser.add_argument("--force", action="store_true",
                        help="Force rebuild even if package exists")
+    parser.add_argument("--build-timeout", type=int,
+                       help="Build timeout in seconds (300-14400, admin only)")
 
     # Monitoring options
     parser.add_argument("--monitor", type=str, help="Monitor existing build")
@@ -1910,7 +1921,7 @@ def main():
 
             if args.farm:
                 # Handle farm submission with multiple architectures
-                response = submit_build_to_farm(server_url, pkgbuild_path, source_files, architectures_needing_build, auth_client)
+                response = submit_build_to_farm(server_url, pkgbuild_path, source_files, architectures_needing_build, auth_client, args.build_timeout)
                 if response:
                     if 'builds' in response and response['builds']:
                         # Multi-architecture farm response

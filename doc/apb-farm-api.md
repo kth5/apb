@@ -249,6 +249,7 @@ Submit a build request to the farm (Authentication Required).
   - `pkgbuild` (file, required): The PKGBUILD file
   - `sources` (file[], optional): Additional source files
   - `architectures` (string, optional): Comma-separated list of target architectures
+  - `build_timeout` (integer, optional): Build timeout in seconds (300-14400, admin only)
 
 **Enhanced Response:**
 ```json

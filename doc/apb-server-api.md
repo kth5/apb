@@ -210,6 +210,7 @@ Submit a new build request.
   - `pkgbuild` (file, required): The PKGBUILD file
   - `sources` (file[], optional): Additional source files
   - `build_id` (string, optional): Build UUID (provided by APB Farm)
+  - `build_timeout` (integer, optional): Build timeout in seconds (300-14400)
 
 **Response:**
 ```json

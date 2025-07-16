@@ -1040,6 +1040,12 @@ def init_database() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
 
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN build_timeout INTEGER DEFAULT 7200')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     return conn
 
@@ -1464,7 +1470,7 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     build_database.commit()
 
 
-async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None) -> List[Dict]:
+async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = 7200) -> List[Dict]:
     """
     Queue builds for each architecture that has available servers.
     Returns a list of build information dictionaries.
@@ -1557,7 +1563,8 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             "created_at": time.time(),
             "status": BuildStatus.QUEUED,
             "submission_group": submission_group,
-            "arch": arch
+            "arch": arch,
+            "build_timeout": build_timeout
         }
 
         build_queue.append(build_info)
@@ -1566,11 +1573,11 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         cursor = build_database.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO builds
-            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id, build_timeout)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             build_id, None, arch, pkgname, BuildStatus.QUEUED,
-            None, None, time.time(), len(build_queue), submission_group, user_id
+            None, None, time.time(), len(build_queue), submission_group, user_id, build_timeout
         ))
         build_database.commit()
 
@@ -1692,6 +1699,10 @@ async def forward_build_to_server(build_info: Dict, server_url: str):
         data.add_field('build_id', build_id)
         data.add_field('pkgbuild', build_info["pkgbuild_content"],
                       filename='PKGBUILD', content_type='text/plain')
+
+        # Add build timeout if specified
+        if "build_timeout" in build_info:
+            data.add_field('build_timeout', str(build_info["build_timeout"]))
 
         # Add source files
         for source_file in build_info.get("source_files", []):
@@ -2990,10 +3001,27 @@ async def submit_build(
     pkgbuild: UploadFile = File(...),
     sources: List[UploadFile] = File(default=[]),
     architectures: str = Form(None),
+    build_timeout: Optional[int] = Form(None),
     current_user: User = Depends(require_auth)  # Require authentication
 ):
     """Submit a build request (authenticated users only)"""
     try:
+        # Validate timeout parameter
+        if build_timeout is not None:
+            if current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only admin users can specify custom build timeouts"
+                )
+            if build_timeout < 300 or build_timeout > 14400:  # 5 minutes to 4 hours
+                raise HTTPException(
+                    status_code=400,
+                    detail="Build timeout must be between 300 and 14400 seconds (5 minutes to 4 hours)"
+                )
+
+        # Use default timeout if not specified
+        timeout_seconds = build_timeout if build_timeout is not None else 7200
+
         # Read PKGBUILD content
         pkgbuild_content = (await pkgbuild.read()).decode('utf-8')
 
@@ -3039,7 +3067,9 @@ async def submit_build(
                 })
 
         # Queue builds for each architecture
-        queued_builds = await queue_builds_for_architectures(pkgbuild_content, pkgname, target_archs, source_files, current_user.id)
+        queued_builds = await queue_builds_for_architectures(
+            pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds
+        )
 
         if not queued_builds:
             # Get available architectures for error message
@@ -3056,7 +3086,7 @@ async def submit_build(
         # Return the first build ID for backward compatibility, plus info about all builds
         primary_build = queued_builds[0]
 
-        return {
+        response = {
             "build_id": primary_build["build_id"],  # Primary build ID for backward compatibility
             "status": BuildStatus.QUEUED,
             "message": f"Queued {len(queued_builds)} build(s) for processing",
@@ -3072,6 +3102,15 @@ async def submit_build(
             "created_at": time.time()
         }
 
+        # Include timeout info in response
+        if build_timeout is not None:
+            response["build_timeout"] = timeout_seconds
+            response["timeout_set_by"] = current_user.username
+
+        return response
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error submitting build: {e}")
         raise HTTPException(status_code=500, detail=str(e))

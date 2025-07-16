@@ -235,11 +235,14 @@ def monitor_resources():
             current_time = time.time()
             for build_id, build_info in list(active_builds.items()):
                 if (build_info["status"] == BuildStatus.BUILDING and
-                    "start_time" in build_info and
-                    current_time - build_info["start_time"] > BUILD_TIMEOUT):
+                    "start_time" in build_info):
 
-                    logger.warning(f"Build {build_id} exceeded timeout, terminating")
-                    terminate_build(build_id)
+                    # Get timeout for this specific build, fallback to global if not set
+                    timeout_for_build = build_info.get("build_timeout", BUILD_TIMEOUT)
+
+                    if current_time - build_info["start_time"] > timeout_for_build:
+                        logger.warning(f"Build {build_id} exceeded timeout ({timeout_for_build}s), terminating")
+                        terminate_build(build_id)
 
             time.sleep(30)  # Check every 30 seconds
 
@@ -752,7 +755,7 @@ def unlock_srcdest(lock_fd: int):
         logger.error(f"Error unlocking SRCDEST: {e}")
 
 
-def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any]):
+def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any], build_timeout: int = BUILD_TIMEOUT):
     """Build package using makechrootpkg"""
     global build_counter
 
@@ -881,8 +884,8 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any])
                         break
 
                     # Check overall build timeout
-                    if current_time - start_time > BUILD_TIMEOUT:
-                        log_output(f"Build timed out after {BUILD_TIMEOUT} seconds")
+                    if current_time - start_time > build_timeout:
+                        log_output(f"Build timed out after {build_timeout} seconds")
                         process.terminate()
                         break
 
@@ -1018,7 +1021,8 @@ def process_build_queue():
                 build_package,
                 build_data["build_id"],
                 build_data["build_dir"],
-                build_data["pkgbuild_info"]
+                build_data["pkgbuild_info"],
+                build_data.get("build_timeout", BUILD_TIMEOUT)
             )
 
         except queue.Empty:
@@ -1155,7 +1159,8 @@ async def health_check():
 async def submit_build(
     pkgbuild: UploadFile = File(...),
     build_id: str = Form(...),
-    sources: List[UploadFile] = File(default=[])
+    sources: List[UploadFile] = File(default=[]),
+    build_timeout: Optional[int] = Form(None)
 ):
     """Submit a new build request"""
     try:
@@ -1172,6 +1177,17 @@ async def submit_build(
                 status_code=400,
                 detail={"error": "Build ID already exists", "detail": f"Build with ID '{build_id}' already exists"}
             )
+
+        # Validate and set build timeout
+        timeout_seconds = BUILD_TIMEOUT  # Default timeout
+        if build_timeout is not None:
+            if build_timeout < 300 or build_timeout > 14400:  # 5 minutes to 4 hours
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "Invalid timeout", "detail": "Build timeout must be between 300 and 14400 seconds"}
+                )
+            timeout_seconds = build_timeout
+            logger.info(f"Build {build_id} using custom timeout: {timeout_seconds} seconds")
 
         # Create build directory
         builds_dir = Path(server_config["builds_dir"])
@@ -1281,14 +1297,16 @@ async def submit_build(
             "created_at": time.time(),
             "arch": pkgbuild_info["arch"],
             "packages": [],
-            "logs": []
+            "logs": [],
+            "build_timeout": timeout_seconds
         }
 
         # Add to queue
         build_queue.put({
             "build_id": build_id,
             "build_dir": build_dir,
-            "pkgbuild_info": pkgbuild_info
+            "pkgbuild_info": pkgbuild_info,
+            "build_timeout": timeout_seconds
         })
 
         return {
