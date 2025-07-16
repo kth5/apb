@@ -18,6 +18,9 @@ import requests
 import re
 from datetime import datetime
 
+# Version information
+VERSION = "2025-07-16"
+
 
 def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
     """
@@ -429,6 +432,11 @@ class APBotClient:
         self.server_url = server_url.rstrip('/')
         self.session = requests.Session()
         self.auth_client = auth_client
+
+        # Set User-Agent header to identify the client
+        self.session.headers.update({
+            'User-Agent': f'APB-Client/{VERSION}'
+        })
 
         # Set authentication headers if available
         if self.auth_client:
