@@ -30,6 +30,8 @@ import aiohttp
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
+import io
+import tarfile
 
 # FastAPI dependencies
 try:
@@ -1771,61 +1773,89 @@ async def process_build_queue():
 
 
 async def forward_build_to_server(build_info: Dict, server_url: str):
-    """Forward a build to a specific server"""
+    """Forward a build to a specific server using tarball format"""
     build_id = build_info["build_id"]
 
     try:
-        # Create form data
-        data = aiohttp.FormData()
-        data.add_field('build_id', build_id)
-        data.add_field('pkgbuild', build_info["pkgbuild_content"],
-                      filename='PKGBUILD', content_type='text/plain')
+        # Create temporary tarball with all build files
+        import tempfile
+        import tarfile
 
-        # Add build timeout if specified
-        if "build_timeout" in build_info:
-            data.add_field('build_timeout', str(build_info["build_timeout"]))
+        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
+            try:
+                with tarfile.open(temp_tarball.name, 'w:gz') as tar:
+                    # Add PKGBUILD
+                    pkgbuild_info = tarfile.TarInfo(name='PKGBUILD')
+                    pkgbuild_content = build_info["pkgbuild_content"].encode('utf-8')
+                    pkgbuild_info.size = len(pkgbuild_content)
+                    tar.addfile(pkgbuild_info, io.BytesIO(pkgbuild_content))
 
-        # Add source files
-        for source_file in build_info.get("source_files", []):
-            data.add_field('sources', source_file["content"],
-                          filename=source_file["filename"],
-                          content_type=source_file["content_type"])
+                    # Add source files
+                    for source_file in build_info.get("source_files", []):
+                        file_info = tarfile.TarInfo(name=source_file["filename"])
+                        file_content = source_file["content"]
+                        if isinstance(file_content, str):
+                            file_content = file_content.encode('utf-8')
+                        file_info.size = len(file_content)
+                        tar.addfile(file_info, io.BytesIO(file_content))
 
-        # Use longer timeout for build submissions (increased from 30 to 60 seconds)
-        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+                # Create form data with tarball
+                data = aiohttp.FormData()
+                data.add_field('build_id', build_id)
 
-        logger.info(f"Forwarding build {build_id} to {server_url}")
+                # Add build timeout if specified
+                if "build_timeout" in build_info:
+                    data.add_field('build_timeout', str(build_info["build_timeout"]))
 
-        async with http_session.post(f"{server_url}/build", data=data, timeout=timeout) as response:
-            if response.status == 200:
-                # Successful submission - update database
-                cursor = build_database.cursor()
-                cursor.execute('''
-                    UPDATE builds SET server_url = ?, status = ?, start_time = ?
-                    WHERE id = ?
-                ''', (server_url, BuildStatus.BUILDING, time.time(), build_id))
-                build_database.commit()
+                # Add the tarball
+                with open(temp_tarball.name, 'rb') as f:
+                    data.add_field('build_tarball', f.read(),
+                                 filename='build.tar.gz',
+                                 content_type='application/gzip')
 
-                logger.info(f"Build {build_id} successfully forwarded to {server_url}")
-                return True
+                # Use longer timeout for build submissions (increased from 30 to 60 seconds)
+                timeout = aiohttp.ClientTimeout(total=60, connect=10)
 
-            else:
-                # Server returned error - log details and mark as failed
+                logger.info(f"Forwarding build {build_id} to {server_url}")
+
+                async with http_session.post(f"{server_url}/build", data=data, timeout=timeout) as response:
+                    if response.status == 200:
+                        # Successful submission - update database
+                        cursor = build_database.cursor()
+                        cursor.execute('''
+                            UPDATE builds SET server_url = ?, status = ?, start_time = ?
+                            WHERE id = ?
+                        ''', (server_url, BuildStatus.BUILDING, time.time(), build_id))
+                        build_database.commit()
+
+                        logger.info(f"Build {build_id} successfully forwarded to {server_url}")
+                        return True
+
+                    else:
+                        # Server returned error - log details and mark as failed
+                        try:
+                            error_text = await response.text()
+                            logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}: {error_text}")
+                        except:
+                            logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}")
+
+                        # Update database to mark build as failed
+                        cursor = build_database.cursor()
+                        cursor.execute('''
+                            UPDATE builds SET status = ?, end_time = ?
+                            WHERE id = ?
+                        ''', (BuildStatus.FAILED, time.time(), build_id))
+                        build_database.commit()
+
+                        return False
+
+            finally:
+                # Clean up temporary file
                 try:
-                    error_text = await response.text()
-                    logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}: {error_text}")
-                except:
-                    logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}")
-
-                # Update database to mark build as failed
-                cursor = build_database.cursor()
-                cursor.execute('''
-                    UPDATE builds SET status = ?, end_time = ?
-                    WHERE id = ?
-                ''', (BuildStatus.FAILED, time.time(), build_id))
-                build_database.commit()
-
-                return False
+                    import os
+                    os.unlink(temp_tarball.name)
+                except OSError:
+                    pass
 
     except asyncio.TimeoutError:
         logger.error(f"Timeout forwarding build {build_id} to {server_url}")
@@ -3224,13 +3254,14 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[User]
 
 @app.post("/build")
 async def submit_build(
-    pkgbuild: UploadFile = File(...),
+    build_tarball: UploadFile = File(None),
+    pkgbuild: UploadFile = File(None),
     sources: List[UploadFile] = File(default=[]),
     architectures: str = Form(None),
     build_timeout: Optional[int] = Form(None),
     current_user: User = Depends(require_auth)  # Require authentication
 ):
-    """Submit a build request (authenticated users only)"""
+    """Submit a build request (authenticated users only, supports both tarball and individual file uploads)"""
     try:
         # Validate timeout parameter
         if build_timeout is not None:
@@ -3248,10 +3279,77 @@ async def submit_build(
         # Use default timeout if not specified
         timeout_seconds = build_timeout if build_timeout is not None else 7200
 
-        # Read PKGBUILD content
-        pkgbuild_content = (await pkgbuild.read()).decode('utf-8')
+        # Handle tarball upload (new method)
+        if build_tarball and build_tarball.filename:
+            # Create temporary directory for extraction
+            import tempfile
+            import tarfile
 
-        # Parse PKGBUILD
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_dir_path = Path(temp_dir)
+
+                # Save tarball temporarily
+                tarball_path = temp_dir_path / "build.tar.gz"
+                with open(tarball_path, 'wb') as f:
+                    content = await build_tarball.read()
+                    f.write(content)
+
+                # Extract tarball
+                try:
+                    with tarfile.open(tarball_path, 'r:gz') as tar:
+                        # Extract all files to temp directory
+                        tar.extractall(path=temp_dir_path)
+
+                    # Read PKGBUILD content
+                    pkgbuild_path = temp_dir_path / "PKGBUILD"
+                    if not pkgbuild_path.exists():
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Tarball must contain a PKGBUILD file"
+                        )
+
+                    with open(pkgbuild_path, 'r', encoding='utf-8') as f:
+                        pkgbuild_content = f.read()
+
+                    # Collect source files from extracted content
+                    source_files = []
+                    for item in temp_dir_path.iterdir():
+                        if item.is_file() and item.name != "PKGBUILD":
+                            with open(item, 'rb') as f:
+                                source_files.append({
+                                    "filename": item.name,
+                                    "content": f.read(),
+                                    "content_type": "application/octet-stream"
+                                })
+
+                except (tarfile.TarError, OSError) as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Could not extract tarball: {str(e)}"
+                    )
+
+        # Handle individual file uploads (legacy method for backward compatibility)
+        elif pkgbuild and pkgbuild.filename:
+            # Read PKGBUILD content
+            pkgbuild_content = (await pkgbuild.read()).decode('utf-8')
+
+            # Read source files
+            source_files = []
+            for source in sources:
+                if source.filename:
+                    content = await source.read()
+                    source_files.append({
+                        "filename": source.filename,
+                        "content": content,
+                        "content_type": source.content_type or "application/octet-stream"
+                    })
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Either build_tarball or pkgbuild must be provided"
+            )
+
+        # Parse PKGBUILD (same logic regardless of upload method)
         pkgname = parse_pkgbuild_name(pkgbuild_content)
         pkgbuild_archs = parse_pkgbuild_arch(pkgbuild_content)
 
@@ -3280,17 +3378,6 @@ async def submit_build(
                 "pkgbuild_architectures": pkgbuild_archs,
                 "requested_architectures": architectures.split(',') if architectures else []
             }
-
-        # Read source files
-        source_files = []
-        for source in sources:
-            if source.filename:
-                content = await source.read()
-                source_files.append({
-                    "filename": source.filename,
-                    "content": content,
-                    "content_type": source.content_type or "application/octet-stream"
-                })
 
         # Queue builds for each architecture
         queued_builds = await queue_builds_for_architectures(

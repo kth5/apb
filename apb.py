@@ -11,6 +11,8 @@ import time
 import threading
 import queue
 import getpass
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Generator, Any
 from urllib.parse import urljoin
@@ -457,12 +459,12 @@ class APBotClient:
             headers = self.auth_client.get_auth_headers()
             self.session.headers.update(headers)
 
-    def build_package(self, files: List[Path]) -> str:
+    def build_package(self, build_path: Path) -> str:
         """
-        Submit a build request to the server.
+        Submit a build request to the server using a tarball of all files in the build directory.
 
         Args:
-            files: List of file paths to upload (first should be PKGBUILD)
+            build_path: Path to directory containing PKGBUILD and source files
 
         Returns:
             Build UUID provided by APB Farm
@@ -470,33 +472,44 @@ class APBotClient:
         Raises:
             requests.HTTPError: On HTTP errors
             requests.RequestException: On connection errors
-            ValueError: On invalid response
+            ValueError: On invalid response or missing PKGBUILD
         """
-        if not files:
-            raise ValueError("No files provided")
+        # Ensure we have a PKGBUILD
+        pkgbuild_path = build_path / "PKGBUILD"
+        if not pkgbuild_path.exists():
+            raise ValueError(f"PKGBUILD not found in {build_path}")
 
-        # Prepare files for upload
-        files_data = []
-        for file_path in files:
-            if not file_path.exists():
-                raise ValueError(f"File not found: {file_path}")
+        # Create a temporary tarball containing all files (excluding subdirectories)
+        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
+            try:
+                with tarfile.open(temp_tarball.name, 'w:gz') as tar:
+                    # Add all files from the build directory, excluding subdirectories
+                    for item in build_path.iterdir():
+                        if item.is_file():
+                            # Add file with just its name (not full path)
+                            tar.add(item, arcname=item.name)
 
-            with open(file_path, 'rb') as f:
-                if file_path.name == 'PKGBUILD':
-                    files_data.append(('pkgbuild', (file_path.name, f.read())))
-                else:
-                    files_data.append(('sources', (file_path.name, f.read())))
+                # Submit the tarball
+                with open(temp_tarball.name, 'rb') as f:
+                    files_data = [('build_tarball', ('build.tar.gz', f.read(), 'application/gzip'))]
 
-        # Submit build request
-        url = urljoin(self.server_url, '/build')
-        response = self.session.post(url, files=files_data)
-        response.raise_for_status()
+                # Submit build request
+                url = urljoin(self.server_url, '/build')
+                response = self.session.post(url, files=files_data)
+                response.raise_for_status()
 
-        result = response.json()
-        if 'build_id' not in result:
-            raise ValueError("Invalid response: missing build_id")
+                result = response.json()
+                if 'build_id' not in result:
+                    raise ValueError("Invalid response: missing build_id")
 
-        return result['build_id']
+                return result['build_id']
+
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_tarball.name)
+                except OSError:
+                    pass
 
     def get_build_status(self, build_id: str) -> Dict:
         """
@@ -788,14 +801,13 @@ def load_config(config_path: Optional[Path] = None) -> Dict:
     }
 
 
-def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path], auth_client: Optional[APBAuthClient] = None) -> Optional[str]:
+def submit_build(server_url: str, build_path: Path, auth_client: Optional[APBAuthClient] = None) -> Optional[str]:
     """
-    Submit a build to a server with automatic server selection.
+    Submit a build to a server using a tarball of the build directory.
 
     Args:
         server_url: Server URL
-        pkgbuild_path: Path to PKGBUILD file
-        source_files: List of source files
+        build_path: Path to directory containing PKGBUILD and source files
         auth_client: Optional authentication client
 
     Returns:
@@ -803,20 +815,18 @@ def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path],
     """
     try:
         client = APBotClient(server_url, auth_client)
-        files = [pkgbuild_path] + source_files
-        return client.build_package(files)
+        return client.build_package(build_path)
     except requests.RequestException:
         return None
 
 
-def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: List[Path], architectures: List[str] = None, auth_client: Optional[APBAuthClient] = None, build_timeout: Optional[int] = None) -> Optional[Dict]:
+def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[str] = None, auth_client: Optional[APBAuthClient] = None, build_timeout: Optional[int] = None) -> Optional[Dict]:
     """
-    Submit a build to a farm server and return the full response.
+    Submit a build to a farm server using a tarball and return the full response.
 
     Args:
         server_url: Farm server URL
-        pkgbuild_path: Path to PKGBUILD file
-        source_files: List of source files
+        build_path: Path to directory containing PKGBUILD and source files
         architectures: Optional list of architectures to build for
         auth_client: Optional authentication client for farm access
         build_timeout: Optional build timeout in seconds (admin only)
@@ -830,36 +840,50 @@ def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: Lis
             if build_timeout < 300 or build_timeout > 14400:
                 raise ValueError("Build timeout must be between 300 and 14400 seconds (5 minutes to 4 hours)")
 
+        # Ensure we have a PKGBUILD
+        pkgbuild_path = build_path / "PKGBUILD"
+        if not pkgbuild_path.exists():
+            raise ValueError(f"PKGBUILD not found in {build_path}")
+
         client = APBotClient(server_url, auth_client)
-        files = [pkgbuild_path] + source_files
 
-        # Prepare files for upload
-        files_data = []
-        for file_path in files:
-            if not file_path.exists():
-                raise ValueError(f"File not found: {file_path}")
+        # Create a temporary tarball containing all files (excluding subdirectories)
+        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
+            try:
+                with tarfile.open(temp_tarball.name, 'w:gz') as tar:
+                    # Add all files from the build directory, excluding subdirectories
+                    for item in build_path.iterdir():
+                        if item.is_file():
+                            # Add file with just its name (not full path)
+                            tar.add(item, arcname=item.name)
 
-            with open(file_path, 'rb') as f:
-                if file_path.name == 'PKGBUILD':
-                    files_data.append(('pkgbuild', (file_path.name, f.read())))
-                else:
-                    files_data.append(('sources', (file_path.name, f.read())))
+                # Prepare form data
+                form_data = {}
+                if architectures:
+                    # Include architectures list as form data to tell farm which architectures to build
+                    form_data['architectures'] = ','.join(architectures)
+                if build_timeout is not None:
+                    # Include build timeout (only allowed for admin users)
+                    form_data['build_timeout'] = str(build_timeout)
 
-        # Prepare form data
-        form_data = {}
-        if architectures:
-            # Include architectures list as form data to tell farm which architectures to build
-            form_data['architectures'] = ','.join(architectures)
-        if build_timeout is not None:
-            # Include build timeout (only allowed for admin users)
-            form_data['build_timeout'] = str(build_timeout)
+                # Submit the tarball
+                with open(temp_tarball.name, 'rb') as f:
+                    files_data = [('build_tarball', ('build.tar.gz', f.read(), 'application/gzip'))]
 
-        # Submit build request
-        url = urljoin(server_url, '/build')
-        response = client.session.post(url, files=files_data, data=form_data)
-        response.raise_for_status()
+                # Submit build request
+                url = urljoin(server_url, '/build')
+                response = client.session.post(url, files=files_data, data=form_data)
+                response.raise_for_status()
 
-        return response.json()
+                return response.json()
+
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_tarball.name)
+                except OSError:
+                    pass
+
     except requests.RequestException as e:
         print(f"Error submitting build to farm: {e}")
         if hasattr(e, 'response') and e.response is not None:
@@ -1404,12 +1428,6 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         print(f"Error: PKGBUILD not found in {build_path}")
         return False
 
-    # Find source files
-    source_files = []
-    for file_path in build_path.iterdir():
-        if file_path.is_file() and file_path.name != "PKGBUILD":
-            source_files.append(file_path)
-
     servers = config.get("servers", {})
 
     # Use architectures from PKGBUILD if no specific architecture is requested
@@ -1488,7 +1506,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                 if verbose:
                     print(f"[{arch}] Submitting build to {server_url}...")
 
-                build_id = submit_build(server_url, pkgbuild_path, source_files, auth_client)
+                build_id = submit_build(server_url, build_path, auth_client)
                 if build_id:
                     print(f"[{arch}] Build submitted: {build_id}")
                     arch_build_info[arch] = {
@@ -1884,11 +1902,7 @@ def main():
             print(f"Error: PKGBUILD not found in {build_path}")
             sys.exit(1)
 
-        # Find source files
-        source_files = []
-        for file_path in build_path.iterdir():
-            if file_path.is_file() and file_path.name != "PKGBUILD":
-                source_files.append(file_path)
+
 
         # For farm submissions, check which architectures need building
         if args.farm:
@@ -1935,7 +1949,7 @@ def main():
 
             if args.farm:
                 # Handle farm submission with multiple architectures
-                response = submit_build_to_farm(server_url, pkgbuild_path, source_files, architectures_needing_build, auth_client, args.build_timeout)
+                response = submit_build_to_farm(server_url, build_path, architectures_needing_build, auth_client, args.build_timeout)
                 if response:
                     if 'builds' in response and response['builds']:
                         # Multi-architecture farm response
@@ -2013,7 +2027,7 @@ def main():
                     sys.exit(1)
             else:
                 # Handle direct server submission (single architecture)
-                build_id = submit_build(server_url, pkgbuild_path, source_files, auth_client)
+                build_id = submit_build(server_url, build_path, auth_client)
                 if build_id:
                     print(f"Build submitted: {build_id}")
 

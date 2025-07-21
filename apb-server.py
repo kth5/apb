@@ -29,6 +29,7 @@ import gc
 import resource
 import select
 from contextlib import asynccontextmanager
+import tarfile
 
 # Minimal dependencies - only FastAPI and uvicorn
 try:
@@ -1316,20 +1317,14 @@ async def health_check():
 
 @app.post("/build")
 async def submit_build(
-    pkgbuild: UploadFile = File(...),
+    build_tarball: UploadFile = File(None),
+    pkgbuild: UploadFile = File(None),
     build_id: str = Form(...),
     sources: List[UploadFile] = File(default=[]),
     build_timeout: Optional[int] = Form(None)
 ):
-    """Submit a new build request"""
+    """Submit a new build request (supports both tarball and individual file uploads)"""
     try:
-        # Validate PKGBUILD file
-        if not pkgbuild.filename or pkgbuild.filename.lower() != "pkgbuild":
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "Invalid PKGBUILD file", "detail": "File must be named 'PKGBUILD'"}
-            )
-
         # Check if build_id already exists
         if build_id in active_builds or build_id in build_history:
             raise HTTPException(
@@ -1355,91 +1350,169 @@ async def submit_build(
         build_dir = builds_dir / build_id
         build_dir.mkdir(exist_ok=True)
 
-        # Save PKGBUILD with size limit and streaming
-        pkgbuild_path = build_dir / "PKGBUILD"
-        try:
+        # Handle tarball upload (new method)
+        if build_tarball and build_tarball.filename:
             # Check file size first
-            if pkgbuild.size and pkgbuild.size > MAX_FILE_SIZE:
+            if build_tarball.size and build_tarball.size > MAX_REQUEST_SIZE:
                 raise HTTPException(
                     status_code=413,
-                    detail={"error": "File too large", "detail": f"PKGBUILD exceeds {MAX_FILE_SIZE} bytes"}
+                    detail={"error": "File too large", "detail": f"Tarball exceeds {MAX_REQUEST_SIZE} bytes"}
                 )
 
-            # Stream file to disk to avoid memory issues
-            with open(pkgbuild_path, 'wb') as f:
-                bytes_written = 0
-                while True:
-                    # Read in chunks to avoid memory exhaustion
-                    chunk = await pkgbuild.read(8192)  # 8KB chunks
-                    if not chunk:
-                        break
+            # Save tarball temporarily
+            tarball_path = build_dir / "build.tar.gz"
+            try:
+                with open(tarball_path, 'wb') as f:
+                    bytes_written = 0
+                    while True:
+                        chunk = await build_tarball.read(8192)  # 8KB chunks
+                        if not chunk:
+                            break
 
-                    bytes_written += len(chunk)
-                    if bytes_written > MAX_FILE_SIZE:
-                        f.close()
-                        pkgbuild_path.unlink(missing_ok=True)  # Delete partial file
+                        bytes_written += len(chunk)
+                        if bytes_written > MAX_REQUEST_SIZE:
+                            f.close()
+                            tarball_path.unlink(missing_ok=True)  # Delete partial file
+                            raise HTTPException(
+                                status_code=413,
+                                detail={"error": "File too large", "detail": f"Tarball exceeds {MAX_REQUEST_SIZE} bytes"}
+                            )
+
+                        f.write(chunk)
+
+                # Extract tarball
+                try:
+                    with tarfile.open(tarball_path, 'r:gz') as tar:
+                        # Extract all files to build directory
+                        tar.extractall(path=build_dir)
+
+                    # Remove the tarball after extraction
+                    tarball_path.unlink(missing_ok=True)
+
+                    # Verify PKGBUILD exists
+                    pkgbuild_path = build_dir / "PKGBUILD"
+                    if not pkgbuild_path.exists():
                         raise HTTPException(
-                            status_code=413,
-                            detail={"error": "File too large", "detail": f"PKGBUILD exceeds {MAX_FILE_SIZE} bytes"}
+                            status_code=400,
+                            detail={"error": "Invalid tarball", "detail": "Tarball must contain a PKGBUILD file"}
                         )
 
-                    f.write(chunk)
+                except (tarfile.TarError, OSError) as e:
+                    # Clean up on extraction error
+                    tarball_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "Invalid tarball", "detail": f"Could not extract tarball: {str(e)}"}
+                    )
 
-        except HTTPException:
-            raise
-        except Exception as e:
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "Failed to save tarball", "detail": str(e)}
+                )
+
+        # Handle individual file uploads (legacy method for backward compatibility)
+        elif pkgbuild and pkgbuild.filename:
+            # Validate PKGBUILD file
+            if pkgbuild.filename.lower() != "pkgbuild":
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "Invalid PKGBUILD file", "detail": "File must be named 'PKGBUILD'"}
+                )
+
+            # Save PKGBUILD with size limit and streaming
+            pkgbuild_path = build_dir / "PKGBUILD"
+            try:
+                # Check file size first
+                if pkgbuild.size and pkgbuild.size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail={"error": "File too large", "detail": f"PKGBUILD exceeds {MAX_FILE_SIZE} bytes"}
+                    )
+
+                # Stream file to disk to avoid memory issues
+                with open(pkgbuild_path, 'wb') as f:
+                    bytes_written = 0
+                    while True:
+                        # Read in chunks to avoid memory exhaustion
+                        chunk = await pkgbuild.read(8192)  # 8KB chunks
+                        if not chunk:
+                            break
+
+                        bytes_written += len(chunk)
+                        if bytes_written > MAX_FILE_SIZE:
+                            f.close()
+                            pkgbuild_path.unlink(missing_ok=True)  # Delete partial file
+                            raise HTTPException(
+                                status_code=413,
+                                detail={"error": "File too large", "detail": f"PKGBUILD exceeds {MAX_FILE_SIZE} bytes"}
+                            )
+
+                        f.write(chunk)
+
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "Failed to save PKGBUILD", "detail": str(e)}
+                )
+
+            # Save source files with size limits and streaming
+            total_size = 0
+            for source in sources:
+                if source.filename:
+                    source_path = build_dir / source.filename
+                    try:
+                        # Check individual file size
+                        if source.size and source.size > MAX_FILE_SIZE:
+                            logger.error(f"Source file {source.filename} too large: {source.size} bytes")
+                            continue
+
+                        # Stream file to disk
+                        with open(source_path, 'wb') as f:
+                            bytes_written = 0
+                            while True:
+                                chunk = await source.read(8192)  # 8KB chunks
+                                if not chunk:
+                                    break
+
+                                bytes_written += len(chunk)
+                                total_size += len(chunk)
+
+                                # Check individual file size limit
+                                if bytes_written > MAX_FILE_SIZE:
+                                    f.close()
+                                    source_path.unlink(missing_ok=True)
+                                    logger.error(f"Source file {source.filename} exceeded size limit")
+                                    break
+
+                                # Check total request size limit
+                                if total_size > MAX_REQUEST_SIZE:
+                                    f.close()
+                                    source_path.unlink(missing_ok=True)
+                                    raise HTTPException(
+                                        status_code=413,
+                                        detail={"error": "Request too large", "detail": f"Total request size exceeds {MAX_REQUEST_SIZE} bytes"}
+                                    )
+
+                                f.write(chunk)
+
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        logger.error(f"Error saving source file {source.filename}: {e}")
+                        # Continue with other files
+        else:
             raise HTTPException(
                 status_code=400,
-                detail={"error": "Failed to save PKGBUILD", "detail": str(e)}
+                detail={"error": "No build files provided", "detail": "Either build_tarball or pkgbuild must be provided"}
             )
 
-        # Save source files with size limits and streaming
-        total_size = 0
-        for source in sources:
-            if source.filename:
-                source_path = build_dir / source.filename
-                try:
-                    # Check individual file size
-                    if source.size and source.size > MAX_FILE_SIZE:
-                        logger.error(f"Source file {source.filename} too large: {source.size} bytes")
-                        continue
-
-                    # Stream file to disk
-                    with open(source_path, 'wb') as f:
-                        bytes_written = 0
-                        while True:
-                            chunk = await source.read(8192)  # 8KB chunks
-                            if not chunk:
-                                break
-
-                            bytes_written += len(chunk)
-                            total_size += len(chunk)
-
-                            # Check individual file size limit
-                            if bytes_written > MAX_FILE_SIZE:
-                                f.close()
-                                source_path.unlink(missing_ok=True)
-                                logger.error(f"Source file {source.filename} exceeded size limit")
-                                break
-
-                            # Check total request size limit
-                            if total_size > MAX_REQUEST_SIZE:
-                                f.close()
-                                source_path.unlink(missing_ok=True)
-                                raise HTTPException(
-                                    status_code=413,
-                                    detail={"error": "Request too large", "detail": f"Total request size exceeds {MAX_REQUEST_SIZE} bytes"}
-                                )
-
-                            f.write(chunk)
-
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    logger.error(f"Error saving source file {source.filename}: {e}")
-                    # Continue with other files
-
-        # Parse PKGBUILD
+        # Parse PKGBUILD (same path regardless of upload method)
+        pkgbuild_path = build_dir / "PKGBUILD"
         pkgbuild_info = parse_pkgbuild(pkgbuild_path)
 
         if pkgbuild_info["pkgname"] == "unknown":
