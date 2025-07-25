@@ -10,5 +10,9 @@
     "riscv64": [
       "http://riscv-server1.example.com:8000"
     ]
-  }
+  },
+  "archive_enabled": true,
+  "archive_dir": "/home/apb/.apb/archive",
+  "archive_cleanup_server": true,
+  "archive_retention_days": 30
 } 

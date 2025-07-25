@@ -2023,6 +2023,56 @@ async def admin_cleanup():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/build/{build_id}/cleanup")
+async def cleanup_build(build_id: str):
+    """Clean up a specific build - called by farm after archiving"""
+    try:
+        builds_dir = Path(server_config["builds_dir"])
+        build_dir = builds_dir / build_id
+
+        if not build_dir.exists():
+            logger.warning(f"Build directory {build_dir} does not exist for cleanup")
+            return {"success": True, "message": "Build directory already removed"}
+
+        # Check if build is in active_builds or build_history
+        build_info = active_builds.get(build_id) or build_history.get(build_id)
+
+        if not build_info:
+            logger.warning(f"Build {build_id} not found in server records")
+            return {"success": False, "message": "Build not found in server records"}
+
+        # Only allow cleanup of completed or failed builds
+        if build_info.get("status") not in [BuildStatus.COMPLETED, BuildStatus.FAILED, BuildStatus.CANCELLED]:
+            logger.warning(f"Cannot cleanup build {build_id} - status is {build_info.get('status')}")
+            return {"success": False, "message": f"Cannot cleanup build with status: {build_info.get('status')}"}
+
+        # Remove the build directory
+        shutil.rmtree(build_dir)
+        logger.info(f"Cleaned up build directory for build {build_id}")
+
+        # Remove from build_history (but keep record in active_builds if still there)
+        if build_id in build_history:
+            del build_history[build_id]
+
+        # Clean up build outputs and streams
+        if build_id in build_outputs:
+            del build_outputs[build_id]
+        if build_id in build_streams:
+            del build_streams[build_id]
+
+        logger.info(f"Successfully cleaned up build {build_id}")
+
+        return {
+            "success": True,
+            "message": f"Build {build_id} cleaned up successfully",
+            "build_id": build_id
+        }
+
+    except Exception as e:
+        logger.error(f"Error cleaning up build {build_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error cleaning up build: {str(e)}")
+
+
 def signal_handler(signum, frame):
     """Handle shutdown signals"""
     logger.info(f"Received signal {signum}, shutting down...")

@@ -82,9 +82,29 @@ The farm requires a configuration file (`apb.json`) that defines the available s
     "riscv64": [
       "http://riscv-server1.example.com:8000"
     ]
-  }
+  },
+  "archive_enabled": true,
+  "archive_dir": "/home/apb/.apb/archive",
+  "archive_cleanup_server": true,
+  "archive_retention_days": 30
 }
 ```
+
+### Archive Configuration Options
+
+The farm includes a local archive system that automatically downloads and caches build artifacts from servers, reducing bandwidth usage and enabling server cleanup:
+
+- **`archive_enabled`** (boolean, default: `true`): Enable/disable the archive system
+- **`archive_dir`** (string, default: `~/.apb/archive`): Directory to store archived build artifacts
+- **`archive_cleanup_server`** (boolean, default: `true`): Request server cleanup after successful archiving
+- **`archive_retention_days`** (integer, default: `30`): Days to retain archived builds (0 = unlimited)
+
+### Archive System Benefits
+
+1. **Bandwidth Optimization**: Client downloads served from farm's local cache instead of repeatedly hitting servers
+2. **Server Storage Management**: Servers can automatically clean up build artifacts after farm archiving
+3. **Improved Availability**: Archived files remain accessible even if the original server becomes unavailable
+4. **Retention Management**: Automatic cleanup of old archives based on configurable retention policy
 
 ## Architecture Validation
 
@@ -941,12 +961,26 @@ CREATE TABLE builds (
 );
 ```
 
+### Archived Files Table
+```sql
+CREATE TABLE archived_files (
+    build_id TEXT,                     -- Build UUID
+    filename TEXT,                     -- Archived file name
+    file_type TEXT,                    -- 'package' or 'log'
+    size INTEGER,                      -- File size in bytes
+    archived_at REAL,                  -- Archive timestamp
+    archive_path TEXT,                 -- Full path to archived file
+    PRIMARY KEY (build_id, filename)
+);
+```
+
 ### Database Features
 - **Build Tracking**: Complete history of all builds across all servers
 - **Server Availability**: Tracks which servers are currently available
 - **Status Caching**: Caches server responses for offline access
 - **Submission Grouping**: Links related builds from same PKGBUILD submission
 - **Queue Management**: Tracks build queue positions and timing
+- **Archive Management**: Tracks locally cached build artifacts with metadata
 
 ---
 
