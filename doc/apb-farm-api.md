@@ -31,6 +31,7 @@ The APB Farm implements a comprehensive token-based authentication system with r
 - Cancel own builds
 - View own build history via `/my/builds`
 - Access authenticated endpoints
+- Update own email address
 
 #### Admin (Administrators)
 - All user permissions
@@ -39,10 +40,12 @@ The APB Farm implements a comprehensive token-based authentication system with r
 - Complete user management (create, delete, change roles)
 - Access to user build histories
 - Revoke user tokens
+- Configure SMTP settings
+- Send email notifications
 
 ### Authentication Flow
 
-1. **Registration**: Admins create user accounts with username/password
+1. **Registration**: Admins create user accounts with username/password/email
 2. **Login**: Users authenticate with credentials to receive token
 3. **Token Usage**: Include token in `Authorization: Bearer <token>` header
 4. **Auto-renewal**: Tokens automatically renewed on use (10-day expiration)
@@ -66,6 +69,22 @@ On first startup, the farm creates a default admin account:
 - **Request**: `multipart/form-data` for file uploads, `application/json` for JSON requests
 - **Response**: `application/json` for API endpoints, `text/html` for web pages
 
+## File Size Limits
+
+The farm implements configurable file size limits inherited from servers:
+
+### Upload Handling
+- **Streaming**: Large uploads are streamed to target servers
+- **Validation**: Files validated before forwarding to servers
+- **Error Handling**: Proper error messages for oversized uploads
+- **Server Limits**: Respects individual server file size limits
+
+### Tarball Support
+- **Native Support**: Full support for tarball uploads to servers
+- **Automatic Detection**: Detects tarball vs individual file uploads
+- **Compression**: Supports gzipped tar archives (.tar.gz)
+- **Validation**: Validates tarball structure before forwarding
+
 ## Configuration
 The farm requires a configuration file (`apb.json`) that defines the available servers grouped by architecture:
 
@@ -79,8 +98,11 @@ The farm requires a configuration file (`apb.json`) that defines the available s
     "aarch64": [
       "http://arm-server1.example.com:8000"
     ],
-    "riscv64": [
-      "http://riscv-server1.example.com:8000"
+    "powerpc": [
+      "http://powerpc-server1.example.com:8000"
+    ],
+    "powerpc64le": [
+      "http://ppc64le-server1.example.com:8000"
     ]
   }
 }
@@ -133,7 +155,7 @@ The farm implements sophisticated server health tracking with the following stat
 ### Health Tracking Logic
 
 - Servers are marked as DEGRADED after 5 consecutive failures
-- Servers are marked as SEVERELY DEGRADED after 15 consecutive failures
+- Servers are marked as UNAVAILABLE after 15 consecutive failures
 - HTTP 502 errors are treated specially as they often indicate busy servers
 - Architecture mismatches between configuration and server reports are tracked
 - Cached server information is used during temporary outages
@@ -145,7 +167,31 @@ Each server maintains:
 - Last failed contact timestamp
 - Consecutive failure count
 - Last known architecture
+- Health status (HEALTHY/DEGRADED/UNAVAILABLE/MISCONFIGURED)
 - Cached response data for fallback during outages
+
+## Email Notifications
+
+The farm includes an integrated SMTP system for sending email notifications:
+
+### SMTP Configuration
+- **Admin Configuration**: Admins can configure SMTP settings via API
+- **Flexible Settings**: Supports various SMTP providers (Gmail, SendGrid, etc.)
+- **TLS Support**: Configurable TLS encryption
+- **Authentication**: Optional SMTP authentication
+- **Custom Headers**: Configurable from address and name
+
+### Email Features
+- **User Notifications**: Email notifications for user management actions
+- **Account Management**: Notifications for account creation, deletion, role changes
+- **Test Functionality**: Built-in email testing for configuration validation
+- **Error Handling**: Comprehensive error handling for email delivery
+
+### Supported SMTP Providers
+- Gmail (smtp.gmail.com:587)
+- SendGrid (smtp.sendgrid.net:587)
+- Mailgun (smtp.mailgun.org:587)
+- Custom SMTP servers
 
 ---
 
@@ -169,19 +215,35 @@ Get farm information and status of all managed servers.
       "url": "http://server1.example.com:8000",
       "arch": "x86_64",
       "status": "online",
+      "health": "healthy",
       "info": {
         "version": "2025-07-16",
         "supported_architecture": "x86_64",
+        "system_info": {
+          "architecture": "x86_64",
+          "cpu": {
+            "cores": 8,
+            "usage_percent": 25.5
+          },
+          "memory": {
+            "total": 16777216,
+            "used": 8388608,
+            "percentage": 50.0
+          },
+          "uptime": "2 days, 5 hours, 30 minutes"
+        },
         "queue_status": {
           "current_builds_count": 1,
           "queued_builds": 2,
-          "max_concurrent_builds": 3
+          "max_concurrent_builds": 3,
+          "buildroot_recreation_count": 0,
+          "server_busy_with_buildroot": false
         }
       }
     }
   ],
-  "available_architectures": ["x86_64", "powerpc64le"],
-  "total_servers": 2,
+  "available_architectures": ["x86_64", "powerpc", "powerpc64le"],
+  "total_servers": 3,
   "authenticated": true,
   "user_role": "user"
 }
@@ -193,7 +255,7 @@ Get farm information and status of all managed servers.
 - **Admin**: Full server URLs and detailed information
 
 #### GET /health
-Health check endpoint for the farm.
+Simple health check endpoint for the farm.
 
 **Response:**
 ```json
@@ -204,34 +266,94 @@ Health check endpoint for the farm.
 ```
 
 #### GET /dashboard
-Get the farm dashboard (HTML page) showing all servers, their current builds, and recent build history.
+Get the comprehensive farm dashboard (HTML page) showing all servers, their current builds, and recent build history.
 
 **Parameters:**
 - `page` (integer, optional): Page number for build history pagination (default: 1)
 
-**Response:** HTML page with:
-- **Server Status by Architecture**: Shows each server grouped by architecture
-- **Currently Running Builds**: Displays up to 3 currently building packages per server with:
-  - Package name (clickable link to build details)
-  - Build start time
-  - "... and X more" indicator if more than 3 builds are running
-- **Server Health Information**: Visual indicators for server status (online/offline/misconfigured)
-- **Queue Information**: Current and queued build counts per server
-- **Recent Build History**: Paginated list of recent builds across all servers
-- **Auto-refresh**: Page refreshes every 10 seconds for real-time updates
+**Response:** Enhanced HTML page with:
 
-**Dashboard Features:**
-- **Real-time Status**: Shows live server health and build activity
-- **Build Monitoring**: Direct links to build status pages for active builds
-- **Architecture Grouping**: Servers organized by their actual supported architecture
-- **Degraded Server Handling**: Special display for servers with health issues
-- **Responsive Design**: Mobile-friendly layout with proper styling
+**Server Status by Architecture**:
+- Servers grouped by their actual supported architecture
+- Real-time health indicators (green=online, red=offline, yellow=misconfigured)
+- Current and queued build counts per server
+- Server version information and uptime
+
+**Currently Running Builds**:
+- Displays up to 3 currently building packages per server with:
+  - Package name (clickable link to build details)
+  - Build start time and duration
+  - User who submitted the build (for authenticated users)
+  - "... and X more" indicator if more than 3 builds are running
+
+**Enhanced Build Monitoring**:
+- **Buildroot Recreation Tracking**: Special indicators for builds performing buildroot recreation
+- **Build Timeout Information**: Shows custom timeout configurations
+- **Architecture-specific Information**: Build architecture clearly displayed
+- **User Attribution**: Shows which user submitted each build (with appropriate permissions)
+
+**Recent Build History**:
+- Paginated list of recent builds across all servers (20 per page)
+- Status-based color coding (green=completed, red=failed, blue=building, gray=cancelled)
+- Build timing information and duration
+- Package names with direct links to build details
+- User information (for authenticated users)
+
+**Advanced Dashboard Features**:
+- **Auto-refresh**: Page refreshes every 10 seconds for real-time updates
+- **Responsive Design**: Mobile-friendly layout with proper CSS styling
+- **Permission-based Display**: Different information levels based on user role
+- **Server Health Details**: Extended server information including system stats
+- **Queue Status**: Real-time queue information and build distribution
 
 **CSS Styling includes:**
-- Color-coded server status (green=online, red=offline, yellow=misconfigured)
-- Styled running builds section with blue accent border
-- Responsive build history with status-based color coding
-- Pagination controls for build history navigation
+- Modern card-based layout for server information
+- Color-coded build status indicators
+- Responsive grid layout for different screen sizes
+- Interactive elements with hover effects
+- Status badges for server health and build states
+
+#### GET /admin
+Get the comprehensive admin panel (Admin Only).
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Response:** Full-featured HTML admin panel with:
+
+**User Management Section**:
+- List all users with roles, creation dates, and last login
+- Create new users with username, password, role, and email
+- Delete users (with confirmation dialogs)
+- Change user roles between 'user' and 'admin'
+- Revoke user tokens for security purposes
+- View user build histories
+
+**SMTP Configuration Section**:
+- Configure email server settings (server, port, authentication)
+- Test email configuration with test messages
+- View current SMTP configuration (passwords hidden)
+- Enable/disable TLS encryption
+- Set custom from address and display name
+
+**Server Management Section**:
+- View detailed server information including health status
+- Monitor server performance and resource usage
+- View server-specific build statistics
+- Access server logs and diagnostic information
+
+**System Statistics**:
+- Overall farm statistics and performance metrics
+- Build distribution across servers and architectures
+- User activity and build submission patterns
+- System health monitoring and alerts
+
+**Admin Panel Features**:
+- **Role-based Security**: Only accessible to admin users
+- **Real-time Updates**: Dynamic content updates without page refresh
+- **Input Validation**: Comprehensive form validation with error messages
+- **Confirmation Dialogs**: Safety confirmations for destructive actions
+- **Mobile Responsive**: Optimized for mobile and tablet access
 
 ---
 
@@ -243,7 +365,16 @@ Submit a build request to the farm (Authentication Required).
 **Request Headers:**
 - `Authorization: Bearer <token>` (required)
 
-**Request:**
+**Request Methods:**
+
+**Method 1: Tarball Upload (Recommended)**
+- **Content-Type:** `multipart/form-data`
+- **Parameters:**
+  - `build_tarball` (file, required): Compressed tarball containing PKGBUILD and sources
+  - `architectures` (string, optional): Comma-separated list of target architectures
+  - `build_timeout` (integer, optional): Build timeout in seconds (300-14400, admin only)
+
+**Method 2: Individual File Upload (Legacy)**
 - **Content-Type:** `multipart/form-data`
 - **Parameters:**
   - `pkgbuild` (file, required): The PKGBUILD file
@@ -258,7 +389,7 @@ Submit a build request to the farm (Authentication Required).
   "status": "queued",
   "message": "Queued 2 build(s) for processing",
   "pkgname": "example-package",
-  "target_architectures": ["x86_64", "powerpc64le"],
+  "target_architectures": ["x86_64", "powerpc"],
   "builds": [
     {
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -266,7 +397,17 @@ Submit a build request to the farm (Authentication Required).
       "status": "queued",
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
-      "created_at": 1642694400.0
+      "created_at": 1642694400.0,
+      "user_id": 2
+    },
+    {
+      "build_id": "7f2a8e9b-1234-5678-9abc-def012345678",
+      "arch": "powerpc",
+      "status": "queued",
+      "pkgname": "example-package",
+      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
+      "created_at": 1642694400.0,
+      "user_id": 2
     }
   ],
   "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
@@ -280,23 +421,28 @@ Submit a build request to the farm (Authentication Required).
 - **User Tracking**: Builds are associated with the submitting user
 - **Permission Checking**: Users can only cancel their own builds (admins can cancel any)
 
-**Error Responses:**
-- **401 Unauthorized**: Authentication required
-- **403 Forbidden**: Insufficient permissions
+**Build Timeout Configuration:**
+- **Default**: 7200 seconds (2 hours)
+- **Range**: 300-14400 seconds (5 minutes to 4 hours)
+- **Admin Only**: Only admin users can specify custom timeouts
+- **Per-Build**: Each build can have a custom timeout
+
+**Enhanced Processing:**
+- **Queue-based**: Builds are queued immediately and processed by background tasks
+- **Background Processing**: Background process redistributes queued builds to available servers
+- **Server Assignment**: Builds assigned to servers based on availability and architecture compatibility
+- **Consistent Tracking**: Farm passes its build ID to the server, ensuring consistent tracking
+- **Retry Logic**: Exponential backoff retry logic for failed submissions
 
 **Architecture Filtering:**
 If `architectures` parameter is provided, only those architectures will be built (if they exist in the PKGBUILD and have available servers).
 
-**Queue-based Processing:**
-1. Builds are queued immediately and processed by background tasks
-2. Background process redistributes queued builds to available servers
-3. Builds are assigned to servers based on availability and architecture compatibility
-4. Farm passes its build ID to the server, ensuring consistent tracking
-5. Retry logic with exponential backoff for failed submissions
-
 **Error Responses:**
+- **401 Unauthorized**: Authentication required
+- **403 Forbidden**: Insufficient permissions (custom timeout without admin role)
 - **503 Service Unavailable**: No suitable server available
-- **400 Bad Request**: Invalid PKGBUILD file
+- **400 Bad Request**: Invalid PKGBUILD file or missing required files
+- **413 Payload Too Large**: Upload exceeds server file size limits
 - **500 Internal Server Error**: Server error
 
 **Architecture Mismatch Error:**
@@ -319,15 +465,17 @@ Get build status. Returns HTML page by default, JSON if `format=json` is specifi
 - `build_id` (string, required): The build ID
 - `format` (string, optional): Response format (`json` or `html`)
 
-**Enhanced Error Handling:**
-- **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
-- **Build Not Found**: If build was never submitted through farm, provides detailed error message
-- **Submission Failed**: If build failed during submission before server assignment
+**Enhanced HTML Response:**
+Returns a comprehensive build status page with:
+- **Real-time Status**: Live updates of build progress
+- **Build Metadata**: Package name, architecture, submission time, user info
+- **Server Information**: Assigned server details and health status
+- **Live Output Streaming**: Real-time build output with auto-scroll
+- **Action Buttons**: Cancel build (if permitted), download artifacts
+- **Progress Indicators**: Build phase tracking and timing information
+- **Error Handling**: Graceful display of server unavailability
 
-**Response (HTML):**
-Forwards to the appropriate server's build status page, or displays cached information with server availability warnings.
-
-**Response (JSON):**
+**Enhanced JSON Response:**
 ```json
 {
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -338,12 +486,33 @@ Forwards to the appropriate server's build status page, or displays cached infor
   "duration": 100.0,
   "server_url": "ser---1",
   "server_arch": "x86_64",
-  "packages": [...],
-  "logs": [...],
+  "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
+  "user_id": 2,
+  "created_at": 1642694300.0,
+  "build_timeout": 7200,
+  "packages": [
+    {
+      "filename": "example-package-1.0.0-1-x86_64.pkg.tar.xz",
+      "size": 1024000,
+      "download_url": "/build/48ea1df5-f7f3-477e-a7a7-36e526ea7cd3/download/example-package-1.0.0-1-x86_64.pkg.tar.xz"
+    }
+  ],
+  "logs": [
+    {
+      "filename": "build.log",
+      "size": 50000,
+      "download_url": "/build/48ea1df5-f7f3-477e-a7a7-36e526ea7cd3/download/build.log"
+    }
+  ],
   "server_unavailable": false,
   "last_status_update": 1642694500.0
 }
 ```
+
+**Enhanced Error Handling:**
+- **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
+- **Build Not Found**: If build was never submitted through farm, provides detailed error message
+- **Submission Failed**: If build failed during submission before server assignment
 
 **Server Unavailable Response:**
 ```json
@@ -369,7 +538,7 @@ Get build status as JSON (alias for `/build/{build_id}/status?format=json`).
 **Response:** Same as `/build/{build_id}/status` with `format=json`.
 
 #### POST /build/{build_id}/cancel
-Cancel a build with permission checking.
+Cancel a build with comprehensive permission checking.
 
 **Request Headers:**
 - `Authorization: Bearer <token>` (required)
@@ -392,10 +561,13 @@ Cancel a build with permission checking.
 **Permission Rules:**
 - **Users**: Can cancel only their own builds
 - **Admins**: Can cancel any user's builds
+- **Build Ownership**: Permission checked against build database user_id
 
-**Error Responses:**
+**Enhanced Error Handling:**
 - **401 Unauthorized**: Authentication required
 - **403 Forbidden**: Not authorized to cancel this build
+- **404 Not Found**: Build not found in database
+- **503 Service Unavailable**: Server unavailable for cancellation request
 
 #### GET /build/{build_id}/output
 Get build output/logs by forwarding to the appropriate server.
@@ -403,7 +575,7 @@ Get build output/logs by forwarding to the appropriate server.
 **Parameters:**
 - `build_id` (string, required): Build UUID
 - `start_index` (integer, optional): Starting line index (default: 0)
-- `limit` (integer, optional): Maximum number of lines (default: 50)
+- `limit` (integer, optional): Maximum number of lines (default: 50, max: 1000)
 
 **Response:**
 ```json
@@ -417,9 +589,15 @@ Get build output/logs by forwarding to the appropriate server.
   ],
   "total_lines": 150,
   "start_index": 0,
-  "returned_lines": 50
+  "returned_lines": 5
 }
 ```
+
+**Enhanced Features:**
+- **Server Forwarding**: Automatically forwards to the correct server
+- **Error Handling**: Handles server unavailability gracefully
+- **Permission Checking**: Respects build visibility permissions
+- **Caching**: Uses cached output when servers are temporarily unavailable
 
 #### GET /build/{build_id}/stream
 Stream build output in real-time by forwarding to the appropriate server.
@@ -431,6 +609,13 @@ Stream build output in real-time by forwarding to the appropriate server.
 - **Content-Type:** `text/event-stream`
 - Forwards Server-Sent Events from the target server
 - Handles server unavailability with appropriate error responses
+- Maintains connection state and error recovery
+
+**Enhanced Streaming Features:**
+- **Connection Management**: Proper cleanup and error handling
+- **Failover Support**: Handles server disconnections gracefully
+- **Authentication**: Respects user permissions for build access
+- **Real-time Forwarding**: Low-latency forwarding of server events
 
 ---
 
@@ -445,11 +630,17 @@ Download a build artifact by forwarding to the appropriate server.
 
 **Response:** Binary file content with appropriate headers.
 
-**Error Handling:**
-- Automatically retries up to 3 times on connection errors
-- Handles server unavailability with detailed error messages
-- Returns 404 if file not found on any server
-- Returns 503 if connection to servers fails
+**Enhanced Error Handling:**
+- **Automatic Retry**: Up to 3 retry attempts on connection errors
+- **Server Discovery**: Attempts to find build on alternative servers if needed
+- **Cache Headers**: Proper caching headers for static content
+- **Range Support**: Passes through range requests for large files
+- **Permission Checking**: Respects build visibility permissions
+
+**Error Responses:**
+- **404 Not Found**: File not found on any server
+- **503 Service Unavailable**: All servers unavailable
+- **403 Forbidden**: Insufficient permissions to access build
 
 ---
 
@@ -472,13 +663,22 @@ Get the latest builds across all managed servers.
       "server_arch": "x86_64",
       "pkgname": "example-package",
       "status": "completed",
-      "start_time": "2024-01-20 10:00:00 UTC",
-      "end_time": "2024-01-20 10:05:00 UTC",
-      "created_at": "2024-01-20 10:00:00 UTC"
+      "start_time": "2024-01-20T10:00:00Z",
+      "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T10:00:00Z",
+      "user_id": 2,
+      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15"
     }
-  ]
+  ],
+  "total": 1
 }
 ```
+
+**Enhanced Features:**
+- **Multi-server Aggregation**: Combines builds from all servers
+- **User Context**: Shows user information where appropriate
+- **Submission Grouping**: Groups related builds from same submission
+- **Status Filtering**: Filter by build status (queued, building, completed, failed, cancelled)
 
 #### GET /my/builds
 Get builds submitted by the current authenticated user.
@@ -501,13 +701,21 @@ Get builds submitted by the current authenticated user.
       "status": "completed",
       "start_time": 1642694400.0,
       "end_time": 1642694500.0,
-      "created_at": 1642694400.0
+      "created_at": 1642694400.0,
+      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
+      "build_timeout": 7200
     }
-  ]
+  ],
+  "total": 1,
+  "user_id": 2
 }
 ```
 
-**Note:** Server URLs are obfuscated for regular users in this endpoint.
+**User-specific Features:**
+- **Personal History**: Shows only builds submitted by the authenticated user
+- **Full Permissions**: User can access all details of their own builds
+- **Submission Groups**: Groups builds from same PKGBUILD submission
+- **Extended Information**: Includes build timeout and detailed timing
 
 ---
 
@@ -533,21 +741,22 @@ Authenticate user and receive access token.
     "username": "your_username",
     "role": "user",
     "created_at": 1642694400.0,
-    "last_login": 1642694400.0
+    "last_login": 1642694400.0,
+    "email": "user@example.com"
   },
   "expires_in_days": 10
 }
 ```
 
+**Enhanced Features:**
+- **Email Support**: User email included in response
+- **Last Login Tracking**: Updates last login timestamp
+- **Detailed User Info**: Complete user profile information
+- **Security Logging**: Login attempts logged for security monitoring
+
 **Error Responses:**
 - **401 Unauthorized**: Invalid username or password
-
-**Usage Example:**
-```bash
-curl -X POST http://localhost:8080/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username": "myuser", "password": "mypassword"}'
-```
+- **400 Bad Request**: Missing or invalid request data
 
 ### POST /auth/logout
 Logout and revoke current authentication token.
@@ -562,7 +771,18 @@ Logout and revoke current authentication token.
 }
 ```
 
-**Note:** This revokes only the current token. User can have multiple active tokens from different sessions.
+**Enhanced Features:**
+- **Token Revocation**: Immediately invalidates the current token
+- **Security Logging**: Logout events logged for audit trail
+- **Session Cleanup**: Cleans up any associated session data
+
+### GET /auth/logout
+Alternative GET endpoint for logout (for web browser redirects).
+
+**Request Headers:**
+- `Authorization: Bearer <token>` (optional)
+
+**Response:** Redirects to dashboard with logout confirmation message.
 
 ### GET /auth/me
 Get current authenticated user information.
@@ -577,12 +797,15 @@ Get current authenticated user information.
   "username": "your_username",
   "role": "user",
   "created_at": 1642694400.0,
-  "last_login": 1642694400.0
+  "last_login": 1642694400.0,
+  "email": "user@example.com"
 }
 ```
 
-**Error Responses:**
-- **401 Unauthorized**: Invalid or expired token
+**Enhanced Features:**
+- **Complete Profile**: Full user profile information
+- **Role Information**: Current user role and permissions
+- **Email Address**: User's email address if configured
 
 ---
 
@@ -602,21 +825,25 @@ List all users in the system.
     "username": "admin",
     "role": "admin",
     "created_at": 1642694400.0,
-    "last_login": 1642694400.0
+    "last_login": 1642694400.0,
+    "email": "admin@example.com"
   },
   {
     "id": 2,
     "username": "user1",
     "role": "user",
     "created_at": 1642694500.0,
-    "last_login": 1642694600.0
+    "last_login": 1642694600.0,
+    "email": "user1@example.com"
   }
 ]
 ```
 
-**Error Responses:**
-- **401 Unauthorized**: Authentication required
-- **403 Forbidden**: Admin access required
+**Enhanced Features:**
+- **Complete User Profiles**: Full user information including email
+- **Activity Tracking**: Last login timestamps
+- **Role Information**: User roles and permissions
+- **Account Status**: Active/inactive status indicators
 
 ### POST /auth/users
 Create a new user account.
@@ -629,7 +856,8 @@ Create a new user account.
 {
   "username": "newuser",
   "password": "securepassword123",
-  "role": "user"
+  "role": "user",
+  "email": "newuser@example.com"
 }
 ```
 
@@ -640,19 +868,22 @@ Create a new user account.
   "username": "newuser",
   "role": "user",
   "created_at": 1642694700.0,
-  "last_login": null
+  "last_login": null,
+  "email": "newuser@example.com"
 }
 ```
 
+**Enhanced Features:**
+- **Email Support**: Optional email address for notifications
+- **Email Notifications**: Automatic email notification to new user (if SMTP configured)
+- **Input Validation**: Comprehensive validation of all fields
+- **Duplicate Detection**: Prevents duplicate usernames
+
 **Validation Rules:**
-- Username: 3-50 characters, unique
+- Username: 3-50 characters, unique, alphanumeric and underscore only
 - Password: 8-100 characters minimum
 - Role: "user" or "admin"
-
-**Error Responses:**
-- **400 Bad Request**: Invalid username, password, or role
-- **401 Unauthorized**: Authentication required
-- **403 Forbidden**: Admin access required
+- Email: Valid email format, optional
 
 ### DELETE /auth/users/{user_id}
 Delete a user account (soft delete - marks as inactive).
@@ -670,13 +901,12 @@ Delete a user account (soft delete - marks as inactive).
 }
 ```
 
-**Error Responses:**
-- **400 Bad Request**: Cannot delete yourself
-- **401 Unauthorized**: Authentication required
-- **403 Forbidden**: Admin access required
-- **404 Not Found**: User not found
-
-**Note:** This performs a soft delete (marks user as inactive) and revokes all user tokens.
+**Enhanced Features:**
+- **Soft Delete**: Marks user as inactive rather than hard delete
+- **Token Revocation**: Automatically revokes all user tokens
+- **Email Notification**: Sends email notification to user (if configured)
+- **Build History Preservation**: Preserves user's build history for audit purposes
+- **Self-Protection**: Prevents admin from deleting their own account
 
 ### PUT /auth/users/{user_id}/role
 Change user role.
@@ -701,11 +931,64 @@ Change user role.
 }
 ```
 
-**Error Responses:**
-- **400 Bad Request**: Invalid role
-- **401 Unauthorized**: Authentication required
-- **403 Forbidden**: Admin access required
-- **404 Not Found**: User not found
+**Enhanced Features:**
+- **Email Notification**: Notifies user of role change via email
+- **Audit Logging**: Logs role changes for security audit
+- **Permission Updates**: Immediately updates user permissions
+- **Validation**: Prevents invalid role assignments
+
+### PUT /auth/users/{user_id}/email
+Update user email address (Admin Only).
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Parameters:**
+- `user_id` (integer): User ID to modify
+
+**Request:**
+```json
+{
+  "email": "newemail@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "User email updated successfully"
+}
+```
+
+**Enhanced Features:**
+- **Email Validation**: Validates email format
+- **Notification**: Sends confirmation to both old and new email addresses
+- **Null Support**: Allows setting email to null to remove it
+
+### PUT /auth/my/email
+Update own email address (User/Admin).
+
+**Request Headers:**
+- `Authorization: Bearer <token>` (required)
+
+**Request:**
+```json
+{
+  "email": "mynewemail@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Email updated successfully"
+}
+```
+
+**Features:**
+- **Self-Service**: Users can update their own email
+- **Email Validation**: Validates email format
+- **Confirmation**: Sends confirmation to new email address
 
 ### POST /auth/users/{user_id}/revoke-tokens
 Revoke all authentication tokens for a user.
@@ -723,6 +1006,12 @@ Revoke all authentication tokens for a user.
 }
 ```
 
+**Enhanced Features:**
+- **Complete Revocation**: Revokes all active tokens for the user
+- **Force Logout**: Immediately logs out user from all sessions
+- **Security Logging**: Logs token revocation for audit purposes
+- **Email Notification**: Notifies user of forced logout
+
 ### GET /auth/users/{user_id}/builds
 Get build history for a specific user.
 
@@ -736,6 +1025,8 @@ Get build history for a specific user.
 **Response:**
 ```json
 {
+  "user_id": 2,
+  "username": "user1",
   "builds": [
     {
       "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -745,226 +1036,246 @@ Get build history for a specific user.
       "status": "completed",
       "start_time": 1642694400.0,
       "end_time": 1642694500.0,
-      "created_at": 1642694400.0
+      "created_at": 1642694400.0,
+      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15"
     }
-  ]
+  ],
+  "total": 1
 }
 ```
 
+**Admin Features:**
+- **Full Access**: Admins see unobfuscated server URLs
+- **Complete History**: Access to all user builds regardless of status
+- **User Context**: Includes username and user information
+- **Detailed Information**: Full build metadata and timing
 
+### PUT /auth/change-password
+Change current user's password.
 
-#### GET /build/{build_id}/status
-Get build status. Returns HTML page by default, JSON if `format=json` is specified.
+**Request Headers:**
+- `Authorization: Bearer <token>` (required)
 
-**Parameters:**
-- `build_id` (string, required): The build ID
-- `format` (string, optional): Response format (`json` or `html`)
-
-**Enhanced Error Handling:**
-- **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
-- **Build Not Found**: If build was never submitted through farm, provides detailed error message
-- **Submission Failed**: If build failed during submission before server assignment
-
-**Response (HTML):**
-Forwards to the appropriate server's build status page, or displays cached information with server availability warnings.
-
-**Response (JSON):**
+**Request:**
 ```json
 {
-  "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-  "pkgname": "example-package",
-  "status": "completed",
-  "start_time": 1642694400.0,
-  "end_time": 1642694500.0,
-  "duration": 100.0,
-  "server_url": "ser---1",
-  "server_arch": "x86_64",
-  "packages": [...],
-  "logs": [...],
-  "server_unavailable": false,
-  "last_status_update": 1642694500.0
+  "current_password": "currentpass123",
+  "new_password": "newpassword456",
+  "confirm_password": "newpassword456"
 }
 ```
 
-**Server Unavailable Response:**
+**Response:**
 ```json
 {
-  "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-  "pkgname": "example-package",
-  "status": "building",
-  "server_unavailable": true,
-  "last_status_update": 1642694450.0,
-  "server_url": "ser---1",
-  "error_message": "Server unavailable: Connection timeout"
+  "message": "Password changed successfully"
 }
 ```
 
-**Note:** Server URLs are obfuscated in responses for security (e.g., `server1.example.com` → `ser---1`).
+**Enhanced Security Features:**
+- **Current Password Verification**: Requires current password for security
+- **Password Confirmation**: Requires new password confirmation
+- **Token Revocation**: Optionally revokes other tokens after password change
+- **Email Notification**: Sends email notification of password change
+- **Security Logging**: Logs password changes for security audit
 
-#### GET /build/{build_id}/status-api
-Get build status as JSON (alias for `/build/{build_id}/status?format=json`).
+---
 
-**Parameters:**
-- `build_id` (string, required): The build ID
+## SMTP Configuration Endpoints (Admin Only)
 
-**Response:** Same as `/build/{build_id}/status` with `format=json`.
+### GET /admin/smtp
+Get current SMTP configuration.
 
-#### POST /build/{build_id}/cancel
-Cancel a build by forwarding the request to the appropriate server.
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
 
-**Parameters:**
-- `build_id` (string, required): The build ID
+**Response:**
+```json
+{
+  "id": 1,
+  "server": "smtp.gmail.com",
+  "port": 587,
+  "username": "your-email@gmail.com",
+  "use_tls": true,
+  "from_email": "noreply@yourcompany.com",
+  "from_name": "APB Farm",
+  "created_at": 1642694400.0,
+  "updated_at": 1642694500.0
+}
+```
+
+**Security Note:** Password is never returned in API responses.
+
+### POST /admin/smtp
+Configure SMTP settings.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Request:**
+```json
+{
+  "server": "smtp.gmail.com",
+  "port": 587,
+  "username": "your-email@gmail.com",
+  "password": "your-app-password",
+  "use_tls": true,
+  "from_email": "noreply@yourcompany.com",
+  "from_name": "APB Farm"
+}
+```
+
+**Response:**
+```json
+{
+  "id": 1,
+  "server": "smtp.gmail.com",
+  "port": 587,
+  "username": "your-email@gmail.com",
+  "use_tls": true,
+  "from_email": "noreply@yourcompany.com",
+  "from_name": "APB Farm",
+  "created_at": 1642694400.0,
+  "updated_at": 1642694600.0
+}
+```
+
+**Enhanced Features:**
+- **Password Security**: Passwords are securely encrypted before storage
+- **Configuration Validation**: Validates SMTP settings before saving
+- **TLS Support**: Configurable TLS encryption
+- **Custom Headers**: Configurable from address and display name
+- **Update Tracking**: Tracks when configuration was last updated
+
+**Supported SMTP Providers:**
+- **Gmail**: smtp.gmail.com:587 (requires app password)
+- **SendGrid**: smtp.sendgrid.net:587
+- **Mailgun**: smtp.mailgun.org:587
+- **Office 365**: smtp.office365.com:587
+- **Custom SMTP**: Any standard SMTP server
+
+### DELETE /admin/smtp
+Delete SMTP configuration.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Response:**
+```json
+{
+  "message": "SMTP configuration deleted successfully"
+}
+```
+
+**Features:**
+- **Complete Removal**: Removes all SMTP configuration
+- **Disables Notifications**: Automatically disables email notifications
+- **Security Cleanup**: Securely wipes stored passwords
+
+### POST /admin/smtp/test
+Test SMTP configuration by sending a test email.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Request:**
+```json
+{
+  "test_email": "admin@example.com"
+}
+```
 
 **Response:**
 ```json
 {
   "success": true,
-  "message": "Build 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3 cancelled successfully",
-  "server_response": {
-    "success": true,
-    "message": "Build cancelled successfully"
-  }
+  "message": "Test email sent successfully to admin@example.com"
 }
 ```
 
-**Enhanced Error Handling:**
-- Handles server unavailability gracefully
-- Updates local database when cancellation succeeds
-- Provides detailed error messages for troubleshooting
-
-#### GET /build/{build_id}/output
-Get build output/logs by forwarding to the appropriate server.
-
-**Parameters:**
-- `build_id` (string, required): Build UUID
-- `start_index` (integer, optional): Starting line index (default: 0)
-- `limit` (integer, optional): Maximum number of lines (default: 50)
-
-**Response:**
+**Error Response:**
 ```json
 {
-  "output": [
-    "==> Making package: example-package 1.0.0-1 (x86_64)",
-    "==> Checking runtime dependencies...",
-    "==> Installing missing dependencies...",
-    "==> Starting build()...",
-    "==> Build completed successfully"
-  ],
-  "total_lines": 150,
-  "start_index": 0,
-  "returned_lines": 50
+  "success": false,
+  "error": "SMTP connection failed",
+  "detail": "Authentication failed: Invalid credentials"
 }
 ```
 
-#### GET /build/{build_id}/stream
-Stream build output in real-time by forwarding to the appropriate server.
-
-**Parameters:**
-- `build_id` (string, required): Build UUID
-
-**Response:**
-- **Content-Type:** `text/event-stream`
-- Forwards Server-Sent Events from the target server
-- Handles server unavailability with appropriate error responses
-
----
-
-### File Downloads
-
-#### GET /build/{build_id}/download/{filename}
-Download a build artifact by forwarding to the appropriate server.
-
-**Parameters:**
-- `build_id` (string, required): Build UUID
-- `filename` (string, required): The filename to download
-
-**Response:** Binary file content with appropriate headers.
-
-**Error Handling:**
-- Automatically retries up to 3 times on connection errors
-- Handles server unavailability with detailed error messages
-- Returns 404 if file not found on any server
-- Returns 503 if connection to servers fails
-
----
-
-### Build History
-
-#### GET /builds/latest
-Get the latest builds across all managed servers.
-
-**Parameters:**
-- `limit` (integer, optional): Maximum number of builds (default: 20, max: 100)
-- `status` (string, optional): Filter by status
-
-**Response:**
-```json
-{
-  "builds": [
-    {
-      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-      "server_url": "ser---1",
-      "server_arch": "x86_64",
-      "pkgname": "example-package",
-      "status": "completed",
-      "start_time": "2024-01-20 10:00:00 UTC",
-      "end_time": "2024-01-20 10:05:00 UTC",
-      "created_at": "2024-01-20 10:00:00 UTC"
-    }
-  ]
-}
-```
+**Test Features:**
+- **Live Testing**: Actually sends a test email to verify configuration
+- **Error Details**: Provides detailed error messages for troubleshooting
+- **Connection Validation**: Tests SMTP server connectivity and authentication
+- **TLS Testing**: Validates TLS encryption if enabled
 
 ---
 
 ## Build Database Schema
 
-The farm maintains a SQLite database with comprehensive build tracking:
+The farm maintains a comprehensive SQLite database with full build tracking:
 
-### Builds Table Schema
+### Enhanced Builds Table Schema
 ```sql
 CREATE TABLE builds (
     id TEXT PRIMARY KEY,                -- Build UUID
     server_url TEXT,                   -- Assigned server URL
     server_arch TEXT,                  -- Target architecture
-    pkgname TEXT,                      -- Package name
+    pkgname TEXT,                      -- Package name from PKGBUILD
     status TEXT,                       -- Current build status
     start_time REAL,                   -- Build start timestamp
     end_time REAL,                     -- Build completion timestamp
     created_at REAL,                   -- Submission timestamp
     queue_position INTEGER,            -- Position in queue when submitted
-    submission_group TEXT,             -- Group ID for related builds
+    submission_group TEXT,             -- Group ID for related builds from same submission
     last_known_status TEXT,            -- Last known status from server
     last_status_update REAL,           -- Last status check timestamp
     server_available BOOLEAN DEFAULT 1, -- Server availability flag
-    cached_response TEXT               -- Cached server response (JSON)
+    cached_response TEXT,              -- Cached server response (JSON)
+    user_id INTEGER,                   -- User who submitted the build
+    build_timeout INTEGER DEFAULT 7200, -- Custom build timeout in seconds
+    FOREIGN KEY (user_id) REFERENCES users (id)
 );
+
+-- Database indexes for performance
+CREATE INDEX idx_builds_user ON builds(user_id);
+CREATE INDEX idx_builds_status ON builds(status);
+CREATE INDEX idx_builds_created_at ON builds(created_at);
+CREATE INDEX idx_builds_submission_group ON builds(submission_group);
+CREATE INDEX idx_builds_server_arch ON builds(server_arch);
 ```
 
 ### Database Features
 - **Build Tracking**: Complete history of all builds across all servers
+- **User Attribution**: Links builds to submitting users
 - **Server Availability**: Tracks which servers are currently available
 - **Status Caching**: Caches server responses for offline access
 - **Submission Grouping**: Links related builds from same PKGBUILD submission
 - **Queue Management**: Tracks build queue positions and timing
+- **Custom Timeouts**: Stores per-build timeout configurations
 
 ---
 
 ## Authentication Database Schema
 
-The farm authentication system uses the following database tables:
+The farm authentication system uses comprehensive database tables:
 
 ### Users Table
 ```sql
 CREATE TABLE users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,           -- PBKDF2-hashed password
+    password_hash TEXT NOT NULL,           -- PBKDF2-hashed password with salt
     role TEXT NOT NULL DEFAULT 'user',     -- 'user' or 'admin'
     created_at REAL NOT NULL,              -- Unix timestamp
     last_login REAL,                       -- Unix timestamp
+    email TEXT,                            -- User email address
     is_active BOOLEAN DEFAULT 1            -- Soft delete flag
 );
+
+-- Indexes for performance
+CREATE INDEX idx_users_username ON users(username);
+CREATE INDEX idx_users_role ON users(role);
+CREATE INDEX idx_users_active ON users(is_active);
 ```
 
 ### Tokens Table
@@ -979,117 +1290,187 @@ CREATE TABLE tokens (
     is_active BOOLEAN DEFAULT 1,           -- Token active flag
     FOREIGN KEY (user_id) REFERENCES users (id)
 );
+
+-- Indexes for performance
+CREATE INDEX idx_tokens_hash ON tokens(token_hash);
+CREATE INDEX idx_tokens_user ON tokens(user_id);
+CREATE INDEX idx_tokens_expires ON tokens(expires_at);
+CREATE INDEX idx_tokens_active ON tokens(is_active);
 ```
 
-### Enhanced Builds Table
-The existing builds table has been extended with user tracking:
+### SMTP Configuration Table
 ```sql
-ALTER TABLE builds ADD COLUMN user_id INTEGER;  -- Links builds to users
-CREATE INDEX idx_builds_user ON builds(user_id);
+CREATE TABLE smtp_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server TEXT NOT NULL,                  -- SMTP server hostname
+    port INTEGER NOT NULL,                 -- SMTP server port
+    username TEXT,                         -- SMTP username (optional)
+    password TEXT,                         -- Encrypted SMTP password (optional)
+    use_tls BOOLEAN DEFAULT 1,             -- Use TLS encryption
+    from_email TEXT,                       -- From email address
+    from_name TEXT,                        -- From display name
+    created_at REAL NOT NULL,              -- Unix timestamp
+    updated_at REAL NOT NULL               -- Unix timestamp
+);
 ```
 
 ### Security Features
 
-- **Password Security**: PBKDF2 with 100,000 iterations and random salt
-- **Token Security**: SHA-256 hashing for storage, secure random generation
-- **Database Indexes**: Optimized for authentication performance
+- **Password Security**: PBKDF2 with 100,000 iterations and random salt per password
+- **Token Security**: SHA-256 hashing for storage, cryptographically secure random generation
+- **Email Encryption**: SMTP passwords encrypted before database storage
+- **Database Indexes**: Optimized for authentication and query performance
 - **Automatic Cleanup**: Background task removes expired tokens every hour
+- **Foreign Key Constraints**: Maintains data integrity between users and tokens
 
 ---
 
 ## Background Tasks
 
-The farm runs several background tasks for maintaining system health:
+The farm runs several sophisticated background tasks for maintaining system health:
 
 ### Process Build Queue
-- **Frequency**: Continuous with 5-second intervals
+- **Frequency**: Continuous with 5-second intervals when builds are queued
 - **Function**: Processes queued builds and assigns them to available servers
 - **Features**:
-  - Exponential backoff retry logic
-  - Server availability checking
-  - Load balancing across servers
-  - Architecture compatibility validation
+  - **Exponential Backoff**: Retry logic with increasing delays for failed submissions
+  - **Server Health**: Checks server availability and health before assignment
+  - **Load Balancing**: Distributes builds across available servers
+  - **Architecture Validation**: Ensures server supports required architecture
+  - **Timeout Handling**: Respects custom build timeouts
+  - **Error Recovery**: Handles server failures gracefully
 
 ### Update Build Status
-- **Frequency**: Every 120 seconds
-- **Function**: Updates status for all active builds
+- **Frequency**: Every 120 seconds for all active builds
+- **Function**: Updates status for all active builds from their assigned servers
 - **Features**:
-  - Concurrent status checking for performance
-  - Error isolation to prevent one failure from blocking others
-  - Database updates with comprehensive status information
+  - **Concurrent Processing**: Uses asyncio for parallel status updates
+  - **Error Isolation**: One server failure doesn't block updates for other servers
+  - **Status Caching**: Caches responses for offline access
+  - **Database Updates**: Maintains comprehensive build status in database
+  - **Server Health Tracking**: Updates server health based on response patterns
 
 ### Discover Builds
-- **Frequency**: Every 300 seconds
-- **Function**: Discovers builds directly submitted to servers
+- **Frequency**: Every 300 seconds across all configured servers
+- **Function**: Discovers builds directly submitted to servers (bypassing farm)
 - **Features**:
-  - Automatic discovery of builds not submitted through farm
-  - Database synchronization with server build lists
-  - Historical build data collection
+  - **Automatic Discovery**: Finds builds not submitted through farm
+  - **Database Synchronization**: Adds discovered builds to farm database
+  - **Historical Data**: Collects historical build data from servers
+  - **Architecture Tracking**: Maintains accurate architecture information
+  - **Orphan Detection**: Identifies builds without user attribution
 
 ### Handle Unavailable Servers
-- **Frequency**: Every 120 seconds
+- **Frequency**: Every 120 seconds for health monitoring
 - **Function**: Manages builds on servers that become unavailable
 - **Features**:
-  - Detects builds on unavailable servers
-  - Attempts final status updates before marking as lost
-  - Automatically fails builds on servers unavailable for >30 minutes
+  - **Availability Detection**: Identifies servers that have become unavailable
+  - **Final Status Attempts**: Tries to get final status before marking as lost
+  - **Automatic Failure**: Marks builds as failed after 30 minutes of server unavailability
+  - **Recovery Detection**: Automatically detects when servers come back online
+  - **Health State Management**: Updates server health states appropriately
+
+### Cleanup Expired Tokens
+- **Frequency**: Every 3600 seconds (1 hour)
+- **Function**: Removes expired authentication tokens from database
+- **Features**:
+  - **Automatic Cleanup**: Removes tokens past their expiration time
+  - **Performance Optimization**: Prevents token table from growing indefinitely
+  - **Security Maintenance**: Ensures old tokens cannot be used
+  - **Database Optimization**: Maintains optimal database performance
 
 ---
 
 ## Error Handling
 
-The farm provides robust error handling and fallback mechanisms:
+The farm provides comprehensive error handling and fallback mechanisms:
 
 ### HTTP Status Codes
 - **200 OK**: Request successful
-- **404 Not Found**: Build not found on any server
+- **400 Bad Request**: Invalid request data or malformed parameters
+- **401 Unauthorized**: Authentication required or invalid token
+- **403 Forbidden**: Insufficient permissions for requested action
+- **404 Not Found**: Build not found on any server or resource not found
+- **413 Payload Too Large**: Upload exceeds server or farm file size limits
 - **503 Service Unavailable**:
   - No suitable server available for architecture
   - All servers for architecture are offline
   - Connection errors to servers
 - **500 Internal Server Error**: Farm internal error
 
-### Error Response Format
+### Enhanced Error Response Format
 ```json
 {
   "error": "Build not found",
-  "detail": "Build with ID '48ea1df5-f7f3-477e-a7a7-36e526ea7cd3' not found on any server"
+  "detail": "Build with ID '48ea1df5-f7f3-477e-a7a7-36e526ea7cd3' not found on any server",
+  "error_type": "build_not_found",
+  "timestamp": "2024-01-20T10:00:00Z"
+}
+```
+
+### Authentication Error Responses
+```json
+{
+  "error": "Authentication required",
+  "detail": "This endpoint requires authentication. Please provide a valid Bearer token."
+}
+```
+
+```json
+{
+  "error": "Insufficient permissions",
+  "detail": "Admin role required to perform this action"
 }
 ```
 
 ### Fallback Mechanisms
 - **Cached Responses**: Uses cached data when servers are temporarily unavailable
-- **Automatic Retry**: Exponential backoff for server connections
+- **Automatic Retry**: Exponential backoff retry logic for server connections
 - **Graceful Degradation**: Continues operation when some servers are unavailable
 - **Health Recovery**: Automatically detects when servers come back online
-
-### Server Unavailability Handling
-- **Temporary Outages**: Uses cached status information
-- **Extended Outages**: Marks builds as failed after 30 minutes
-- **Partial Failures**: Continues serving available servers while others recover
 - **Error Isolation**: Server failures don't affect other servers or farm operation
 
----
-
-## Real-time Updates
-
-The farm provides real-time monitoring of builds across all servers:
-
-### Background Tasks
-- **Server Status Refresh**: Every 90 seconds with enhanced caching
-- **Build Status Updates**: Every 120 seconds with concurrent processing
-- **Build Discovery**: Every 300 seconds across all servers
-- **Server Health Monitoring**: Continuous with failure tracking
-
-### Dashboard Updates
-- **Auto-refresh**: Every 10 seconds when viewing active builds
-- **Live Build Display**: Shows currently running builds per server
-- **Real-time Status**: Updates build and server status indicators
-- **Health Indicators**: Visual feedback for server health states
+### Server Health Error Handling
+- **Connection Timeouts**: 30-second timeout for server connections
+- **HTTP Error Codes**: Special handling for 502 (server busy) vs other errors
+- **Consecutive Failure Tracking**: Marks servers as degraded after 5 failures
+- **Architecture Mismatch**: Handles servers reporting wrong architecture
+- **Persistent Errors**: Marks servers as MISCONFIGURED for persistent issues
 
 ---
 
-## Configuration
+## Real-time Updates and Monitoring
+
+The farm provides comprehensive real-time monitoring across all components:
+
+### Enhanced Dashboard Updates
+- **Auto-refresh**: Every 10 seconds for active build monitoring
+- **Live Build Display**: Shows currently running builds per server with real-time updates
+- **Server Health Indicators**: Visual indicators update in real-time
+- **Queue Status**: Real-time queue information and server capacity
+- **User Activity**: Real-time display of user submissions and activity
+
+### Build Status Monitoring
+- **Real-time Streaming**: Live build output streaming from servers
+- **Status Propagation**: Immediate status updates from servers to farm database
+- **Progress Tracking**: Real-time progress indicators for active builds
+- **Completion Notifications**: Immediate notification when builds complete
+
+### Server Health Monitoring
+- **Continuous Monitoring**: Real-time server health and availability tracking
+- **Health State Transitions**: Immediate updates when servers change health state
+- **Performance Metrics**: Real-time monitoring of server load and capacity
+- **Alert Generation**: Automatic alerts for server health issues
+
+### Background Task Monitoring
+- **Task Status**: Monitoring of all background task execution
+- **Performance Metrics**: Execution time and success rate tracking
+- **Error Tracking**: Comprehensive error logging and monitoring
+- **Resource Usage**: Monitoring of background task resource consumption
+
+---
+
+## Configuration and Deployment
 
 ### Configuration File Locations
 The farm searches for configuration files in this order:
@@ -1098,14 +1479,36 @@ The farm searches for configuration files in this order:
 3. `~/.apb/apb.json` (user home)
 4. `~/.apb-farm/apb.json` (farm-specific)
 
-### Configuration Schema
+### Enhanced Configuration Schema
 ```json
 {
   "servers": {
-    "architecture_name": [
-      "http://server1:port",
-      "http://server2:port"
+    "x86_64": [
+      "http://server1.example.com:8000",
+      "http://server2.example.com:8000"
+    ],
+    "powerpc": [
+      "http://powerpc-server.example.com:8000"
+    ],
+    "powerpc64le": [
+      "http://ppc64le-server.example.com:8000"
+    ],
+    "aarch64": [
+      "http://arm-server.example.com:8000"
     ]
+  },
+  "database": {
+    "path": "./apb-farm.db",
+    "backup_interval": 3600
+  },
+  "security": {
+    "token_expiry_days": 10,
+    "max_login_attempts": 5,
+    "require_email": false
+  },
+  "notifications": {
+    "smtp_enabled": true,
+    "admin_notifications": true
   }
 }
 ```
@@ -1115,47 +1518,75 @@ The farm searches for configuration files in this order:
 - `--port`: Port to listen on (default: 8080)
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 - `--config`: Path to specific config file
+- `--database`: Path to SQLite database file
+- `--no-auth`: Disable authentication (development only)
+
+### Environment Variables
+- `APB_FARM_HOST`: Override host setting
+- `APB_FARM_PORT`: Override port setting
+- `APB_FARM_CONFIG`: Override config file path
+- `APB_FARM_DATABASE`: Override database file path
+- `APB_FARM_LOG_LEVEL`: Override log level
 
 ---
 
 ## Security Considerations
 
-### Server URL Obfuscation
-- Server URLs are obfuscated in API responses
-- Format: `{first_3_chars}---{last_char}` (e.g., `ser---1`)
-- Prevents exposure of internal server addresses
+### Authentication Security
+- **Token-based Authentication**: Secure Bearer token system with automatic expiration
+- **Password Security**: PBKDF2 hashing with salt for password storage
+- **Role-based Access Control**: Granular permissions based on user roles
+- **Token Management**: Automatic cleanup of expired tokens
+- **Session Security**: Secure token generation and validation
 
-### Access Control
-- No authentication currently implemented
-- All endpoints are publicly accessible
-- Consider implementing authentication for production deployments
+### Server URL Obfuscation
+- **URL Protection**: Server URLs are obfuscated in API responses for non-admin users
+- **Format**: `{first_3_chars}---{last_char}` (e.g., `ser---1`)
+- **Internal Network Protection**: Prevents exposure of internal server addresses
+- **Admin Access**: Full URLs visible to admin users only
 
 ### Network Security
-- Farm acts as a proxy, hiding individual server addresses
-- Centralizes access control point
-- Can be placed behind reverse proxy for additional security
+- **Proxy Architecture**: Farm acts as a secure proxy to individual servers
+- **Centralized Access Control**: Single point for authentication and authorization
+- **Internal Network Isolation**: Servers can be deployed on internal networks
+- **HTTPS Support**: Can be deployed behind HTTPS reverse proxy
+
+### Data Protection
+- **Database Encryption**: Sensitive data encrypted before storage
+- **Audit Logging**: Comprehensive logging of security-relevant events
+- **Input Validation**: All inputs validated to prevent injection attacks
+- **Error Information**: Error messages don't leak sensitive information
 
 ---
 
 ## Monitoring and Observability
 
-### Logging
-- Comprehensive logging with configurable levels
-- Separate log files for different components
-- Request/response logging for debugging
-- Enhanced server health tracking logs
+### Comprehensive Logging
+- **Structured Logging**: JSON-formatted logs with structured data
+- **Security Logging**: Authentication, authorization, and security events
+- **Performance Logging**: Request timing and performance metrics
+- **Error Logging**: Detailed error information with stack traces
+- **Audit Logging**: User actions and administrative changes
 
-### Metrics
-- Server availability tracking with health states
-- Build distribution across servers
-- Performance metrics for server selection
-- Queue processing performance monitoring
+### Metrics and Analytics
+- **Server Health Metrics**: Availability, response time, and error rates
+- **Build Metrics**: Build distribution, success rates, and timing
+- **User Activity**: Login patterns, build submissions, and usage statistics
+- **Performance Metrics**: API response times and throughput
+- **System Health**: Database performance and background task execution
 
-### Health Checks
-- Individual server health monitoring with failure tracking
-- Farm-level health status
-- Automatic server discovery and recovery
-- Enhanced error reporting and diagnostics
+### Health Monitoring
+- **Endpoint Health**: Individual server health monitoring
+- **Farm Health**: Overall farm health and status
+- **Database Health**: Database connectivity and performance
+- **Background Task Health**: Monitoring of all background processes
+- **Resource Monitoring**: Memory, CPU, and disk usage tracking
+
+### Alerting and Notifications
+- **Email Notifications**: User management and system events
+- **Health Alerts**: Automatic alerts for server health issues
+- **Performance Alerts**: Notifications for performance degradation
+- **Security Alerts**: Notifications for security-relevant events
 
 ---
 
@@ -1163,29 +1594,62 @@ The farm searches for configuration files in this order:
 
 ### Backward Compatibility
 
-- **Existing Endpoints**: All existing endpoints remain functional
+- **API Compatibility**: All existing endpoints remain functional
 - **Guest Access**: Unauthenticated users can still view dashboard and public information
-- **API Compatibility**: No breaking changes to existing API contracts
+- **Client Compatibility**: Existing clients continue to work without modification
+- **Configuration Compatibility**: Existing configuration files remain valid
 
 ### Migration Path
 
-1. **Install Updated Farm**: Deploy new farm version with authentication
-2. **Default Admin**: Use default admin account (admin/admin123) for initial setup
-3. **Create Users**: Create user accounts for team members
-4. **Update Clients**: Update client configurations with authentication
-5. **Security Hardening**: Change default admin password, configure HTTPS
+1. **Install Updated Farm**: Deploy new farm version with authentication system
+2. **Database Migration**: Automatic database schema migration on first startup
+3. **Default Admin Setup**: Use default admin account (admin/admin123) for initial setup
+4. **User Account Creation**: Create user accounts for team members
+5. **Client Migration**: Update client tools with authentication tokens
+6. **Security Hardening**: Change default admin password, configure HTTPS
 
-### Environment-Specific Deployment
+### Deployment Scenarios
 
-#### Development
+#### Development Environment
 ```bash
-# Use default settings with HTTP
-apb-farm.py --host localhost --port 8080
+# Simple development setup
+apb-farm.py --host localhost --port 8080 --log-level DEBUG
 ```
 
-#### Production
+#### Production Environment
 ```bash
-# Use HTTPS reverse proxy, secure settings
-apb-farm.py --host 0.0.0.0 --port 8080
+# Production setup with authentication
+apb-farm.py --host 0.0.0.0 --port 8080 --log-level INFO
 # Configure nginx/apache for HTTPS termination
+# Set up proper firewall rules
+# Configure backup procedures for database
+```
+
+#### High Availability Setup
+```bash
+# Multiple farm instances with shared database
+apb-farm.py --host 0.0.0.0 --port 8080 --database /shared/apb-farm.db
+# Configure load balancer for multiple farm instances
+# Set up database replication and backup
+# Monitor all instances for health and performance
+```
+
+### Client Migration
+
+#### Legacy Clients (No Authentication)
+- Continue to work for read-only operations
+- Build submission requires authentication
+
+#### Updated Clients (With Authentication)
+```bash
+# Login to get token
+TOKEN=$(curl -X POST http://farm:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"myuser","password":"mypass"}' | jq -r .token)
+
+# Submit build with authentication
+curl -X POST http://farm:8080/build \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "pkgbuild=@PKGBUILD" \
+  -F "sources=@source.tar.gz"
 ```

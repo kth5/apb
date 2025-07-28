@@ -1547,10 +1547,15 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     build_database.commit()
 
 
-async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = 7200) -> List[Dict]:
+async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = 7200, original_tarball: Optional[bytes] = None) -> List[Dict]:
     """
     Queue builds for each architecture that has available servers.
-    Returns a list of build information dictionaries.
+
+    Args:
+        original_tarball: Contains original client tarball for direct forwarding (avoids recreation)
+
+    Returns:
+        List of build information dictionaries.
     """
     submission_group = str(uuid.uuid4())  # Group ID to track related builds
     queued_builds = []
@@ -1647,7 +1652,8 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             "status": BuildStatus.QUEUED,
             "submission_group": submission_group,
             "arch": arch,
-            "build_timeout": build_timeout
+            "build_timeout": build_timeout,
+            "original_tarball": original_tarball
         }
 
         build_queue.append(build_info)
@@ -1775,98 +1781,115 @@ async def process_build_queue():
 async def forward_build_to_server(build_info: Dict, server_url: str):
     """Forward a build to a specific server using tarball format"""
     build_id = build_info["build_id"]
+    temp_tarball_path = None
 
     try:
-        # Create temporary tarball with all build files
         import tempfile
-        import tarfile
 
-        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
-            try:
-                with tarfile.open(temp_tarball.name, 'w:gz') as tar:
-                    # Add PKGBUILD
-                    pkgbuild_info = tarfile.TarInfo(name='PKGBUILD')
-                    pkgbuild_content = build_info["pkgbuild_content"].encode('utf-8')
-                    pkgbuild_info.size = len(pkgbuild_content)
-                    tar.addfile(pkgbuild_info, io.BytesIO(pkgbuild_content))
+        # Use original tarball if available (optimal), otherwise recreate from source_files (legacy compatibility)
+        if build_info.get("original_tarball"):
+            # Write original tarball to temporary file
+            with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
+                temp_tarball.write(build_info["original_tarball"])
+                temp_tarball.flush()
+                temp_tarball_path = temp_tarball.name
+        else:
+            # Fallback: Create temporary tarball from source_files (only for legacy individual file submissions)
+            import tarfile
+            with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
+                temp_tarball_path = temp_tarball.name
+                # Create a temporary directory for build files
+                with tempfile.TemporaryDirectory() as temp_build_dir:
+                    temp_build_path = Path(temp_build_dir)
 
-                    # Add source files
+                    # Write PKGBUILD to real file
+                    pkgbuild_path = temp_build_path / "PKGBUILD"
+                    with open(pkgbuild_path, 'w', encoding='utf-8') as f:
+                        f.write(build_info["pkgbuild_content"])
+
+                    # Write source files to real files (legacy individual file submissions only)
                     for source_file in build_info.get("source_files", []):
-                        file_info = tarfile.TarInfo(name=source_file["filename"])
+                        source_path = temp_build_path / source_file["filename"]
                         file_content = source_file["content"]
                         if isinstance(file_content, str):
-                            file_content = file_content.encode('utf-8')
-                        file_info.size = len(file_content)
-                        tar.addfile(file_info, io.BytesIO(file_content))
+                            with open(source_path, 'w', encoding='utf-8') as f:
+                                f.write(file_content)
+                        else:
+                            with open(source_path, 'wb') as f:
+                                f.write(file_content)
 
-                # Create form data with tarball
-                data = aiohttp.FormData()
-                data.add_field('build_id', build_id)
+                    # Create tarball from real files
+                    with tarfile.open(temp_tarball.name, 'w:gz') as tar:
+                        for item in temp_build_path.iterdir():
+                            if item.is_file():
+                                tar.add(item, arcname=item.name)
 
-                # Add build timeout if specified
-                if "build_timeout" in build_info:
-                    data.add_field('build_timeout', str(build_info["build_timeout"]))
+        # Create form data with tarball
+        data = aiohttp.FormData()
+        data.add_field('build_id', build_id)
 
-                # Add the tarball
-                with open(temp_tarball.name, 'rb') as f:
-                    data.add_field('build_tarball', f.read(),
-                                 filename='build.tar.gz',
-                                 content_type='application/gzip')
+        # Add build timeout if specified
+        if "build_timeout" in build_info:
+            data.add_field('build_timeout', str(build_info["build_timeout"]))
 
-                # Use longer timeout for build submissions (increased from 30 to 60 seconds)
-                timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        # Use longer timeout for build submissions (increased from 30 to 60 seconds)
+        timeout = aiohttp.ClientTimeout(total=120, connect=15)  # Increased for large files
 
-                logger.info(f"Forwarding build {build_id} to {server_url}")
+        logger.info(f"Forwarding build {build_id} to {server_url}")
 
-                async with http_session.post(f"{server_url}/build", data=data, timeout=timeout) as response:
-                    if response.status == 200:
-                        # Successful submission - update database
-                        cursor = build_database.cursor()
-                        cursor.execute('''
-                            UPDATE builds SET server_url = ?, status = ?, start_time = ?
-                            WHERE id = ?
-                        ''', (server_url, BuildStatus.BUILDING, time.time(), build_id))
-                        build_database.commit()
+        # Open file and stream it directly without loading into memory
+        with open(temp_tarball_path, 'rb') as tarball_file:
+            # Add the tarball as a file stream
+            data.add_field('build_tarball', tarball_file,
+                         filename='build.tar.gz',
+                         content_type='application/gzip')
 
-                        logger.info(f"Build {build_id} successfully forwarded to {server_url}")
-                        return True
+            async with http_session.post(f"{server_url}/build", data=data, timeout=timeout) as response:
+                if response.status == 200:
+                    # Successful submission - update database
+                    cursor = build_database.cursor()
+                    cursor.execute('''
+                        UPDATE builds SET server_url = ?, status = ?, start_time = ?
+                        WHERE id = ?
+                    ''', (server_url, BuildStatus.BUILDING, time.time(), build_id))
+                    build_database.commit()
 
-                    else:
-                        # Server returned error - log details and mark as failed
-                        try:
-                            error_text = await response.text()
-                            logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}: {error_text}")
-                        except:
-                            logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}")
+                    logger.info(f"Build {build_id} successfully forwarded to {server_url}")
+                    return True
 
-                        # Update database to mark build as failed
-                        cursor = build_database.cursor()
-                        cursor.execute('''
-                            UPDATE builds SET status = ?, end_time = ?
-                            WHERE id = ?
-                        ''', (BuildStatus.FAILED, time.time(), build_id))
-                        build_database.commit()
+                else:
+                    # Server returned error - log details and mark as failed
+                    try:
+                        error_text = await response.text()
+                        logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}: {error_text}")
+                    except:
+                        logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status}")
 
-                        return False
+                    # Update database to mark build as failed
+                    cursor = build_database.cursor()
+                    cursor.execute('''
+                        UPDATE builds SET status = ?, end_time = ?
+                        WHERE id = ?
+                    ''', (BuildStatus.FAILED, time.time(), build_id))
+                    build_database.commit()
 
-            finally:
-                # Clean up temporary file
-                try:
-                    import os
-                    os.unlink(temp_tarball.name)
-                except OSError:
-                    pass
+                    return False
 
     except asyncio.TimeoutError:
         logger.error(f"Timeout forwarding build {build_id} to {server_url}")
-        # Mark server as temporarily unavailable but don't fail the build immediately
-        # Instead, requeue for retry with another server
         return None
 
     except Exception as e:
         logger.error(f"Error forwarding build {build_id} to {server_url}: {e}")
-        # Network or other error - requeue for retry
         return None
+
+    finally:
+        # Clean up temporary file
+        if temp_tarball_path:
+            try:
+                os.unlink(temp_tarball_path)
+            except OSError:
+                pass
 
 
 async def update_single_build_status(build_id: str, server_url: str):
@@ -3288,19 +3311,19 @@ async def submit_build(
             with tempfile.TemporaryDirectory() as temp_dir:
                 temp_dir_path = Path(temp_dir)
 
-                # Save tarball temporarily
+                # Save tarball temporarily and keep original content
                 tarball_path = temp_dir_path / "build.tar.gz"
+                original_tarball_content = await build_tarball.read()
                 with open(tarball_path, 'wb') as f:
-                    content = await build_tarball.read()
-                    f.write(content)
+                    f.write(original_tarball_content)
 
-                # Extract tarball
+                # Extract tarball ONLY to read metadata - don't recreate from extracted files
                 try:
                     with tarfile.open(tarball_path, 'r:gz') as tar:
                         # Extract all files to temp directory
                         tar.extractall(path=temp_dir_path)
 
-                    # Read PKGBUILD content
+                    # Read PKGBUILD content for metadata
                     pkgbuild_path = temp_dir_path / "PKGBUILD"
                     if not pkgbuild_path.exists():
                         raise HTTPException(
@@ -3311,16 +3334,8 @@ async def submit_build(
                     with open(pkgbuild_path, 'r', encoding='utf-8') as f:
                         pkgbuild_content = f.read()
 
-                    # Collect source files from extracted content
+                    # For tarball submissions, source_files are not needed since we forward the original tarball
                     source_files = []
-                    for item in temp_dir_path.iterdir():
-                        if item.is_file() and item.name != "PKGBUILD":
-                            with open(item, 'rb') as f:
-                                source_files.append({
-                                    "filename": item.name,
-                                    "content": f.read(),
-                                    "content_type": "application/octet-stream"
-                                })
 
                 except (tarfile.TarError, OSError) as e:
                     raise HTTPException(
@@ -3379,9 +3394,10 @@ async def submit_build(
                 "requested_architectures": architectures.split(',') if architectures else []
             }
 
-        # Queue builds for each architecture
+        # Queue builds for each architecture - pass original tarball if available
+        original_tarball = original_tarball_content if 'original_tarball_content' in locals() else None
         queued_builds = await queue_builds_for_architectures(
-            pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds
+            pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds, original_tarball
         )
 
         if not queued_builds:

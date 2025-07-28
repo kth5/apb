@@ -489,14 +489,14 @@ class APBotClient:
                             # Add file with just its name (not full path)
                             tar.add(item, arcname=item.name)
 
-                # Submit the tarball
+                # Submit the tarball using streaming to avoid memory issues
                 with open(temp_tarball.name, 'rb') as f:
-                    files_data = [('build_tarball', ('build.tar.gz', f.read(), 'application/gzip'))]
+                    files_data = [('build_tarball', ('build.tar.gz', f, 'application/gzip'))]
 
-                # Submit build request
-                url = urljoin(self.server_url, '/build')
-                response = self.session.post(url, files=files_data)
-                response.raise_for_status()
+                    # Submit build request
+                    url = urljoin(self.server_url, '/build')
+                    response = self.session.post(url, files=files_data)
+                    response.raise_for_status()
 
                 result = response.json()
                 if 'build_id' not in result:
@@ -866,14 +866,14 @@ def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[
                     # Include build timeout (only allowed for admin users)
                     form_data['build_timeout'] = str(build_timeout)
 
-                # Submit the tarball
+                # Submit the tarball using streaming to avoid memory issues
                 with open(temp_tarball.name, 'rb') as f:
-                    files_data = [('build_tarball', ('build.tar.gz', f.read(), 'application/gzip'))]
+                    files_data = [('build_tarball', ('build.tar.gz', f, 'application/gzip'))]
 
-                # Submit build request
-                url = urljoin(server_url, '/build')
-                response = client.session.post(url, files=files_data, data=form_data)
-                response.raise_for_status()
+                    # Submit build request
+                    url = urljoin(server_url, '/build')
+                    response = client.session.post(url, files=files_data, data=form_data)
+                    response.raise_for_status()
 
                 return response.json()
 

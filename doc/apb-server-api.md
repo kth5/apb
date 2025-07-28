@@ -36,8 +36,29 @@ For production deployments:
 - **Request**: `multipart/form-data` for file uploads, `application/json` for JSON requests
 - **Response**: `application/json` for API endpoints, `text/html` for web pages
 
+## File Size Limits
+
+The server implements configurable file size limits to prevent resource exhaustion:
+
+### Default Limits
+- **Individual files**: 100MB per file
+- **Total request**: 500MB total request size
+- **Configurable**: Limits can be adjusted via command-line arguments
+
+### Configuration
+```bash
+# Set custom file size limits
+apb-server.py --max-file-size 209715200    # 200MB per file
+apb-server.py --max-request-size 1073741824 # 1GB total request
+```
+
+### Streaming Uploads
+- **Memory Efficient**: Files are streamed to disk to avoid memory exhaustion
+- **Partial Cleanup**: Incomplete uploads are automatically cleaned up
+- **Progress Tracking**: Large uploads can be monitored for progress
+
 ## Rate Limiting
-No explicit rate limiting is implemented, but the server has a configurable concurrent build limit.
+No explicit rate limiting is implemented, but the server has a configurable concurrent build limit and request timeout middleware.
 
 ## Request Timeout Middleware
 
@@ -61,21 +82,48 @@ The server implements sophisticated request timeout middleware to prevent hangin
 }
 ```
 
+## Global Exception Handling
+
+The server includes comprehensive exception handling to prevent HTTP 502 errors:
+
+### Exception Management
+- **Global Handler**: Catches all unhandled exceptions
+- **Detailed Logging**: Full exception details and tracebacks
+- **Graceful Responses**: Returns structured JSON error responses
+- **Resource Cleanup**: Forces garbage collection on errors
+
+### Exception Response Format
+```json
+{
+  "error": "Internal server error",
+  "detail": "Specific error message",
+  "type": "ExceptionType"
+}
+```
+
 ## Resource Monitoring
 
 The server includes comprehensive resource monitoring capabilities:
 
 ### System Monitoring
 - **CPU Usage**: Real-time CPU load and core utilization
-- **Memory Monitoring**: Total, available, and used memory tracking
-- **Disk Monitoring**: Build directory space usage and availability
+- **Memory Monitoring**: Total, available, and used memory tracking with 90% threshold
+- **Disk Monitoring**: Build directory space usage with 95% threshold
 - **Process Tracking**: Individual build process resource consumption
+- **Uptime Tracking**: Server uptime and boot time information
 
 ### Background Monitoring
-- **Resource Monitor Thread**: Runs continuously in background
-- **Cleanup Scheduling**: Automatic cleanup based on resource usage
-- **Build Process Management**: Tracks and manages running build processes
+- **Resource Monitor Thread**: Runs continuously every 30 seconds
+- **Cleanup Scheduling**: Automatic cleanup based on resource usage (hourly)
+- **Build Process Management**: Tracks running processes with timeout detection
 - **Garbage Collection**: Automatic memory cleanup during resource pressure
+- **Hung Process Detection**: Identifies and terminates processes exceeding timeouts
+
+### Build Data Cleanup
+- **Memory Management**: Limits build outputs to 10,000 lines per build
+- **History Cleanup**: Maintains only 100 most recent builds in memory
+- **Old Build Removal**: Automatically removes builds older than 1 hour from memory
+- **Disk Cleanup**: Removes build directories older than 7 days
 
 ### System Information Response
 Enhanced system information includes:
@@ -86,6 +134,7 @@ Enhanced system information includes:
     "cpu": {
       "model": "Intel Core i7",
       "cores": 8,
+      "usage_percent": 25.5,
       "load_average": [0.5, 0.7, 0.9]
     },
     "memory": {
@@ -100,7 +149,13 @@ Enhanced system information includes:
       "free": 500000000,
       "percentage": 50.0
     },
-    "uptime": "2 days, 5 hours, 30 minutes"
+    "uptime": "2 days, 5 hours, 30 minutes",
+    "process_info": {
+      "pid": 12345,
+      "thread_count": 8,
+      "open_files": 25,
+      "memory_usage": 104857600
+    }
   }
 }
 ```
@@ -138,6 +193,26 @@ This is particularly useful when:
 - Building packages for embedded systems
 - Testing architecture-specific builds
 
+### PowerPC Architecture Support
+
+The server includes special support for PowerPC architectures:
+
+#### Automatic ppc32 Prefix
+- **Detection**: Automatically detects PowerPC and Espresso architectures
+- **Build Command**: Uses `ppc32` prefix for makechrootpkg to ensure 32-bit detection
+- **Architecture Mapping**: Maps `espresso` architecture to ensure compatibility
+
+```bash
+# PowerPC build command example
+sudo ppc32 makechrootpkg -cuT -r /buildroot
+```
+
+#### PowerPC Configuration
+```bash
+# Example: Espresso server configuration
+apb-server.py --architecture powerpc --buildroot /data/buildroot
+```
+
 ---
 
 ## Endpoints
@@ -158,6 +233,7 @@ Get comprehensive server information and status.
     "cpu": {
       "model": "Intel Core i7",
       "cores": 8,
+      "usage_percent": 25.5,
       "load_average": [0.5, 0.7, 0.9]
     },
     "memory": {
@@ -172,44 +248,120 @@ Get comprehensive server information and status.
       "free": 500000000,
       "percentage": 50.0
     },
-    "uptime": "2 days, 5 hours, 30 minutes"
+    "uptime": "2 days, 5 hours, 30 minutes",
+    "process_info": {
+      "pid": 12345,
+      "thread_count": 8,
+      "open_files": 25,
+      "memory_usage": 104857600
+    }
   },
   "queue_status": {
     "current_builds_count": 1,
     "queued_builds": 2,
-    "max_concurrent_builds": 3
-  },
-  "current_build": {
-    "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-    "pkgname": "example-package",
-    "status": "building",
-    "start_time": 1642694400.0
+    "max_concurrent_builds": 3,
+    "current_build": {
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "pkgname": "example-package",
+      "status": "building",
+      "start_time": 1642694400.0,
+      "buildroot_recreation": false
+    },
+    "total_active_builds": 3,
+    "build_history_count": 25,
+    "buildroot_recreation_count": 0,
+    "buildroot_recreation_builds": [],
+    "server_busy_with_buildroot": false
   }
 }
 ```
 
 #### GET /health
-Simple health check endpoint for monitoring systems.
+Enhanced health check endpoint that performs comprehensive system testing.
 
-**Response:**
+**Response (Healthy):**
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-16"
+  "version": "2025-07-16",
+  "timestamp": "2024-01-20T10:00:00Z",
+  "response_time_ms": 45.2,
+  "checks": {
+    "memory": {
+      "status": "ok",
+      "usage_percent": 45.2,
+      "available_mb": 8192
+    },
+    "disk": {
+      "status": "ok",
+      "usage_percent": 65.3,
+      "free_gb": 125
+    },
+    "executor": {
+      "status": "ok",
+      "test_result": "test"
+    },
+    "build_queue": {
+      "status": "ok",
+      "queue_size": 2,
+      "active_builds": 1,
+      "running_processes": 1
+    },
+    "filesystem": {
+      "status": "ok"
+    }
+  }
 }
 ```
+
+**Response (Degraded):**
+```json
+{
+  "status": "degraded",
+  "version": "2025-07-16",
+  "timestamp": "2024-01-20T10:00:00Z",
+  "response_time_ms": 2500.1,
+  "warning": "High response time",
+  "checks": {
+    "memory": {
+      "status": "warning",
+      "usage_percent": 92.1,
+      "available_mb": 512
+    },
+    "disk": {
+      "status": "error",
+      "error": "Disk usage above 95%"
+    }
+  }
+}
+```
+
+**Health Status Values:**
+- `healthy`: All checks pass
+- `warning`: Some checks have warnings but service is functional
+- `degraded`: Errors detected or high response time
+- `error`: Critical failure (returns 500 status)
 
 ### Build Management
 
 #### POST /build
-Submit a new build request.
+Submit a new build request with support for both tarball and individual file uploads.
 
-**Request:**
+**Request Methods:**
+
+**Method 1: Tarball Upload (Recommended)**
 - **Content-Type:** `multipart/form-data`
 - **Parameters:**
-  - `pkgbuild` (file, required): The PKGBUILD file
+  - `build_tarball` (file, required): Compressed tarball containing PKGBUILD and sources
+  - `build_id` (string, required): Build UUID (provided by APB Farm)
+  - `build_timeout` (integer, optional): Build timeout in seconds (300-14400)
+
+**Method 2: Individual File Upload (Legacy)**
+- **Content-Type:** `multipart/form-data`
+- **Parameters:**
+  - `pkgbuild` (file, required): The PKGBUILD file (must be named 'PKGBUILD')
   - `sources` (file[], optional): Additional source files
-  - `build_id` (string, optional): Build UUID (provided by APB Farm)
+  - `build_id` (string, required): Build UUID (provided by APB Farm)
   - `build_timeout` (integer, optional): Build timeout in seconds (300-14400)
 
 **Response:**
@@ -221,22 +373,45 @@ Submit a new build request.
 }
 ```
 
-**Build ID Behavior:**
-- If `build_id` is provided, the server will use that exact ID
-- If `build_id` is not provided, the server generates a timestamp-based ID
-- The APB Farm always provides a build ID to ensure consistency across the system
+**Tarball Requirements:**
+- **Format**: Gzipped tar archive (.tar.gz)
+- **Contents**: Must contain a PKGBUILD file at the root level
+- **Size Limit**: Subject to configured maximum request size
+- **Extraction**: Automatically extracted to build directory
 
 **Enhanced Build Processing:**
-- **Input Validation**: Comprehensive PKGBUILD and source file validation
+- **Input Validation**: Comprehensive PKGBUILD parsing and validation
 - **Resource Checking**: Verifies sufficient disk space and memory before queuing
-- **Queue Management**: Intelligent queuing with priority and resource consideration
+- **Queue Management**: Intelligent queuing with concurrent build limits
 - **Process Tracking**: Full lifecycle tracking from submission to completion
+- **Streaming Upload**: Memory-efficient handling of large uploads
+- **Partial Cleanup**: Automatic cleanup of failed uploads
 
-**Error Response:**
+**Build Timeout Configuration:**
+- **Default**: 7200 seconds (2 hours)
+- **Range**: 300-14400 seconds (5 minutes to 4 hours)
+- **Per-Build**: Each build can have a custom timeout
+- **Enforcement**: Automatic termination after timeout
+
+**Error Responses:**
 ```json
 {
   "error": "Invalid PKGBUILD file",
   "detail": "Missing required fields: pkgname, pkgver"
+}
+```
+
+```json
+{
+  "error": "File too large",
+  "detail": "Tarball exceeds 500000000 bytes"
+}
+```
+
+```json
+{
+  "error": "Build ID already exists",
+  "detail": "Build with ID '48ea1df5-f7f3-477e-a7a7-36e526ea7cd3' already exists"
 }
 ```
 
@@ -252,10 +427,13 @@ Get build status as JSON.
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
   "pkgname": "example-package",
   "status": "completed",
+  "created_at": 1642694300.0,
   "start_time": 1642694400.0,
   "end_time": 1642694500.0,
   "duration": 100.0,
   "exit_code": 0,
+  "build_timeout": 7200,
+  "arch": ["x86_64"],
   "packages": [
     {
       "filename": "example-package-1.0.0-1-x86_64.pkg.tar.xz",
@@ -281,10 +459,10 @@ Get build status as JSON.
 - `cancelled`: Build was cancelled
 
 **Enhanced Status Information:**
-- **Resource Usage**: Memory and CPU usage during build
-- **Progress Indicators**: Build phase tracking when available
-- **Error Details**: Detailed error information for failed builds
-- **Timing Information**: Comprehensive timing and duration data
+- **Timing Details**: Separate creation, start, and end times
+- **Custom Timeouts**: Shows configured timeout for each build
+- **Architecture Info**: Target architecture for the build
+- **Build Context**: Additional metadata about build environment
 
 #### GET /build/{build_id}
 Get detailed build information (HTML or JSON based on Accept header).
@@ -305,18 +483,24 @@ Get detailed build information (HTML or JSON based on Accept header).
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
   "pkgname": "example-package",
   "status": "completed",
-  "start_time": "2024-01-20 10:00:00 UTC",
-  "end_time": "2024-01-20 10:05:00 UTC",
+  "start_time": "2024-01-20T10:00:00Z",
+  "end_time": "2024-01-20T10:05:00Z",
   "duration": 300.0,
   "exit_code": 0,
   "packages": [...],
   "logs": [...],
-  "sources": [...]
+  "sources": [
+    {
+      "filename": "example.patch",
+      "size": 1024,
+      "download_url": "/build/48ea1df5-f7f3-477e-a7a7-36e526ea7cd3/download/example.patch"
+    }
+  ]
 }
 ```
 
 #### GET /build/{build_id}/output
-Get build output/logs.
+Get build output/logs with pagination support.
 
 **Parameters:**
 - `build_id` (string, required): Build UUID (provided by APB Farm)
@@ -335,17 +519,15 @@ Get build output/logs.
   ],
   "total_lines": 150,
   "start_index": 0,
-  "returned_lines": 50,
-  "build_status": "building",
-  "last_updated": 1642694450.0
+  "returned_lines": 5
 }
 ```
 
 **Enhanced Output Features:**
 - **Streaming Support**: Real-time output as builds progress
-- **Pagination**: Efficient handling of large build logs
-- **Status Integration**: Build status included with output
-- **Filtering**: Support for filtering output by log level or content
+- **Pagination**: Efficient handling of large build logs (up to 10,000 lines)
+- **Memory Management**: Automatic truncation of very large outputs
+- **Real-time Updates**: Output updates as build progresses
 
 #### GET /build/{build_id}/stream
 Stream build output in real-time using Server-Sent Events.
@@ -359,6 +541,7 @@ Stream build output in real-time using Server-Sent Events.
   - `output`: New build output line
   - `status`: Status change
   - `complete`: Build finished
+  - `heartbeat`: Connection keepalive (every 30 seconds)
 
 **Example Event Stream:**
 ```
@@ -369,20 +552,24 @@ event: output
 data: ==> Checking runtime dependencies...
 
 event: status
-data: {"status": "building", "progress": 25}
+data: {"status": "building"}
+
+event: heartbeat
+data: 1642694450.0
 
 event: complete
 data: {"status": "completed", "exit_code": 0}
 ```
 
 **Enhanced Streaming Features:**
-- **Connection Management**: Automatic reconnection handling
+- **Connection Management**: Automatic stream cleanup and resource management
+- **Heartbeat Support**: Regular heartbeats prevent connection timeout
 - **Resource Efficiency**: Optimized for minimal server resource usage
 - **Error Handling**: Graceful handling of connection issues
-- **Progress Updates**: Real-time build progress when available
+- **Historical Output**: Sends existing output before streaming new content
 
 #### POST /build/{build_id}/cancel
-Cancel a build.
+Cancel a build with proper process management.
 
 **Parameters:**
 - `build_id` (string, required): Build UUID (provided by APB Farm)
@@ -396,10 +583,11 @@ Cancel a build.
 ```
 
 **Enhanced Cancellation:**
-- **Process Management**: Properly terminates build processes and cleans up resources
-- **State Management**: Updates build status and notifies monitoring systems
+- **Process Management**: Properly terminates build processes (SIGTERM then SIGKILL)
+- **Buildroot Recreation Handling**: Special timeout handling for buildroot recreation (300s vs 10s)
 - **Resource Cleanup**: Cleans up temporary files and build directories
-- **Safety Checks**: Prevents cancellation of builds in critical phases
+- **State Management**: Updates build status and notifies monitoring systems
+- **Safety Checks**: Prevents cancellation conflicts and race conditions
 
 #### GET /build/{build_id}/confirm-cancel
 Get build cancellation confirmation page.
@@ -414,10 +602,10 @@ Get build cancellation confirmation page.
 
 ---
 
-### File Downloads
+### File Downloads and Viewing
 
 #### GET /build/{build_id}/download/{filename}
-Download a build artifact.
+Download a build artifact with enhanced features.
 
 **Parameters:**
 - `build_id` (string, required): Build UUID (provided by APB Farm)
@@ -427,31 +615,30 @@ Download a build artifact.
 
 **Headers:**
 - `Content-Disposition`: `attachment; filename={filename}`
-- `Content-Type`: Determined by file extension
+- `Content-Type`: `application/octet-stream`
 - `Content-Length`: File size for download progress
 
 **Enhanced Download Features:**
-- **Range Support**: Partial content support for large files
-- **Bandwidth Management**: Configurable download speed limiting
-- **Security**: Filename validation to prevent directory traversal
-- **Caching**: Appropriate cache headers for static content
+- **Security**: Filename validation to prevent directory traversal attacks
+- **File Types**: Supports all build artifacts (packages, logs, sources)
+- **Error Handling**: Proper 404 responses for missing files
 
 #### GET /build/{build_id}/view/{filename}
-View a text file in the browser.
+View a text file in the browser with syntax highlighting.
 
 **Parameters:**
 - `build_id` (string, required): Build UUID (provided by APB Farm)
 - `filename` (string, required): The filename to view
 
 **Response:**
-- **Content-Type:** `text/plain` or `text/html`
-- File content for viewing with syntax highlighting for supported formats
+- **Content-Type:** `text/html` with embedded content
+- File content displayed in formatted HTML with navigation
 
 **Viewing Features:**
-- **Syntax Highlighting**: Automatic highlighting for PKGBUILD, log files, and source code
-- **Line Numbers**: Configurable line numbering for easier navigation
-- **Search**: In-browser search functionality for large files
-- **Security**: Safe rendering of text content with XSS protection
+- **Text Detection**: Automatic detection of text vs binary files
+- **Fallback**: Redirects binary files to download endpoint
+- **Navigation**: Links back to build status page
+- **UTF-8 Support**: Proper encoding handling for text files
 
 #### GET /build/{build_id}/packages
 List packages produced by a build.
@@ -467,14 +654,10 @@ List packages produced by a build.
     {
       "filename": "example-package-1.0.0-1-x86_64.pkg.tar.xz",
       "size": 1024000,
-      "created_at": "2024-01-20 10:05:00 UTC",
-      "download_url": "/build/48ea1df5-f7f3-477e-a7a7-36e526ea7cd3/download/example-package-1.0.0-1-x86_64.pkg.tar.xz",
-      "checksum": "sha256:a1b2c3d4...",
-      "type": "package"
+      "created_at": "2024-01-20T10:05:00Z",
+      "download_url": "/build/48ea1df5-f7f3-477e-a7a7-36e526ea7cd3/download/example-package-1.0.0-1-x86_64.pkg.tar.xz"
     }
-  ],
-  "total_packages": 1,
-  "total_size": 1024000
+  ]
 }
 ```
 
@@ -483,12 +666,11 @@ List packages produced by a build.
 ### Build History
 
 #### GET /builds/latest
-Get the latest builds.
+Get the latest builds with filtering support.
 
 **Parameters:**
 - `limit` (integer, optional): Maximum number of builds (default: 10, max: 100)
 - `status` (string, optional): Filter by status
-- `architecture` (string, optional): Filter by architecture
 
 **Response:**
 ```json
@@ -498,14 +680,12 @@ Get the latest builds.
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
       "pkgname": "example-package",
       "status": "completed",
-      "start_time": "2024-01-20 10:00:00 UTC",
-      "end_time": "2024-01-20 10:05:00 UTC",
-      "duration": 300.0,
-      "architecture": "x86_64"
+      "start_time": "2024-01-20T10:00:00Z",
+      "end_time": "2024-01-20T10:05:00Z",
+      "duration": 300.0
     }
   ],
-  "total": 1,
-  "filtered": true
+  "total": 1
 }
 ```
 
@@ -524,8 +704,8 @@ Get builds for a specific package.
     {
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
       "status": "completed",
-      "start_time": "2024-01-20 10:00:00 UTC",
-      "end_time": "2024-01-20 10:05:00 UTC",
+      "start_time": "2024-01-20T10:00:00Z",
+      "end_time": "2024-01-20T10:05:00Z",
       "duration": 300.0
     }
   ],
@@ -546,8 +726,8 @@ Get the latest build for a specific package.
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
   "pkgname": "example-package",
   "status": "completed",
-  "start_time": "2024-01-20 10:00:00 UTC",
-  "end_time": "2024-01-20 10:05:00 UTC",
+  "start_time": "2024-01-20T10:00:00Z",
+  "end_time": "2024-01-20T10:05:00Z",
   "duration": 300.0,
   "packages": [
     {
@@ -569,7 +749,7 @@ Download the latest build file for a package.
 
 **File Types:**
 - `package`: Main package file
-- `debug`: Debug package file
+- `debug`: Debug package file (excludes -debug packages from main search)
 - `log`: Build log file
 - `pkgbuild`: PKGBUILD file
 
@@ -585,78 +765,150 @@ Get cleanup administration page.
 **Response:** HTML page with cleanup options including:
 - Disk space usage summary
 - Old build cleanup configuration
-- Buildroot recreation options
-- Cache management controls
+- Memory usage and cleanup status
+- Manual cleanup triggers
 
 #### POST /admin/cleanup
-Trigger server cleanup.
-
-**Request:**
-- **Content-Type:** `application/json`
-- **Parameters:**
-  - `cleanup_type` (string, optional): Type of cleanup ("builds", "cache", "buildroot", "all")
-  - `older_than_days` (integer, optional): Clean builds older than N days
-  - `force` (boolean, optional): Force cleanup even if builds are active
+Trigger server cleanup with detailed results.
 
 **Response:**
 ```json
 {
   "success": true,
-  "message": "Cleanup initiated",
-  "cleanup_id": "cleanup_456",
-  "estimated_space_freed": "2.5 GB",
-  "cleanup_type": "builds"
+  "message": "Cleanup completed: removed 15 old builds",
+  "cleanup_id": "cleanup_1642694400"
 }
 ```
 
 **Enhanced Cleanup Features:**
-- **Selective Cleanup**: Choose specific cleanup operations
-- **Space Estimation**: Preview how much space will be freed
-- **Background Processing**: Cleanup runs in background without blocking server
-- **Progress Tracking**: Monitor cleanup progress via cleanup_id
+- **Selective Cleanup**: Removes builds older than 7 days
+- **Memory Cleanup**: Clears build outputs and history
+- **Disk Management**: Removes old build directories
+- **Error Handling**: Continues cleanup even if some operations fail
+- **Logging**: Detailed logging of cleanup operations
 
 ---
 
 ## Build Process Management
 
-The server implements sophisticated build process management:
+The server implements sophisticated build process management with enhanced features:
 
 ### Build Lifecycle
 
 1. **Submission**: Validate PKGBUILD and queue build
-2. **Resource Check**: Verify sufficient resources (disk, memory)
+2. **Resource Check**: Verify sufficient disk space and memory
 3. **Buildroot Preparation**: Ensure clean buildroot environment
-4. **Source Management**: Download and validate sources
-5. **Build Execution**: Run makechrootpkg in isolated environment
-6. **Artifact Collection**: Collect packages and logs
-7. **Cleanup**: Clean temporary files and update status
+4. **GPG Key Management**: Download and verify GPG keys for source validation
+5. **SRCDEST Locking**: Acquire exclusive access to shared source directory
+6. **Source Management**: Download and validate sources
+7. **Build Execution**: Run makechrootpkg in isolated environment
+8. **Artifact Collection**: Collect packages and logs
+9. **Cleanup**: Clean temporary files and update status
 
-### Process Tracking
+### GPG Key Support
 
-- **Running Processes**: Global tracking of active build processes
-- **Resource Monitoring**: CPU and memory usage per build
-- **Timeout Management**: Automatic build termination after timeout (2 hours default)
-- **Graceful Shutdown**: Proper process termination during server shutdown
+The server automatically handles GPG key management for package source validation:
+
+#### Automatic Key Download
+- **validpgpkeys Parsing**: Extracts GPG keys from PKGBUILD validpgpkeys array
+- **Key Retrieval**: Downloads keys using `gpg --recv-keys`
+- **Multi-line Support**: Handles both single-line and multi-line validpgpkeys arrays
+- **Error Handling**: Continues build even if key download fails (with warnings)
+
+#### GPG Configuration
+```bash
+# Example PKGBUILD with GPG keys
+validpgpkeys=('ABCD1234...' 'EFGH5678...')
+
+# Multi-line format also supported
+validpgpkeys=(
+    'ABCD1234...'
+    'EFGH5678...'
+)
+```
+
+### SRCDEST Locking
+
+The server implements sophisticated SRCDEST directory locking for concurrent builds:
+
+#### Locking Mechanism
+- **Exclusive Access**: Prevents concurrent source downloads in shared SRCDEST
+- **Orphan Detection**: Automatically detects and cleans up orphaned locks
+- **Timeout Handling**: 10-minute timeout prevents infinite waiting
+- **Lock File Management**: Uses fcntl for atomic lock operations
+
+#### Orphan Lock Cleanup
+- **Startup Cleanup**: Removes orphaned locks from previous server sessions
+- **Process Detection**: Uses `lsof` to verify if locks are actually held
+- **Age-based Cleanup**: Removes locks older than 30 minutes if lsof unavailable
+- **Graceful Degradation**: Continues build even if locking fails
+
+#### SRCDEST Configuration
+```bash
+# /etc/makepkg.conf
+SRCDEST="/data/sources"  # Shared source directory
+CCACHE_DIR="/data/ccache"  # Shared ccache directory
+```
 
 ### Buildroot Management
 
-- **Automatic Recreation**: Configurable buildroot recreation (e.g., every 50 builds)
-- **Cache Management**: Intelligent package cache handling
-- **Chroot Isolation**: Complete isolation between builds
-- **Security**: Proper user/group separation and permissions
+Enhanced buildroot management with automatic recreation:
+
+#### Buildroot Recreation
+- **Automatic Triggers**: Configurable recreation after N builds
+- **Safe Recreation**: Special handling during buildroot recreation builds
+- **Extended Timeouts**: 5-minute timeout for buildroot recreation vs 10 seconds for normal builds
+- **Process Tracking**: Tracks builds performing buildroot recreation
+- **Failure Handling**: Continues with existing buildroot if recreation fails
+
+#### Buildroot Configuration
+```bash
+# Enable automatic buildroot recreation every 50 builds
+apb-server.py --buildroot-autorecreate 50
+```
+
+#### Configuration Management
+- **Host Configuration**: Copies `/etc/makepkg.conf` and `/etc/pacman.conf` to chroot
+- **Dependency Management**: Installs base, base-devel, and ccache packages
+- **Permission Handling**: Proper sudo permissions for chroot operations
+
+### Process Tracking
+
+Enhanced tracking of build processes and resources:
+
+#### Running Process Management
+- **Global Tracking**: Maintains registry of all running build processes
+- **Graceful Termination**: SIGTERM followed by SIGKILL if necessary
+- **Timeout Detection**: Monitors processes for timeout and hung state
+- **Shutdown Handling**: Proper cleanup during server shutdown
+- **Process Groups**: Uses process groups for better cleanup
+
+#### Timeout Management
+- **Overall Timeout**: Configurable per-build timeout (default 2 hours)
+- **Output Timeout**: Terminates builds with no output for 30 minutes
+- **Custom Timeouts**: Per-build timeout configuration
+- **Special Handling**: Extended timeouts for buildroot recreation
 
 ### Queue Management
 
-- **Thread Pool**: Configurable worker threads for concurrent builds
-- **Priority Queuing**: Build prioritization based on age and resource requirements
-- **Resource Limits**: Respect system resource limits and concurrent build count
-- **Failure Handling**: Automatic retry logic for transient failures
+Sophisticated queue management with resource awareness:
+
+#### Thread Pool Management
+- **Configurable Workers**: Adjustable concurrent build limit
+- **Dynamic Scaling**: Thread pool recreated with new worker count during startup
+- **Resource Monitoring**: Considers system resources when accepting builds
+- **Queue Processing**: Background thread processes build queue continuously
+
+#### Build Prioritization
+- **FIFO Processing**: First-in-first-out queue processing
+- **Resource Limits**: Respects configured concurrent build limits
+- **Failure Handling**: Proper error handling and state management
 
 ---
 
 ## Error Handling
 
-All endpoints return appropriate HTTP status codes:
+All endpoints return appropriate HTTP status codes with enhanced error information:
 
 - **200 OK**: Request successful
 - **400 Bad Request**: Invalid request parameters or malformed data
@@ -671,71 +923,152 @@ All endpoints return appropriate HTTP status codes:
 ```json
 {
   "error": "Build not found",
-  "detail": "Build with ID '48ea1df5-f7f3-477e-a7a7-36e526ea7cd3' does not exist",
-  "status_code": 404,
-  "timestamp": "2024-01-20T10:00:00Z",
-  "request_id": "req_abc123"
+  "detail": "Build with ID '48ea1df5-f7f3-477e-a7a7-36e526ea7cd3' does not exist"
+}
+```
+
+```json
+{
+  "error": "Invalid tarball",
+  "detail": "Tarball must contain a PKGBUILD file"
+}
+```
+
+```json
+{
+  "error": "File too large",
+  "detail": "PKGBUILD exceeds 104857600 bytes"
 }
 ```
 
 ### Error Recovery
 
-- **Automatic Retry**: Transient errors are retried automatically
+- **Automatic Cleanup**: Failed uploads and builds are automatically cleaned up
 - **Graceful Degradation**: Service continues with reduced functionality during issues
-- **Resource Recovery**: Automatic cleanup of failed builds
+- **Resource Recovery**: Automatic cleanup of failed builds and orphaned processes
 - **State Consistency**: Maintains consistent build state even during failures
+- **Global Exception Handling**: Prevents HTTP 502 errors through comprehensive exception catching
 
 ---
 
-## WebSocket Events
+## Server-Sent Events (SSE)
 
-The server supports real-time updates through Server-Sent Events (SSE) for build output streaming:
+The server supports real-time updates through Server-Sent Events for build output streaming:
 
 ### Event Types
 
 - **output**: New build output line
 - **status**: Build status change
-- **progress**: Build progress update (when available)
-- **error**: Error during build
-- **complete**: Build completion
+- **complete**: Build completion with exit code
+- **heartbeat**: Connection keepalive (every 30 seconds)
 
 ### Connection Management
 
-- **Automatic Reconnection**: Client-side reconnection handling
-- **Connection Limits**: Configurable limits on concurrent SSE connections
+- **Stream Registry**: Maintains registry of active streams per build
+- **Automatic Cleanup**: Removes streams when connections close
 - **Resource Efficiency**: Optimized for minimal server overhead
-- **Security**: Proper authentication and access control for streams
+- **Historical Output**: Sends existing output before streaming new content
+- **Heartbeat Support**: Regular heartbeats prevent connection timeout
+
+### Example Usage
+```javascript
+const eventSource = new EventSource('/build/48ea1df5-f7f3-477e-a7a7-36e526ea7cd3/stream');
+
+eventSource.addEventListener('output', function(event) {
+    console.log('Build output:', event.data);
+});
+
+eventSource.addEventListener('complete', function(event) {
+    const result = JSON.parse(event.data);
+    console.log('Build completed with exit code:', result.exit_code);
+});
+```
 
 ---
 
 ## Configuration
 
-Server behavior can be configured via:
-- Command line arguments
-- Environment variables
-- Configuration files
+Server behavior can be configured via command line arguments and environment variables:
 
-### Key Configuration Options
+### Command Line Arguments
 
-#### Command Line Arguments
+#### Basic Configuration
 - `--host`: Server host address (default: localhost)
 - `--port`: Server port (default: 8000)
 - `--buildroot`: Build root directory (default: ~/.apb/buildroot)
 - `--builds-dir`: Build storage directory (default: ~/.apb/builds)
-- `--max-concurrent`: Maximum concurrent builds (default: 3)
-- `--buildroot-autorecreate`: Auto-recreate buildroot after N builds
-- `--architecture`: Override detected architecture
 - `--debug`: Enable debug logging
 
-#### Environment Variables
+#### Build Management
+- `--max-concurrent`: Maximum concurrent builds (default: 3)
+- `--buildroot-autorecreate`: Auto-recreate buildroot after N builds
+- `--build-timeout`: Maximum build time in seconds (default: 7200)
+
+#### Architecture and Platform
+- `--architecture`: Override detected architecture (e.g., 'powerpc' for espresso)
+
+#### File Size Limits
+- `--max-file-size`: Maximum individual file size in bytes (default: 100MB)
+- `--max-request-size`: Maximum total request size in bytes (default: 500MB)
+
+### Example Configurations
+
+#### Standard x86_64 Server
+```bash
+apb-server.py \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --max-concurrent 4 \
+    --buildroot-autorecreate 25
+```
+
+#### PowerPC/Espresso Server
+```bash
+apb-server.py \
+    --architecture powerpc \
+    --buildroot /data/powerpc-buildroot \
+    --builds-dir /data/powerpc-builds \
+    --max-concurrent 2
+```
+
+#### High-capacity Server
+```bash
+apb-server.py \
+    --max-concurrent 8 \
+    --max-file-size 209715200 \
+    --max-request-size 1073741824 \
+    --build-timeout 10800
+```
+
+#### Development Server
+```bash
+apb-server.py \
+    --debug \
+    --max-concurrent 1 \
+    --buildroot-autorecreate 5
+```
+
+### Environment Variables
 - `APB_HOST`: Override default host
 - `APB_PORT`: Override default port
 - `APB_BUILDROOT`: Override buildroot location
 - `APB_MAX_CONCURRENT`: Override concurrent build limit
 - `APB_DEBUG`: Enable debug mode
 
-#### Advanced Configuration
-- **Resource Limits**: Configure memory and disk usage limits
-- **Timeout Settings**: Customize build and request timeouts
-- **Cache Settings**: Configure package cache behavior
-- **Security Settings**: User/group permissions and sandboxing options
+### Resource Limits
+
+The server automatically configures system resource limits:
+
+#### Unlimited Resource Settings
+- **Address Space**: RLIMIT_AS set to unlimited
+- **Data Segment**: RLIMIT_DATA set to unlimited
+- **Stack Size**: RLIMIT_STACK set to unlimited
+- **File Size**: RLIMIT_FSIZE set to unlimited
+- **Open Files**: RLIMIT_NOFILE set to unlimited
+- **Processes**: RLIMIT_NPROC set to unlimited
+
+#### Monitoring and Cleanup
+- **Memory Monitoring**: Triggers cleanup at 90% memory usage
+- **Disk Monitoring**: Triggers cleanup at 95% disk usage
+- **Build Output Limits**: Maximum 10,000 lines per build output
+- **History Limits**: Maximum 100 builds in memory history
