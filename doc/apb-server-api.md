@@ -832,7 +832,8 @@ validpgpkeys=(
 The server implements sophisticated SRCDEST directory locking for concurrent builds:
 
 #### Locking Mechanism
-- **Exclusive Access**: Prevents concurrent source downloads in shared SRCDEST
+- **Package-specific Locks**: Each package uses a separate lock file (`.apb-{pkgname}.lock`)
+- **Exclusive Access**: Prevents concurrent source downloads for the same package in shared SRCDEST
 - **Orphan Detection**: Automatically detects and cleans up orphaned locks
 - **Timeout Handling**: 10-minute timeout prevents infinite waiting
 - **Lock File Management**: Uses fcntl for atomic lock operations

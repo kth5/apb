@@ -749,10 +749,10 @@ def get_makepkg_config() -> Dict[str, str]:
     return config
 
 
-def lock_srcdest(srcdest_path: str) -> Optional[int]:
-    """Lock SRCDEST directory"""
+def lock_srcdest(srcdest_path: str, pkgname: str) -> Optional[int]:
+    """Lock SRCDEST directory with package-specific lock file"""
     try:
-        lock_file = os.path.join(srcdest_path, '.apb-lock')
+        lock_file = os.path.join(srcdest_path, f'.apb-{pkgname}.lock')
 
         # Try to acquire lock
         fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
@@ -831,47 +831,61 @@ def cleanup_orphaned_srcdest_locks():
             return
 
         srcdest_path = makepkg_config['SRCDEST']
-        lock_file = os.path.join(srcdest_path, '.apb-lock')
 
-        if not os.path.exists(lock_file):
+        # Find all APB lock files with the pattern .apb-*.lock
+        import glob
+        lock_pattern = os.path.join(srcdest_path, '.apb-*.lock')
+        lock_files = glob.glob(lock_pattern)
+
+        if not lock_files:
             return
 
-        logger.info(f"Found existing SRCDEST lock file: {lock_file}")
+        logger.info(f"Found {len(lock_files)} existing SRCDEST lock files: {[os.path.basename(f) for f in lock_files]}")
 
-        # Check if any process is holding the lock
-        try:
-            import subprocess
-            result = subprocess.run(['lsof', lock_file],
-                                  capture_output=True, text=True, timeout=5)
-            if result.returncode != 0:
-                # No process is holding the lock - it's orphaned
-                logger.warning(f"Removing orphaned SRCDEST lock file from previous session")
-                os.unlink(lock_file)
-                logger.info(f"Orphaned SRCDEST lock cleaned up successfully")
-            else:
-                logger.warning(f"SRCDEST lock is held by another process - not removing")
-                # Log which process is holding it
-                for line in result.stdout.split('\n'):
-                    if line.strip():
-                        logger.info(f"Lock held by: {line.strip()}")
-        except FileNotFoundError:
-            # lsof not available - use file age as fallback
+        cleaned_count = 0
+        for lock_file in lock_files:
             try:
-                stat_info = os.stat(lock_file)
-                age_seconds = time.time() - stat_info.st_mtime
-                # If lock file is older than 30 minutes, consider it orphaned
-                if age_seconds > 1800:
-                    logger.warning(f"SRCDEST lock file is {age_seconds:.0f}s old, removing orphaned lock from previous session")
-                    os.unlink(lock_file)
-                    logger.info(f"Old SRCDEST lock cleaned up successfully")
-                else:
-                    logger.info(f"SRCDEST lock file is recent ({age_seconds:.0f}s old), leaving in place")
-            except Exception as stat_error:
-                logger.warning(f"Could not check lock file age: {stat_error}")
-                logger.info(f"Leaving lock file in place to be safe")
-        except Exception as e:
-            logger.warning(f"Could not check SRCDEST lock status during startup: {e}")
-            logger.info(f"Leaving lock file in place to be safe")
+                # Check if any process is holding the lock
+                try:
+                    import subprocess
+                    result = subprocess.run(['lsof', lock_file],
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode != 0:
+                        # No process is holding the lock - it's orphaned
+                        logger.warning(f"Removing orphaned SRCDEST lock file {os.path.basename(lock_file)} from previous session")
+                        os.unlink(lock_file)
+                        cleaned_count += 1
+                        logger.info(f"Orphaned SRCDEST lock {os.path.basename(lock_file)} cleaned up successfully")
+                    else:
+                        logger.warning(f"SRCDEST lock {os.path.basename(lock_file)} is held by another process - not removing")
+                        # Log which process is holding it
+                        for line in result.stdout.split('\n'):
+                            if line.strip():
+                                logger.info(f"Lock held by: {line.strip()}")
+                except FileNotFoundError:
+                    # lsof not available - use file age as fallback
+                    try:
+                        stat_info = os.stat(lock_file)
+                        age_seconds = time.time() - stat_info.st_mtime
+                        # If lock file is older than 30 minutes, consider it orphaned
+                        if age_seconds > 1800:
+                            logger.warning(f"SRCDEST lock file {os.path.basename(lock_file)} is {age_seconds:.0f}s old, removing orphaned lock from previous session")
+                            os.unlink(lock_file)
+                            cleaned_count += 1
+                            logger.info(f"Old SRCDEST lock {os.path.basename(lock_file)} cleaned up successfully")
+                        else:
+                            logger.info(f"SRCDEST lock file {os.path.basename(lock_file)} is recent ({age_seconds:.0f}s old), leaving in place")
+                    except Exception as stat_error:
+                        logger.warning(f"Could not check lock file {os.path.basename(lock_file)} age: {stat_error}")
+                        logger.info(f"Leaving lock file {os.path.basename(lock_file)} in place to be safe")
+                except Exception as e:
+                    logger.warning(f"Could not check SRCDEST lock {os.path.basename(lock_file)} status during startup: {e}")
+                    logger.info(f"Leaving lock file {os.path.basename(lock_file)} in place to be safe")
+            except Exception as lock_error:
+                logger.error(f"Error processing lock file {lock_file}: {lock_error}")
+
+        if cleaned_count > 0:
+            logger.info(f"SRCDEST lock cleanup completed: removed {cleaned_count} orphaned lock files")
 
     except Exception as e:
         logger.error(f"Error during SRCDEST lock cleanup: {e}")
@@ -962,8 +976,8 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         # Lock SRCDEST if it exists with timeout
         srcdest_lock = None
         if 'SRCDEST' in makepkg_config:
-            log_output(f"Attempting to acquire SRCDEST lock for {makepkg_config['SRCDEST']}")
-            srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'])
+            log_output(f"Attempting to acquire SRCDEST lock for {makepkg_config['SRCDEST']} (package: {pkgbuild_info['pkgname']})")
+            srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'], pkgbuild_info['pkgname'])
             if srcdest_lock is None:
                 log_output("Waiting for SRCDEST lock...")
                 # Wait for lock with timeout to prevent infinite waiting
@@ -973,7 +987,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                         log_output("SRCDEST lock timeout after 10 minutes, continuing without lock")
                         break
                     time.sleep(5)  # Check every 5 seconds instead of 1
-                    srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'])
+                    srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'], pkgbuild_info['pkgname'])
 
             if srcdest_lock is not None:
                 log_output("SRCDEST lock acquired successfully")
