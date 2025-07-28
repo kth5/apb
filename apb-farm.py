@@ -1222,7 +1222,7 @@ def get_cache_config() -> Dict[str, Any]:
     """Get cache configuration from the main config"""
     config = load_config()
     cache_config = config.get("cache", {})
-    
+
     # Set defaults
     defaults = {
         "enabled": True,
@@ -1230,14 +1230,14 @@ def get_cache_config() -> Dict[str, Any]:
         "directory": "~/.apb/cache",
         "max_size_mb": 10240
     }
-    
+
     for key, default_value in defaults.items():
         if key not in cache_config:
             cache_config[key] = default_value
-    
+
     # Expand directory path
     cache_config["directory"] = Path(cache_config["directory"]).expanduser()
-    
+
     return cache_config
 
 
@@ -1252,43 +1252,43 @@ def ensure_cache_directory() -> Path:
 async def cache_artifact(build_id: str, filename: str, content: bytes) -> bool:
     """Cache an artifact to local storage"""
     cache_config = get_cache_config()
-    
+
     if not cache_config["enabled"]:
         return False
-    
+
     cache_dir = ensure_cache_directory()
-    
+
     # Create build-specific directory
     build_cache_dir = cache_dir / build_id
     build_cache_dir.mkdir(exist_ok=True)
-    
+
     file_path = build_cache_dir / filename
     current_time = time.time()
-    
+
     try:
         # Write the file
         with open(file_path, 'wb') as f:
             f.write(content)
-        
+
         # Determine content type
         content_type = "application/octet-stream"
         if filename.endswith('.log'):
             content_type = "text/plain"
         elif filename.endswith(('.pkg.tar.xz', '.pkg.tar.zst')):
             content_type = "application/x-xz" if filename.endswith('.xz') else "application/zstd"
-        
+
         # Record in database
         cursor = build_database.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO cached_artifacts 
+            INSERT OR REPLACE INTO cached_artifacts
             (build_id, filename, file_path, file_size, cached_at, last_accessed, content_type)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (build_id, filename, str(file_path), len(content), current_time, current_time, content_type))
         build_database.commit()
-        
+
         logger.debug(f"Cached artifact {filename} for build {build_id} ({len(content)} bytes)")
         return True
-        
+
     except Exception as e:
         logger.error(f"Failed to cache artifact {filename} for build {build_id}: {e}")
         # Clean up partial file
@@ -1300,40 +1300,40 @@ async def cache_artifact(build_id: str, filename: str, content: bytes) -> bool:
 async def get_cached_artifact(build_id: str, filename: str) -> Optional[Dict[str, Any]]:
     """Get cached artifact info if available"""
     cache_config = get_cache_config()
-    
+
     if not cache_config["enabled"]:
         return None
-    
+
     cursor = build_database.cursor()
     cursor.execute('''
         SELECT file_path, file_size, cached_at, content_type
-        FROM cached_artifacts 
+        FROM cached_artifacts
         WHERE build_id = ? AND filename = ?
     ''', (build_id, filename))
-    
+
     result = cursor.fetchone()
     if not result:
         return None
-    
+
     file_path, file_size, cached_at, content_type = result
     file_path = Path(file_path)
-    
+
     # Check if file still exists
     if not file_path.exists():
         # File was deleted externally, remove from database
         cursor.execute('DELETE FROM cached_artifacts WHERE build_id = ? AND filename = ?', (build_id, filename))
         build_database.commit()
         return None
-    
+
     # Update last accessed time
     current_time = time.time()
     cursor.execute('''
-        UPDATE cached_artifacts 
-        SET last_accessed = ? 
+        UPDATE cached_artifacts
+        SET last_accessed = ?
         WHERE build_id = ? AND filename = ?
     ''', (current_time, build_id, filename))
     build_database.commit()
-    
+
     return {
         "file_path": file_path,
         "file_size": file_size,
@@ -1342,28 +1342,85 @@ async def get_cached_artifact(build_id: str, filename: str) -> Optional[Dict[str
     }
 
 
+async def proactively_cache_build_artifacts(build_id: str, server_url: str, build_status: Dict):
+    """Proactively cache all artifacts for a completed build"""
+    cache_config = get_cache_config()
+
+    if not cache_config["enabled"]:
+        return
+
+    artifacts_to_cache = []
+
+    # Add packages to cache list
+    packages = build_status.get("packages", [])
+    for package in packages:
+        filename = package.get("filename")
+        if filename:
+            artifacts_to_cache.append(filename)
+
+    # Add logs to cache list
+    logs = build_status.get("logs", [])
+    for log in logs:
+        filename = log.get("filename")
+        if filename:
+            artifacts_to_cache.append(filename)
+
+    if not artifacts_to_cache:
+        logger.debug(f"No artifacts to cache for build {build_id}")
+        return
+
+    logger.info(f"Proactively caching {len(artifacts_to_cache)} artifacts for completed build {build_id}")
+
+    cached_count = 0
+    for filename in artifacts_to_cache:
+        try:
+            # Check if already cached
+            existing_cache = await get_cached_artifact(build_id, filename)
+            if existing_cache:
+                logger.debug(f"Artifact {filename} for build {build_id} already cached")
+                continue
+
+            # Download and cache the artifact
+            async with http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    if await cache_artifact(build_id, filename, content):
+                        cached_count += 1
+                        logger.debug(f"Proactively cached {filename} for build {build_id} ({len(content)} bytes)")
+                    else:
+                        logger.warning(f"Failed to cache {filename} for build {build_id}")
+                else:
+                    logger.warning(f"Failed to download {filename} for build {build_id} (HTTP {response.status})")
+
+        except Exception as e:
+            logger.error(f"Error proactively caching {filename} for build {build_id}: {e}")
+
+    if cached_count > 0:
+        logger.info(f"Successfully cached {cached_count}/{len(artifacts_to_cache)} artifacts for build {build_id}")
+
+
 async def cleanup_expired_cache():
     """Clean up expired cache entries based on retention policy"""
     cache_config = get_cache_config()
-    
+
     if not cache_config["enabled"]:
         return
-    
+
     retention_seconds = cache_config["retention_days"] * 24 * 60 * 60
     current_time = time.time()
     cutoff_time = current_time - retention_seconds
-    
+
     cursor = build_database.cursor()
-    
+
     # Find expired artifacts
     cursor.execute('''
-        SELECT build_id, filename, file_path 
-        FROM cached_artifacts 
+        SELECT build_id, filename, file_path
+        FROM cached_artifacts
         WHERE cached_at < ?
     ''', (cutoff_time,))
-    
+
     expired_artifacts = cursor.fetchall()
-    
+
     for build_id, filename, file_path in expired_artifacts:
         try:
             # Delete the physical file
@@ -1371,13 +1428,13 @@ async def cleanup_expired_cache():
             if file_path.exists():
                 file_path.unlink()
                 logger.debug(f"Deleted expired cache file: {file_path}")
-            
+
             # Remove from database
             cursor.execute('DELETE FROM cached_artifacts WHERE build_id = ? AND filename = ?', (build_id, filename))
-            
+
         except Exception as e:
             logger.error(f"Failed to clean up cached artifact {file_path}: {e}")
-    
+
     # Clean up empty build directories
     cache_dir = ensure_cache_directory()
     try:
@@ -1387,9 +1444,9 @@ async def cleanup_expired_cache():
                 logger.debug(f"Removed empty cache directory: {build_dir}")
     except Exception as e:
         logger.error(f"Failed to clean up empty cache directories: {e}")
-    
+
     build_database.commit()
-    
+
     if expired_artifacts:
         logger.info(f"Cleaned up {len(expired_artifacts)} expired cached artifacts")
 
@@ -2136,6 +2193,10 @@ async def update_single_build_status(build_id: str, server_url: str):
                          build_id))
                 build_database.commit()
                 logger.debug(f"Updated status for build {build_id}: {status}")
+
+                # Proactively cache artifacts if build completed successfully
+                if status == BuildStatus.COMPLETED:
+                    asyncio.create_task(proactively_cache_build_artifacts(build_id, server_url, build_status))
             elif response.status == 404:
                 # Build not found on server - track when first missing
                 current_time = time.time()
@@ -4459,7 +4520,7 @@ async def stream_build_output(build_id: str):
 @app.get("/build/{build_id}/download/{filename}")
 async def download_file(build_id: str, filename: str):
     """Download build artifact (with caching)"""
-    
+
     # First, check if we have the artifact in cache
     cached_artifact = await get_cached_artifact(build_id, filename)
     if cached_artifact:
@@ -4475,7 +4536,7 @@ async def download_file(build_id: str, filename: str):
                 "Content-Length": str(cached_artifact["file_size"])
             }
         )
-    
+
     # Not in cache, need to download from build server
     server_url = await find_build_server(build_id)
 
@@ -4510,17 +4571,17 @@ async def download_file(build_id: str, filename: str):
             async with http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300) as response:
                 if response.status == 200:
                     content = await response.read()
-                    
+
                     # Cache the artifact for future use
                     await cache_artifact(build_id, filename, content)
-                    
+
                     # Determine content type
                     content_type = "application/octet-stream"
                     if filename.endswith('.log'):
                         content_type = "text/plain"
                     elif filename.endswith(('.pkg.tar.xz', '.pkg.tar.zst')):
                         content_type = "application/x-xz" if filename.endswith('.xz') else "application/zstd"
-                    
+
                     logger.debug(f"Downloaded and cached {filename} for build {build_id} ({len(content)} bytes)")
                     return StreamingResponse(
                         iter([content]),
@@ -4635,35 +4696,35 @@ async def get_my_builds(
 async def get_cache_status(current_user: User = Depends(require_admin)):
     """Get cache status information for administrators"""
     cache_config = get_cache_config()
-    
+
     if not cache_config["enabled"]:
         return {
             "enabled": False,
             "message": "Caching is disabled"
         }
-    
+
     cursor = build_database.cursor()
-    
+
     # Get cache statistics
     cursor.execute('SELECT COUNT(*) FROM cached_artifacts')
     total_artifacts = cursor.fetchone()[0]
-    
+
     cursor.execute('SELECT SUM(file_size) FROM cached_artifacts')
     total_size_result = cursor.fetchone()
     total_size = total_size_result[0] if total_size_result[0] else 0
-    
+
     cursor.execute('SELECT MIN(cached_at) FROM cached_artifacts')
     oldest_cache_result = cursor.fetchone()
     oldest_cache = oldest_cache_result[0] if oldest_cache_result[0] else None
-    
+
     # Get expired artifacts count
     retention_seconds = cache_config["retention_days"] * 24 * 60 * 60
     current_time = time.time()
     cutoff_time = current_time - retention_seconds
-    
+
     cursor.execute('SELECT COUNT(*) FROM cached_artifacts WHERE cached_at < ?', (cutoff_time,))
     expired_artifacts = cursor.fetchone()[0]
-    
+
     return {
         "enabled": True,
         "retention_days": cache_config["retention_days"],
@@ -4682,28 +4743,28 @@ async def get_cache_status(current_user: User = Depends(require_admin)):
 async def manual_cache_cleanup(current_user: User = Depends(require_admin)):
     """Manually trigger cache cleanup for administrators"""
     cache_config = get_cache_config()
-    
+
     if not cache_config["enabled"]:
         return {
             "success": False,
             "message": "Caching is disabled"
         }
-    
+
     try:
         # Get count before cleanup
         cursor = build_database.cursor()
         cursor.execute('SELECT COUNT(*) FROM cached_artifacts')
         artifacts_before = cursor.fetchone()[0]
-        
+
         # Run cleanup
         await cleanup_expired_cache()
-        
+
         # Get count after cleanup
         cursor.execute('SELECT COUNT(*) FROM cached_artifacts')
         artifacts_after = cursor.fetchone()[0]
-        
+
         cleaned_count = artifacts_before - artifacts_after
-        
+
         return {
             "success": True,
             "artifacts_before": artifacts_before,
@@ -4711,7 +4772,7 @@ async def manual_cache_cleanup(current_user: User = Depends(require_admin)):
             "artifacts_cleaned": cleaned_count,
             "message": f"Cache cleanup completed. Removed {cleaned_count} expired artifacts."
         }
-        
+
     except Exception as e:
         logger.error(f"Manual cache cleanup failed: {e}")
         return {
@@ -4827,6 +4888,7 @@ async def get_admin_panel(
             <div class="tab-buttons">
                 <div class="tab-button active" onclick="switchTab('smtp-tab')">📧 SMTP Configuration</div>
                 <div class="tab-button" onclick="switchTab('users-tab')">👥 User Management</div>
+                <div class="tab-button" onclick="switchTab('admin-functions-tab')">⚙️ Admin Functions</div>
             </div>
 
             <div id="smtp-tab" class="tab-content active">
@@ -4865,6 +4927,30 @@ async def get_admin_panel(
                                 <div class="success-message" id="testSuccess"></div>
                                 <button type="submit" class="submit-button">Send Test Email</button>
                             </form>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="admin-functions-tab" class="tab-content">
+                <div class="admin-section">
+                    <h2>🗂️ Cache Management</h2>
+                    <div class="smtp-config-form">
+                        <h3>Build Artifact Cache</h3>
+                        <p>The farm caches build artifacts (packages and logs) for faster downloads and improved reliability.</p>
+
+                        <div id="cacheStatusSection">
+                            <h4>Cache Status</h4>
+                            <div id="cacheStatusDisplay">Loading cache status...</div>
+                            <button type="button" class="submit-button" onclick="loadCacheStatus()">🔄 Refresh Status</button>
+                        </div>
+
+                        <div style="margin-top: 20px;">
+                            <h4>Cache Cleanup</h4>
+                            <p>Manually remove expired cache artifacts. This operation runs automatically every 4 hours.</p>
+                            <div class="error-message" id="cleanupError"></div>
+                            <div class="success-message" id="cleanupSuccess"></div>
+                            <button type="button" class="submit-button" onclick="performCacheCleanup()">🧹 Clean Up Cache</button>
                         </div>
                     </div>
                 </div>
@@ -5251,8 +5337,94 @@ async def get_admin_panel(
                 }}
             }}
 
-            // Load SMTP config on page load
-            window.addEventListener('load', loadSmtpConfig);
+            // Cache management functions
+            async function loadCacheStatus() {{
+                const displayElement = document.getElementById('cacheStatusDisplay');
+                displayElement.innerHTML = 'Loading...';
+
+                try {{
+                    const token = getAuthToken();
+                    if (!token) {{
+                        displayElement.innerHTML = '<span class="error-message">Authentication required</span>';
+                        return;
+                    }}
+
+                    const response = await fetch('/admin/cache', {{
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }}
+                    }});
+
+                    if (response.ok) {{
+                        const data = await response.json();
+                        if (data.enabled) {{
+                            displayElement.innerHTML = `
+                                <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #28a745;">
+                                    <h5 style="margin-top: 0; color: #28a745;">✅ Cache Enabled</h5>
+                                    <p><strong>Retention:</strong> ${{data.retention_days}} days</p>
+                                    <p><strong>Total Artifacts:</strong> ${{data.total_artifacts}} files</p>
+                                    <p><strong>Total Size:</strong> ${{data.total_size_mb}} MB (${{data.total_size_bytes}} bytes)</p>
+                                    <p><strong>Expired Artifacts:</strong> ${{data.expired_artifacts}} files</p>
+                                    ${{data.oldest_cache_age_days ? `<p><strong>Oldest Cache:</strong> ${{data.oldest_cache_age_days}} days old</p>` : ''}}
+                                </div>
+                            `;
+                        }} else {{
+                            displayElement.innerHTML = `
+                                <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
+                                    <h5 style="margin-top: 0; color: #856404;">⚠️ Cache Disabled</h5>
+                                    <p>${{data.message}}</p>
+                                </div>
+                            `;
+                        }}
+                    }} else {{
+                        displayElement.innerHTML = '<span class="error-message">Failed to load cache status</span>';
+                    }}
+                }} catch (error) {{
+                    displayElement.innerHTML = '<span class="error-message">Error loading cache status</span>';
+                }}
+            }}
+
+            async function performCacheCleanup() {{
+                const errorElement = document.getElementById('cleanupError');
+                const successElement = document.getElementById('cleanupSuccess');
+
+                // Clear previous messages
+                errorElement.textContent = '';
+                successElement.textContent = '';
+
+                try {{
+                    const token = getAuthToken();
+                    if (!token) {{
+                        errorElement.textContent = 'Authentication required';
+                        return;
+                    }}
+
+                    const response = await fetch('/admin/cache/cleanup', {{
+                        method: 'POST',
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }}
+                    }});
+
+                    const data = await response.json();
+
+                    if (response.ok && data.success) {{
+                        successElement.textContent = data.message;
+                        // Reload cache status to show updated information
+                        loadCacheStatus();
+                    }} else {{
+                        errorElement.textContent = data.message || 'Cache cleanup failed';
+                    }}
+                }} catch (error) {{
+                    errorElement.textContent = 'Error performing cache cleanup';
+                }}
+            }}
+
+            // Load SMTP config and cache status on page load
+            window.addEventListener('load', function() {{
+                loadSmtpConfig();
+                loadCacheStatus();
+            }});
         </script>
     </body>
     </html>

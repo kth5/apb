@@ -1690,6 +1690,7 @@ Cache settings are configured in `apb.json`:
 - **GET** `/admin/cache`
 - **Authorization**: Bearer token (admin only)
 - Returns cache statistics and configuration
+- **Also available**: Through the admin web dashboard under "Admin Functions" tab
 
 **Response:**
 ```json
@@ -1711,6 +1712,7 @@ Cache settings are configured in `apb.json`:
 - **POST** `/admin/cache/cleanup`
 - **Authorization**: Bearer token (admin only)
 - Manually triggers cache cleanup of expired artifacts
+- **Also available**: Through the admin web dashboard under "Admin Functions" tab with one-click cleanup
 
 **Response:**
 ```json
@@ -1725,12 +1727,33 @@ Cache settings are configured in `apb.json`:
 
 ### Cache Behavior
 
-1. **Download Request**: When a user requests an artifact download
-2. **Cache Check**: Farm first checks if the artifact is cached locally
-3. **Cache Hit**: If cached, artifact is served directly from local storage
-4. **Cache Miss**: If not cached, artifact is downloaded from build server and cached
-5. **Cache Storage**: Artifacts are stored in build-specific directories
-6. **Automatic Cleanup**: Background task runs every 4 hours to remove expired artifacts
+1. **Build Completion**: When a build completes successfully, all artifacts are proactively cached
+2. **Download Request**: When a user requests an artifact download
+3. **Cache Check**: Farm first checks if the artifact is cached locally
+4. **Cache Hit**: If cached, artifact is served directly from local storage
+5. **Cache Miss**: If not cached, artifact is downloaded from build server and cached
+6. **Cache Storage**: Artifacts are stored in build-specific directories
+7. **Automatic Cleanup**: Background task runs every 4 hours to remove expired artifacts
+
+### Admin Dashboard Integration
+
+The cache management features are fully integrated into the admin web dashboard:
+
+- **Access**: Navigate to the admin panel and click the "Admin Functions" tab
+- **Cache Status**: Real-time display of cache statistics, retention settings, and storage usage
+- **Manual Cleanup**: One-click cache cleanup with live status updates
+- **Authentication**: Requires admin login through the web interface
+- **User-Friendly**: Visual status indicators and success/error messages
+
+#### Proactive Caching
+
+The farm automatically caches all build artifacts (packages and logs) immediately when a build completes successfully:
+
+- **Triggered**: Automatically when build status changes to "completed"
+- **Background Process**: Caching runs asynchronously without blocking status updates
+- **All Artifacts**: Both packages (.pkg.tar.xz files) and build logs are cached
+- **Error Handling**: Individual artifact caching failures don't affect other artifacts
+- **Logging**: Comprehensive logging of caching operations for monitoring
 
 ### CDN and Proxy Caching
 
