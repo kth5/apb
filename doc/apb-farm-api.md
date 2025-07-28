@@ -1655,3 +1655,95 @@ curl -X POST http://farm:8080/build \
   -F "pkgbuild=@PKGBUILD" \
   -F "sources=@source.tar.gz"
 ```
+
+---
+
+## Artifact Caching
+
+The APB Farm includes a built-in caching system for improved download performance and reliability.
+
+### Cache Features
+- **Local Storage**: Built packages and build logs are cached locally on the farm
+- **Configurable Retention**: Artifacts are kept for a configurable period (default: 30 days)
+- **Automatic Cleanup**: Background task removes expired artifacts
+- **Direct Serving**: Downloads are served directly from cache when available
+- **Fallback Support**: Falls back to build servers if artifacts aren't cached
+
+### Cache Configuration
+
+Cache settings are configured in `apb.json`:
+
+```json
+{
+  "cache": {
+    "enabled": true,
+    "retention_days": 30,
+    "directory": "~/.apb/cache",
+    "max_size_mb": 10240
+  }
+}
+```
+
+### Cache Management Endpoints
+
+#### Get Cache Status
+- **GET** `/admin/cache`
+- **Authorization**: Bearer token (admin only)
+- Returns cache statistics and configuration
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "retention_days": 30,
+  "directory": "/home/user/.apb/cache",
+  "max_size_mb": 10240,
+  "total_artifacts": 150,
+  "total_size_bytes": 524288000,
+  "total_size_mb": 500.0,
+  "expired_artifacts": 5,
+  "oldest_cache_timestamp": 1672531200.0,
+  "oldest_cache_age_days": 15.5
+}
+```
+
+#### Manual Cache Cleanup
+- **POST** `/admin/cache/cleanup`
+- **Authorization**: Bearer token (admin only)
+- Manually triggers cache cleanup of expired artifacts
+
+**Response:**
+```json
+{
+  "success": true,
+  "artifacts_before": 150,
+  "artifacts_after": 145,
+  "artifacts_cleaned": 5,
+  "message": "Cache cleanup completed. Removed 5 expired artifacts."
+}
+```
+
+### Cache Behavior
+
+1. **Download Request**: When a user requests an artifact download
+2. **Cache Check**: Farm first checks if the artifact is cached locally
+3. **Cache Hit**: If cached, artifact is served directly from local storage
+4. **Cache Miss**: If not cached, artifact is downloaded from build server and cached
+5. **Cache Storage**: Artifacts are stored in build-specific directories
+6. **Automatic Cleanup**: Background task runs every 4 hours to remove expired artifacts
+
+### CDN and Proxy Caching
+
+Build artifact downloads include appropriate headers for optimal caching and user experience:
+
+- **Cache-Control**: `public, max-age=2592000, immutable` (30 days)
+- **ETag**: `"{build_id}-{filename}"` for cache validation
+- **Content-Disposition**: `attachment; filename={filename}` for proper downloads
+- **Content-Length**: File size in bytes for download progress indication
+
+These headers enable:
+- **CDN Caching**: Content delivery networks can cache artifacts for 30 days
+- **Proxy Caching**: Corporate proxies and ISP caches can store frequently accessed packages
+- **Browser Caching**: End-user browsers cache downloads to avoid re-downloading
+- **Immutable Content**: The `immutable` directive tells caches the content will never change
+- **Download Progress**: Content-Length allows clients to show accurate download progress bars

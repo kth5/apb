@@ -877,6 +877,18 @@ async def cleanup_expired_tokens_task():
             await asyncio.sleep(3600)
 
 
+async def cleanup_cache_task():
+    """Background task to clean up expired cache artifacts"""
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.sleep(14400)  # Run every 4 hours
+            if not shutdown_event.is_set():
+                await cleanup_expired_cache()
+        except Exception as e:
+            logger.error(f"Error in cleanup_cache_task: {e}")
+            await asyncio.sleep(300)  # Wait 5 minutes before retrying
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan events"""
@@ -906,7 +918,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(update_build_status()),
         asyncio.create_task(discover_builds()),
         asyncio.create_task(handle_unavailable_servers()),
-        asyncio.create_task(cleanup_expired_tokens_task())
+        asyncio.create_task(cleanup_expired_tokens_task()),
+        asyncio.create_task(cleanup_cache_task())
     ])
 
     logger.info(f"APB Farm started with {len(config.get('servers', {}))} architecture groups")
@@ -1074,6 +1087,23 @@ def init_database() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
 
+    # Create cache artifacts table
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS cached_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            build_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            cached_at REAL NOT NULL,
+            last_accessed REAL NOT NULL,
+            content_type TEXT DEFAULT 'application/octet-stream',
+            UNIQUE(build_id, filename)
+        )
+    ''')
+
+    conn.commit()
+
     try:
         conn.execute('ALTER TABLE builds ADD COLUMN first_missing_at REAL')
         conn.commit()
@@ -1186,6 +1216,182 @@ def parse_pkgbuild_version(pkgbuild_content: str) -> Dict[str, str]:
             'pkgver': "unknown",
             'pkgrel': "1"
         }
+
+
+def get_cache_config() -> Dict[str, Any]:
+    """Get cache configuration from the main config"""
+    config = load_config()
+    cache_config = config.get("cache", {})
+    
+    # Set defaults
+    defaults = {
+        "enabled": True,
+        "retention_days": 30,
+        "directory": "~/.apb/cache",
+        "max_size_mb": 10240
+    }
+    
+    for key, default_value in defaults.items():
+        if key not in cache_config:
+            cache_config[key] = default_value
+    
+    # Expand directory path
+    cache_config["directory"] = Path(cache_config["directory"]).expanduser()
+    
+    return cache_config
+
+
+def ensure_cache_directory() -> Path:
+    """Ensure cache directory exists and return its path"""
+    cache_config = get_cache_config()
+    cache_dir = cache_config["directory"]
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+async def cache_artifact(build_id: str, filename: str, content: bytes) -> bool:
+    """Cache an artifact to local storage"""
+    cache_config = get_cache_config()
+    
+    if not cache_config["enabled"]:
+        return False
+    
+    cache_dir = ensure_cache_directory()
+    
+    # Create build-specific directory
+    build_cache_dir = cache_dir / build_id
+    build_cache_dir.mkdir(exist_ok=True)
+    
+    file_path = build_cache_dir / filename
+    current_time = time.time()
+    
+    try:
+        # Write the file
+        with open(file_path, 'wb') as f:
+            f.write(content)
+        
+        # Determine content type
+        content_type = "application/octet-stream"
+        if filename.endswith('.log'):
+            content_type = "text/plain"
+        elif filename.endswith(('.pkg.tar.xz', '.pkg.tar.zst')):
+            content_type = "application/x-xz" if filename.endswith('.xz') else "application/zstd"
+        
+        # Record in database
+        cursor = build_database.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO cached_artifacts 
+            (build_id, filename, file_path, file_size, cached_at, last_accessed, content_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (build_id, filename, str(file_path), len(content), current_time, current_time, content_type))
+        build_database.commit()
+        
+        logger.debug(f"Cached artifact {filename} for build {build_id} ({len(content)} bytes)")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to cache artifact {filename} for build {build_id}: {e}")
+        # Clean up partial file
+        if file_path.exists():
+            file_path.unlink()
+        return False
+
+
+async def get_cached_artifact(build_id: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Get cached artifact info if available"""
+    cache_config = get_cache_config()
+    
+    if not cache_config["enabled"]:
+        return None
+    
+    cursor = build_database.cursor()
+    cursor.execute('''
+        SELECT file_path, file_size, cached_at, content_type
+        FROM cached_artifacts 
+        WHERE build_id = ? AND filename = ?
+    ''', (build_id, filename))
+    
+    result = cursor.fetchone()
+    if not result:
+        return None
+    
+    file_path, file_size, cached_at, content_type = result
+    file_path = Path(file_path)
+    
+    # Check if file still exists
+    if not file_path.exists():
+        # File was deleted externally, remove from database
+        cursor.execute('DELETE FROM cached_artifacts WHERE build_id = ? AND filename = ?', (build_id, filename))
+        build_database.commit()
+        return None
+    
+    # Update last accessed time
+    current_time = time.time()
+    cursor.execute('''
+        UPDATE cached_artifacts 
+        SET last_accessed = ? 
+        WHERE build_id = ? AND filename = ?
+    ''', (current_time, build_id, filename))
+    build_database.commit()
+    
+    return {
+        "file_path": file_path,
+        "file_size": file_size,
+        "cached_at": cached_at,
+        "content_type": content_type
+    }
+
+
+async def cleanup_expired_cache():
+    """Clean up expired cache entries based on retention policy"""
+    cache_config = get_cache_config()
+    
+    if not cache_config["enabled"]:
+        return
+    
+    retention_seconds = cache_config["retention_days"] * 24 * 60 * 60
+    current_time = time.time()
+    cutoff_time = current_time - retention_seconds
+    
+    cursor = build_database.cursor()
+    
+    # Find expired artifacts
+    cursor.execute('''
+        SELECT build_id, filename, file_path 
+        FROM cached_artifacts 
+        WHERE cached_at < ?
+    ''', (cutoff_time,))
+    
+    expired_artifacts = cursor.fetchall()
+    
+    for build_id, filename, file_path in expired_artifacts:
+        try:
+            # Delete the physical file
+            file_path = Path(file_path)
+            if file_path.exists():
+                file_path.unlink()
+                logger.debug(f"Deleted expired cache file: {file_path}")
+            
+            # Remove from database
+            cursor.execute('DELETE FROM cached_artifacts WHERE build_id = ? AND filename = ?', (build_id, filename))
+            
+        except Exception as e:
+            logger.error(f"Failed to clean up cached artifact {file_path}: {e}")
+    
+    # Clean up empty build directories
+    cache_dir = ensure_cache_directory()
+    try:
+        for build_dir in cache_dir.iterdir():
+            if build_dir.is_dir() and not any(build_dir.iterdir()):
+                build_dir.rmdir()
+                logger.debug(f"Removed empty cache directory: {build_dir}")
+    except Exception as e:
+        logger.error(f"Failed to clean up empty cache directories: {e}")
+    
+    build_database.commit()
+    
+    if expired_artifacts:
+        logger.info(f"Cleaned up {len(expired_artifacts)} expired cached artifacts")
 
 
 def format_package_name_with_version(pkgname: str, epoch: str = None, pkgver: str = None, pkgrel: str = None) -> str:
@@ -4252,7 +4458,25 @@ async def stream_build_output(build_id: str):
 
 @app.get("/build/{build_id}/download/{filename}")
 async def download_file(build_id: str, filename: str):
-    """Download build artifact"""
+    """Download build artifact (with caching)"""
+    
+    # First, check if we have the artifact in cache
+    cached_artifact = await get_cached_artifact(build_id, filename)
+    if cached_artifact:
+        logger.debug(f"Serving {filename} for build {build_id} from cache")
+        return FileResponse(
+            path=str(cached_artifact["file_path"]),
+            filename=filename,
+            media_type=cached_artifact["content_type"],
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
+                "ETag": f'"{build_id}-{filename}"',
+                "Content-Length": str(cached_artifact["file_size"])
+            }
+        )
+    
+    # Not in cache, need to download from build server
     server_url = await find_build_server(build_id)
 
     if not server_url:
@@ -4286,10 +4510,27 @@ async def download_file(build_id: str, filename: str):
             async with http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300) as response:
                 if response.status == 200:
                     content = await response.read()
+                    
+                    # Cache the artifact for future use
+                    await cache_artifact(build_id, filename, content)
+                    
+                    # Determine content type
+                    content_type = "application/octet-stream"
+                    if filename.endswith('.log'):
+                        content_type = "text/plain"
+                    elif filename.endswith(('.pkg.tar.xz', '.pkg.tar.zst')):
+                        content_type = "application/x-xz" if filename.endswith('.xz') else "application/zstd"
+                    
+                    logger.debug(f"Downloaded and cached {filename} for build {build_id} ({len(content)} bytes)")
                     return StreamingResponse(
                         iter([content]),
-                        media_type="application/octet-stream",
-                        headers={"Content-Disposition": f"attachment; filename={filename}"}
+                        media_type=content_type,
+                        headers={
+                            "Content-Disposition": f"attachment; filename={filename}",
+                            "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
+                            "ETag": f'"{build_id}-{filename}"',
+                            "Content-Length": str(len(content))
+                        }
                     )
                 elif response.status == 404:
                     raise HTTPException(status_code=404, detail="File not found")
@@ -4388,6 +4629,95 @@ async def get_my_builds(
             build["server_url"] = obfuscate_server_url(build["server_url"])
 
     return {"builds": builds}
+
+
+@app.get("/admin/cache")
+async def get_cache_status(current_user: User = Depends(require_admin)):
+    """Get cache status information for administrators"""
+    cache_config = get_cache_config()
+    
+    if not cache_config["enabled"]:
+        return {
+            "enabled": False,
+            "message": "Caching is disabled"
+        }
+    
+    cursor = build_database.cursor()
+    
+    # Get cache statistics
+    cursor.execute('SELECT COUNT(*) FROM cached_artifacts')
+    total_artifacts = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT SUM(file_size) FROM cached_artifacts')
+    total_size_result = cursor.fetchone()
+    total_size = total_size_result[0] if total_size_result[0] else 0
+    
+    cursor.execute('SELECT MIN(cached_at) FROM cached_artifacts')
+    oldest_cache_result = cursor.fetchone()
+    oldest_cache = oldest_cache_result[0] if oldest_cache_result[0] else None
+    
+    # Get expired artifacts count
+    retention_seconds = cache_config["retention_days"] * 24 * 60 * 60
+    current_time = time.time()
+    cutoff_time = current_time - retention_seconds
+    
+    cursor.execute('SELECT COUNT(*) FROM cached_artifacts WHERE cached_at < ?', (cutoff_time,))
+    expired_artifacts = cursor.fetchone()[0]
+    
+    return {
+        "enabled": True,
+        "retention_days": cache_config["retention_days"],
+        "directory": str(cache_config["directory"]),
+        "max_size_mb": cache_config["max_size_mb"],
+        "total_artifacts": total_artifacts,
+        "total_size_bytes": total_size,
+        "total_size_mb": round(total_size / 1024 / 1024, 2) if total_size else 0,
+        "expired_artifacts": expired_artifacts,
+        "oldest_cache_timestamp": oldest_cache,
+        "oldest_cache_age_days": round((current_time - oldest_cache) / 86400, 1) if oldest_cache else None
+    }
+
+
+@app.post("/admin/cache/cleanup")
+async def manual_cache_cleanup(current_user: User = Depends(require_admin)):
+    """Manually trigger cache cleanup for administrators"""
+    cache_config = get_cache_config()
+    
+    if not cache_config["enabled"]:
+        return {
+            "success": False,
+            "message": "Caching is disabled"
+        }
+    
+    try:
+        # Get count before cleanup
+        cursor = build_database.cursor()
+        cursor.execute('SELECT COUNT(*) FROM cached_artifacts')
+        artifacts_before = cursor.fetchone()[0]
+        
+        # Run cleanup
+        await cleanup_expired_cache()
+        
+        # Get count after cleanup
+        cursor.execute('SELECT COUNT(*) FROM cached_artifacts')
+        artifacts_after = cursor.fetchone()[0]
+        
+        cleaned_count = artifacts_before - artifacts_after
+        
+        return {
+            "success": True,
+            "artifacts_before": artifacts_before,
+            "artifacts_after": artifacts_after,
+            "artifacts_cleaned": cleaned_count,
+            "message": f"Cache cleanup completed. Removed {cleaned_count} expired artifacts."
+        }
+        
+    except Exception as e:
+        logger.error(f"Manual cache cleanup failed: {e}")
+        return {
+            "success": False,
+            "message": f"Cache cleanup failed: {str(e)}"
+        }
 
 
 @app.get("/admin")

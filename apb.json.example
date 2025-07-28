@@ -10,5 +10,11 @@
     "riscv64": [
       "http://riscv-server1.example.com:8000"
     ]
+  },
+  "cache": {
+    "enabled": true,
+    "retention_days": 30,
+    "directory": "~/.apb/cache",
+    "max_size_mb": 10240
   }
 } 
