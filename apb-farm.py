@@ -8,7 +8,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import sys
 import time
@@ -907,9 +906,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(update_build_status()),
         asyncio.create_task(discover_builds()),
         asyncio.create_task(handle_unavailable_servers()),
-        asyncio.create_task(cleanup_expired_tokens_task()),
-        asyncio.create_task(process_archive_queue()),
-        asyncio.create_task(cleanup_old_archives())
+        asyncio.create_task(cleanup_expired_tokens_task())
     ])
 
     logger.info(f"APB Farm started with {len(config.get('servers', {}))} architecture groups")
@@ -988,29 +985,13 @@ def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
         if path.exists():
             try:
                 with open(path, 'r') as f:
-                    config = json.load(f)
-
-                # Set default archive directory if not specified
-                if "archive_dir" not in config:
-                    config["archive_dir"] = str(Path.home() / ".apb" / "archive")
-
-                # Set default archive settings
-                if "archive_enabled" not in config:
-                    config["archive_enabled"] = True
-
-                if "archive_cleanup_server" not in config:
-                    config["archive_cleanup_server"] = True
-
-                if "archive_retention_days" not in config:
-                    config["archive_retention_days"] = 30
-
-                return config
+                    return json.load(f)
             except Exception as e:
                 logger.error(f"Error loading config from {path}: {e}")
                 continue
 
     logger.error("No configuration file found")
-    return {"servers": {}, "archive_dir": str(Path.home() / ".apb" / "archive"), "archive_enabled": True, "archive_cleanup_server": True, "archive_retention_days": 30}
+    return {"servers": {}}
 
 
 def init_database() -> sqlite3.Connection:
@@ -1035,19 +1016,6 @@ def init_database() -> sqlite3.Connection:
             last_status_update REAL,
             server_available BOOLEAN DEFAULT 1,
             cached_response TEXT
-        )
-    ''')
-
-    # Create archive tracking table
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS archived_files (
-            build_id TEXT,
-            filename TEXT,
-            file_type TEXT,  -- 'package' or 'log'
-            size INTEGER,
-            archived_at REAL,
-            archive_path TEXT,
-            PRIMARY KEY (build_id, filename)
         )
     ''')
 
@@ -1090,18 +1058,6 @@ def init_database() -> sqlite3.Connection:
 
     try:
         conn.execute('ALTER TABLE builds ADD COLUMN epoch TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN archived BOOLEAN DEFAULT 0')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN archive_requested BOOLEAN DEFAULT 0')
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -2139,216 +2095,6 @@ async def handle_unavailable_servers():
         except Exception as e:
             logger.error(f"Error in handle_unavailable_servers: {e}")
             await asyncio.sleep(120)
-
-
-async def archive_build_artifacts(build_id: str, server_url: str):
-    """Download and archive build artifacts from server"""
-    if not config.get("archive_enabled", True):
-        return False
-
-    try:
-        archive_dir = Path(config["archive_dir"])
-        build_archive_dir = archive_dir / build_id
-        build_archive_dir.mkdir(parents=True, exist_ok=True)
-
-        # Get build status to find files to archive
-        async with http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=30) as response:
-            if response.status != 200:
-                logger.error(f"Failed to get build status for archiving {build_id}")
-                return False
-
-            build_info = await response.json()
-
-        archived_files = []
-
-        # Archive package files
-        for package in build_info.get("packages", []):
-            filename = package["filename"]
-            file_path = build_archive_dir / filename
-
-            try:
-                async with http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300) as file_response:
-                    if file_response.status == 200:
-                        with open(file_path, 'wb') as f:
-                            async for chunk in file_response.content.iter_chunked(8192):
-                                f.write(chunk)
-
-                        # Record in database
-                        cursor = build_database.cursor()
-                        cursor.execute('''
-                            INSERT OR REPLACE INTO archived_files
-                            (build_id, filename, file_type, size, archived_at, archive_path)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        ''', (build_id, filename, 'package', file_path.stat().st_size, time.time(), str(file_path)))
-
-                        archived_files.append(filename)
-                        logger.info(f"Archived package: {build_id}/{filename}")
-                    else:
-                        logger.error(f"Failed to download package {filename} for build {build_id}")
-            except Exception as e:
-                logger.error(f"Error archiving package {filename} for build {build_id}: {e}")
-
-        # Archive log files
-        for log in build_info.get("logs", []):
-            filename = log["filename"]
-            file_path = build_archive_dir / filename
-
-            try:
-                async with http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300) as file_response:
-                    if file_response.status == 200:
-                        with open(file_path, 'wb') as f:
-                            async for chunk in file_response.content.iter_chunked(8192):
-                                f.write(chunk)
-
-                        # Record in database
-                        cursor = build_database.cursor()
-                        cursor.execute('''
-                            INSERT OR REPLACE INTO archived_files
-                            (build_id, filename, file_type, size, archived_at, archive_path)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        ''', (build_id, filename, 'log', file_path.stat().st_size, time.time(), str(file_path)))
-
-                        archived_files.append(filename)
-                        logger.info(f"Archived log: {build_id}/{filename}")
-                    else:
-                        logger.error(f"Failed to download log {filename} for build {build_id}")
-            except Exception as e:
-                logger.error(f"Error archiving log {filename} for build {build_id}: {e}")
-
-        if archived_files:
-            # Mark build as archived
-            cursor.execute('''
-                UPDATE builds
-                SET archived = 1
-                WHERE id = ?
-            ''', (build_id,))
-            build_database.commit()
-
-            logger.info(f"Successfully archived {len(archived_files)} files for build {build_id}")
-
-            # Request server cleanup if enabled
-            if config.get("archive_cleanup_server", True):
-                try:
-                    async with http_session.post(f"{server_url}/build/{build_id}/cleanup", timeout=30) as cleanup_response:
-                        if cleanup_response.status == 200:
-                            logger.info(f"Requested cleanup for build {build_id} on server")
-                        else:
-                            logger.warning(f"Server cleanup request failed for build {build_id}: {cleanup_response.status}")
-                except Exception as e:
-                    logger.error(f"Error requesting server cleanup for build {build_id}: {e}")
-
-            return True
-
-        return False
-
-    except Exception as e:
-        logger.error(f"Error archiving build {build_id}: {e}")
-        return False
-
-
-async def process_archive_queue():
-    """Process builds that need archiving"""
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.sleep(30)  # Check every 30 seconds
-
-            if shutdown_event.is_set():
-                break
-
-            if not config.get("archive_enabled", True):
-                continue
-
-            # Find completed builds that haven't been archived yet
-            cursor = build_database.cursor()
-            cursor.execute('''
-                SELECT id, server_url, pkgname
-                FROM builds
-                WHERE status IN ('completed', 'failed')
-                  AND archived = 0
-                  AND archive_requested = 0
-                  AND server_available = 1
-                ORDER BY end_time ASC
-                LIMIT 5
-            ''')
-            builds_to_archive = cursor.fetchall()
-
-            for build_id, server_url, pkgname in builds_to_archive:
-                # Mark as archive requested to prevent duplicate processing
-                cursor.execute('''
-                    UPDATE builds
-                    SET archive_requested = 1
-                    WHERE id = ?
-                ''', (build_id,))
-                build_database.commit()
-
-                logger.info(f"Starting archive process for build {build_id} ({pkgname})")
-
-                # Archive the build
-                success = await archive_build_artifacts(build_id, server_url)
-
-                if not success:
-                    # Reset archive_requested on failure so it can be retried
-                    cursor.execute('''
-                        UPDATE builds
-                        SET archive_requested = 0
-                        WHERE id = ?
-                    ''', (build_id,))
-                    build_database.commit()
-
-                # Small delay between archives to not overwhelm servers
-                await asyncio.sleep(5)
-
-        except Exception as e:
-            logger.error(f"Error in archive queue processor: {e}")
-            await asyncio.sleep(60)
-
-
-async def cleanup_old_archives():
-    """Clean up old archived builds"""
-    cleanup_interval = 86400  # 24 hours
-    while not shutdown_event.is_set():
-        try:
-            await asyncio.sleep(cleanup_interval)
-
-            if shutdown_event.is_set():
-                break
-
-            retention_days = config.get("archive_retention_days", 30)
-            if retention_days <= 0:
-                continue  # Unlimited retention
-
-            cutoff_time = time.time() - (retention_days * 24 * 60 * 60)
-            archive_dir = Path(config["archive_dir"])
-
-            cursor = build_database.cursor()
-            cursor.execute('''
-                SELECT DISTINCT build_id
-                FROM archived_files
-                WHERE archived_at < ?
-            ''', (cutoff_time,))
-            old_builds = cursor.fetchall()
-
-            for (build_id,) in old_builds:
-                try:
-                    build_archive_dir = archive_dir / build_id
-                    if build_archive_dir.exists():
-                        shutil.rmtree(build_archive_dir)
-                        logger.info(f"Cleaned up old archive for build {build_id}")
-
-                    # Remove from database
-                    cursor.execute('DELETE FROM archived_files WHERE build_id = ?', (build_id,))
-                    cursor.execute('UPDATE builds SET archived = 0 WHERE id = ?', (build_id,))
-
-                except Exception as e:
-                    logger.error(f"Error cleaning up archive for build {build_id}: {e}")
-
-            if old_builds:
-                build_database.commit()
-                logger.info(f"Cleaned up {len(old_builds)} old archived builds")
-
-        except Exception as e:
-            logger.error(f"Error in archive cleanup: {e}")
-            await asyncio.sleep(3600)  # Wait an hour on error
 
 
 # Authentication Routes
@@ -4442,40 +4188,12 @@ async def stream_build_output(build_id: str):
 
 @app.get("/build/{build_id}/download/{filename}")
 async def download_file(build_id: str, filename: str):
-    """Download build artifact - serves from local archive if available, otherwise proxies to server"""
-
-    # First check if file is available in local archive
-    cursor = build_database.cursor()
-    cursor.execute('''
-        SELECT archive_path
-        FROM archived_files
-        WHERE build_id = ? AND filename = ?
-    ''', (build_id, filename))
-    archived_file = cursor.fetchone()
-
-    if archived_file:
-        archive_path = Path(archived_file[0])
-        if archive_path.exists():
-            logger.info(f"Serving {filename} for build {build_id} from local archive")
-            return FileResponse(
-                path=str(archive_path),
-                filename=filename,
-                media_type="application/octet-stream"
-            )
-        else:
-            # Archive file missing, clean up database entry
-            logger.warning(f"Archive file {archive_path} not found, removing from database")
-            cursor.execute('''
-                DELETE FROM archived_files
-                WHERE build_id = ? AND filename = ?
-            ''', (build_id, filename))
-            build_database.commit()
-
-    # Fall back to server proxy if not in archive
+    """Download build artifact"""
     server_url = await find_build_server(build_id)
 
     if not server_url:
         # Check if we have build information in database
+        cursor = build_database.cursor()
         cursor.execute('''
             SELECT server_url, server_available, pkgname
             FROM builds WHERE id = ?
@@ -4496,8 +4214,6 @@ async def download_file(build_id: str, filename: str):
                 )
 
         raise HTTPException(status_code=404, detail="Build not found")
-
-    logger.info(f"Proxying {filename} for build {build_id} from server {server_url}")
 
     # Retry logic for file downloads
     max_retries = 3
