@@ -104,6 +104,7 @@ class User:
     created_at: float
     last_login: Optional[float] = None
     email: Optional[str] = None
+    email_notifications_enabled: bool = True
 
 
 @dataclass
@@ -150,6 +151,7 @@ class UserResponse(BaseModel):
     created_at: float
     last_login: Optional[float]
     email: Optional[str]
+    email_notifications_enabled: bool
 
 
 class ChangePasswordRequest(BaseModel):
@@ -160,6 +162,10 @@ class ChangePasswordRequest(BaseModel):
 
 class UpdateEmailRequest(BaseModel):
     email: Optional[str] = Field(None, max_length=255)
+
+
+class UpdateEmailNotificationsRequest(BaseModel):
+    enabled: bool
 
 
 class SMTPConfigRequest(BaseModel):
@@ -236,13 +242,21 @@ class AuthManager:
                     created_at REAL NOT NULL,
                     last_login REAL,
                     is_active BOOLEAN DEFAULT 1,
-                    email TEXT
+                    email TEXT,
+                    email_notifications_enabled BOOLEAN DEFAULT 1
                 )
             ''')
 
             # Add email column if it doesn't exist (for existing databases)
             try:
                 self.db.execute('ALTER TABLE users ADD COLUMN email TEXT')
+                self.db.commit()
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+            # Add email_notifications_enabled column if it doesn't exist (for existing databases)
+            try:
+                self.db.execute('ALTER TABLE users ADD COLUMN email_notifications_enabled BOOLEAN DEFAULT 1')
                 self.db.commit()
             except sqlite3.OperationalError:
                 pass  # Column already exists
@@ -348,9 +362,9 @@ class AuthManager:
         try:
             cursor = self.db.cursor()
             cursor.execute('''
-                INSERT INTO users (username, password_hash, role, created_at, email)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (username, password_hash, role.value, current_time, email))
+                INSERT INTO users (username, password_hash, role, created_at, email, email_notifications_enabled)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (username, password_hash, role.value, current_time, email, True))
 
             user_id = cursor.lastrowid
             self.db.commit()
@@ -361,7 +375,8 @@ class AuthManager:
                 username=username,
                 role=role,
                 created_at=current_time,
-                email=email
+                email=email,
+                email_notifications_enabled=True
             )
 
         except sqlite3.IntegrityError:
@@ -374,7 +389,7 @@ class AuthManager:
         """Authenticate user with username and password"""
         cursor = self.db.cursor()
         cursor.execute('''
-            SELECT id, username, password_hash, role, created_at, last_login, email
+            SELECT id, username, password_hash, role, created_at, last_login, email, email_notifications_enabled
             FROM users WHERE username = ? AND is_active = 1
         ''', (username,))
 
@@ -382,7 +397,7 @@ class AuthManager:
         if not row:
             return None
 
-        user_id, username, stored_hash, role, created_at, last_login, email = row
+        user_id, username, stored_hash, role, created_at, last_login, email, email_notifications_enabled = row
 
         if not self._verify_password(password, stored_hash):
             return None
@@ -398,7 +413,8 @@ class AuthManager:
             role=UserRole(role),
             created_at=created_at,
             last_login=current_time,
-            email=email
+            email=email,
+            email_notifications_enabled=bool(email_notifications_enabled)
         )
 
     def create_token(self, user: User) -> str:
@@ -491,7 +507,7 @@ class AuthManager:
         """Get user by ID"""
         cursor = self.db.cursor()
         cursor.execute('''
-            SELECT id, username, role, created_at, last_login, email
+            SELECT id, username, role, created_at, last_login, email, email_notifications_enabled
             FROM users WHERE id = ? AND is_active = 1
         ''', (user_id,))
 
@@ -503,7 +519,8 @@ class AuthManager:
                 role=UserRole(row[2]),
                 created_at=row[3],
                 last_login=row[4],
-                email=row[5]
+                email=row[5],
+                email_notifications_enabled=bool(row[6])
             )
         return None
 
@@ -511,7 +528,7 @@ class AuthManager:
         """List all users"""
         cursor = self.db.cursor()
         query = '''
-            SELECT id, username, role, created_at, last_login, email
+            SELECT id, username, role, created_at, last_login, email, email_notifications_enabled
             FROM users
         '''
         if not include_inactive:
@@ -527,7 +544,8 @@ class AuthManager:
                 role=UserRole(row[2]),
                 created_at=row[3],
                 last_login=row[4],
-                email=row[5]
+                email=row[5],
+                email_notifications_enabled=bool(row[6])
             ))
         return users
 
@@ -560,6 +578,23 @@ class AuthManager:
                       (email, user_id))
         self.db.commit()
         return cursor.rowcount > 0
+
+    def update_user_email_notifications(self, user_id: int, enabled: bool) -> bool:
+        """Update user's email notification preference"""
+        try:
+            cursor = self.db.cursor()
+            cursor.execute('''
+                UPDATE users SET email_notifications_enabled = ? WHERE id = ? AND is_active = 1
+            ''', (enabled, user_id))
+
+            if cursor.rowcount > 0:
+                self.db.commit()
+                logger.info(f"Updated email notifications preference for user {user_id} to {enabled}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to update email notifications preference: {e}")
+            return False
 
     def get_user_builds(self, user_id: int, limit: int = 50) -> List[Dict]:
         """Get builds created by a specific user"""
@@ -803,6 +838,117 @@ APB Farm System"""
         body = body_map.get(action, f'Your APB Farm account has been {action} by administrator {admin_user}.')
 
         return self.send_email(user_email, subject, body)
+
+    def send_build_notification(self, user_email: str, username: str, build_id: str, pkgname: str, status: str, arch: str, artifacts: List[Dict] = None):
+        """Send notification email for build completion"""
+        if not user_email:
+            return False
+
+        # Get farm URL from configuration
+        global config
+        farm_url = config.get('farm_url', 'http://localhost:8080')
+        build_status_url = f"{farm_url.rstrip('/')}/build/{build_id}/status"
+        dashboard_url = f"{farm_url.rstrip('/')}/dashboard"
+
+        # Determine subject and status message
+        status_display = {
+            BuildStatus.COMPLETED: "Completed Successfully",
+            BuildStatus.FAILED: "Failed",
+            BuildStatus.CANCELLED: "Cancelled"
+        }.get(status, status.title())
+
+        subject = f"APB Build {status_display}: {pkgname} ({arch}) - {build_id[:8]}"
+
+        # Build artifacts section
+        artifacts_section = ""
+        if artifacts and status == BuildStatus.COMPLETED:
+            artifacts_section = "\n\nAvailable Artifacts:\n"
+            for artifact in artifacts:
+                download_url = f"{farm_url.rstrip('/')}/build/{build_id}/download/{artifact['filename']}"
+                artifacts_section += f"  • {artifact['filename']} ({artifact.get('size', 'unknown')} bytes)\n"
+                artifacts_section += f"    Download: {download_url}\n"
+
+        # Build log section (always available)
+        log_section = f"\n\nBuild Log:\n  • build.log\n    Download: {farm_url.rstrip('/')}/build/{build_id}/download/build.log"
+
+        # Create email body
+        body = f"""Hello {username},
+
+Your build request has {status_display.lower()}.
+
+Build Details:
+  • Build ID: {build_id}
+  • Package: {pkgname}
+  • Architecture: {arch}
+  • Status: {status_display}
+
+View Build Status: {build_status_url}{artifacts_section}{log_section}
+
+You can view all your builds on the dashboard: {dashboard_url}
+
+Best regards,
+APB Farm System"""
+
+        return self.send_email(user_email, subject, body)
+
+
+async def send_build_completion_email(build_id: str, status: str, build_status: Dict):
+    """Send email notification when a build reaches a final status"""
+    try:
+        # Get build information from database
+        global build_database, auth_manager
+        cursor = build_database.cursor()
+        cursor.execute('''
+            SELECT user_id, pkgname, server_arch
+            FROM builds
+            WHERE id = ?
+        ''', (build_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            logger.warning(f"Build {build_id} not found in database for email notification")
+            return
+
+        user_id, pkgname, arch = result
+
+        if not user_id:
+            logger.debug(f"No user_id for build {build_id}, skipping email notification")
+            return
+
+        # Get user information
+        user = auth_manager.get_user_by_id(user_id)
+        if not user or not user.email:
+            logger.debug(f"No email address for user {user_id} (build {build_id}), skipping email notification")
+            return
+
+        # Check if user has email notifications enabled
+        if not user.email_notifications_enabled:
+            logger.debug(f"Email notifications disabled for user {user_id} (build {build_id}), skipping email notification")
+            return
+
+        # Extract artifacts from build status
+        artifacts = []
+        if status == BuildStatus.COMPLETED and 'packages' in build_status:
+            artifacts = build_status['packages']
+
+        # Send notification
+        success = auth_manager.send_build_notification(
+            user.email,
+            user.username,
+            build_id,
+            pkgname or "unknown",
+            status,
+            arch or "unknown",
+            artifacts
+        )
+
+        if success:
+            logger.info(f"Build completion email sent to {user.email} for build {build_id}")
+        else:
+            logger.warning(f"Failed to send build completion email to {user.email} for build {build_id}")
+
+    except Exception as e:
+        logger.error(f"Error sending build completion email for build {build_id}: {e}")
 
 
 # FastAPI Dependencies
@@ -1106,6 +1252,12 @@ def init_database() -> sqlite3.Connection:
 
     try:
         conn.execute('ALTER TABLE builds ADD COLUMN first_missing_at REAL')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN user_id INTEGER')
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -1449,6 +1601,36 @@ async def cleanup_expired_cache():
 
     if expired_artifacts:
         logger.info(f"Cleaned up {len(expired_artifacts)} expired cached artifacts")
+
+
+def determine_content_type_and_disposition(filename: str) -> Tuple[str, str]:
+    """
+    Determine content type and disposition based on filename.
+    Returns tuple of (content_type, disposition)
+    """
+    content_type = "application/octet-stream"
+    disposition = "attachment"  # Default to download
+
+    # Text files - display inline in browser
+    if filename.endswith('.log'):
+        content_type = "text/plain"
+        disposition = "inline"
+    # Binary package files - force download
+    elif filename.endswith(('.pkg.tar.xz', '.pkg.tar.zst')):
+        content_type = "application/x-xz" if filename.endswith('.xz') else "application/zstd"
+        disposition = "attachment"
+    elif filename.endswith(('.tar', '.tar.gz', '.tar.bz2', '.tar.xz')):
+        if filename.endswith('.gz'):
+            content_type = "application/gzip"
+        elif filename.endswith('.bz2'):
+            content_type = "application/x-bzip2"
+        elif filename.endswith('.xz'):
+            content_type = "application/x-xz"
+        else:
+            content_type = "application/x-tar"
+        disposition = "attachment"
+
+    return content_type, disposition
 
 
 def format_package_name_with_version(pkgname: str, epoch: str = None, pkgver: str = None, pkgrel: str = None) -> str:
@@ -2194,6 +2376,10 @@ async def update_single_build_status(build_id: str, server_url: str):
                 build_database.commit()
                 logger.debug(f"Updated status for build {build_id}: {status}")
 
+                # Send email notification for final build status
+                if status in [BuildStatus.COMPLETED, BuildStatus.FAILED, BuildStatus.CANCELLED]:
+                    asyncio.create_task(send_build_completion_email(build_id, status, build_status))
+
                 # Proactively cache artifacts if build completed successfully
                 if status == BuildStatus.COMPLETED:
                     asyncio.create_task(proactively_cache_build_artifacts(build_id, server_url, build_status))
@@ -2229,6 +2415,9 @@ async def update_single_build_status(build_id: str, server_url: str):
                                 last_known_status = 'failed_missing_from_server'
                             WHERE id = ?
                         ''', (BuildStatus.FAILED, current_time, current_time, build_id))
+
+                        # Send email notification for failed build due to missing from server
+                        asyncio.create_task(send_build_completion_email(build_id, BuildStatus.FAILED, {"status": BuildStatus.FAILED, "missing_from_server": True}))
                     else:
                         # Still within timeout window
                         cursor.execute('''
@@ -2499,7 +2688,8 @@ async def get_current_user_info(current_user: User = Depends(require_auth)):
         role=current_user.role.value,
         created_at=current_user.created_at,
         last_login=current_user.last_login,
-        email=current_user.email
+        email=current_user.email,
+        email_notifications_enabled=current_user.email_notifications_enabled
     )
 
 
@@ -2515,7 +2705,8 @@ async def list_users(current_user: User = Depends(require_admin)):
             role=user.role.value,
             created_at=user.created_at,
             last_login=user.last_login,
-            email=user.email
+            email=user.email,
+            email_notifications_enabled=user.email_notifications_enabled
         )
         for user in users
     ]
@@ -2550,7 +2741,8 @@ async def create_user(
             role=new_user.role.value,
             created_at=new_user.created_at,
             last_login=new_user.last_login,
-            email=new_user.email
+            email=new_user.email,
+            email_notifications_enabled=new_user.email_notifications_enabled
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2682,6 +2874,24 @@ async def change_password(
     return {"message": "Password changed successfully. Please log in again."}
 
 
+@app.put("/auth/users/{user_id}/email-notifications")
+async def update_user_email_notifications_admin(
+    user_id: int,
+    notification_data: UpdateEmailNotificationsRequest,
+    current_user: User = Depends(require_admin)
+):
+    """Update user's email notification preference (admin only)"""
+    global auth_manager
+    try:
+        if auth_manager.update_user_email_notifications(user_id, notification_data.enabled):
+            return {"message": f"Email notifications {'enabled' if notification_data.enabled else 'disabled'} for user {user_id}"}
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+    except Exception as e:
+        logger.error(f"Error updating email notifications for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update email notification preference")
+
+
 @app.put("/auth/users/{user_id}/email")
 async def update_user_email(
     user_id: int,
@@ -2742,6 +2952,23 @@ async def update_my_email(
             raise HTTPException(status_code=404, detail="User not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/auth/my/email-notifications")
+async def update_my_email_notifications(
+    notification_data: UpdateEmailNotificationsRequest,
+    current_user: User = Depends(require_auth)
+):
+    """Update current user's email notification preference"""
+    global auth_manager
+    try:
+        if auth_manager.update_user_email_notifications(current_user.id, notification_data.enabled):
+            return {"message": f"Email notifications {'enabled' if notification_data.enabled else 'disabled'} successfully"}
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+    except Exception as e:
+        logger.error(f"Error updating email notifications for user {current_user.id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update email notification preference")
 
 
 # SMTP Configuration Endpoints
@@ -4525,16 +4752,27 @@ async def download_file(build_id: str, filename: str):
     cached_artifact = await get_cached_artifact(build_id, filename)
     if cached_artifact:
         logger.debug(f"Serving {filename} for build {build_id} from cache")
+
+        # Determine content type and disposition for cached files
+        content_type, disposition = determine_content_type_and_disposition(filename)
+
+        # Build headers
+        headers = {
+            "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
+            "ETag": f'"{build_id}-{filename}"',
+            "Content-Length": str(cached_artifact["file_size"])
+        }
+
+        if disposition == "attachment":
+            headers["Content-Disposition"] = f"attachment; filename={filename}"
+        else:
+            headers["Content-Disposition"] = f"inline; filename={filename}"
+
         return FileResponse(
             path=str(cached_artifact["file_path"]),
             filename=filename,
-            media_type=cached_artifact["content_type"],
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
-                "ETag": f'"{build_id}-{filename}"',
-                "Content-Length": str(cached_artifact["file_size"])
-            }
+            media_type=content_type,
+            headers=headers
         )
 
     # Not in cache, need to download from build server
@@ -4575,23 +4813,26 @@ async def download_file(build_id: str, filename: str):
                     # Cache the artifact for future use
                     await cache_artifact(build_id, filename, content)
 
-                    # Determine content type
-                    content_type = "application/octet-stream"
-                    if filename.endswith('.log'):
-                        content_type = "text/plain"
-                    elif filename.endswith(('.pkg.tar.xz', '.pkg.tar.zst')):
-                        content_type = "application/x-xz" if filename.endswith('.xz') else "application/zstd"
+                    # Determine content type and disposition
+                    content_type, disposition = determine_content_type_and_disposition(filename)
 
-                    logger.debug(f"Downloaded and cached {filename} for build {build_id} ({len(content)} bytes)")
+                    # Build headers
+                    headers = {
+                        "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
+                        "ETag": f'"{build_id}-{filename}"',
+                        "Content-Length": str(len(content))
+                    }
+
+                    if disposition == "attachment":
+                        headers["Content-Disposition"] = f"attachment; filename={filename}"
+                    else:
+                        headers["Content-Disposition"] = f"inline; filename={filename}"
+
+                    logger.debug(f"Downloaded and cached {filename} for build {build_id} ({len(content)} bytes), serving as {content_type} ({disposition})")
                     return StreamingResponse(
                         iter([content]),
                         media_type=content_type,
-                        headers={
-                            "Content-Disposition": f"attachment; filename={filename}",
-                            "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
-                            "ETag": f'"{build_id}-{filename}"',
-                            "Content-Length": str(len(content))
-                        }
+                        headers=headers
                     )
                 elif response.status == 404:
                     raise HTTPException(status_code=404, detail="File not found")
@@ -4866,6 +5107,9 @@ async def get_admin_panel(
                 </select>
                 <label>Email:</label>
                 <input type="email" id="editEmail" placeholder="user@example.com">
+                <label>
+                    <input type="checkbox" id="editEmailNotifications"> Email notifications enabled
+                </label>
                 <div class="error-message" id="editError"></div>
                 <div class="success-message" id="editSuccess"></div>
                 <button type="submit" class="submit-button">Update User</button>
@@ -4986,6 +5230,7 @@ async def get_admin_panel(
                         <th>ID</th>
                         <th>Username</th>
                         <th>Email</th>
+                        <th>Email Notifications</th>
                         <th>Role</th>
                         <th>Created</th>
                         <th>Last Login</th>
@@ -4999,17 +5244,19 @@ async def get_admin_panel(
         role_badge = f'<span class="admin-badge">ADMIN</span>' if user["role"] == "admin" else f'<span class="user-badge">USER</span>'
         delete_disabled = 'disabled title="Cannot delete yourself"' if user["id"] == current_user.id else ''
         email_display = user["email"] if user["email"] != "none" else '<em>none</em>'
+        notifications_display = '✓ Enabled' if user.get("email_notifications_enabled", True) else '✗ Disabled'
 
         html += f"""
                     <tr>
                         <td>{user["id"]}</td>
                         <td>{user["username"]}</td>
                         <td class="email-cell" title="{user['email']}">{email_display}</td>
+                        <td>{notifications_display}</td>
                         <td>{role_badge}</td>
                         <td>{user["created_at"]}</td>
                         <td>{user["last_login"]}</td>
                         <td>
-                            <button class="action-button edit-button" onclick="editUser({user['id']}, '{user['username']}', '{user['role']}', '{user['email'] if user['email'] != 'none' else ''}')">Edit</button>
+                            <button class="action-button edit-button" onclick="editUser({user['id']}, '{user['username']}', '{user['role']}', '{user['email'] if user['email'] != 'none' else ''}', {str(user.get('email_notifications_enabled', True)).lower()})">Edit</button>
                             <button class="action-button delete-button" onclick="deleteUser({user['id']}, '{user['username']}')" {delete_disabled}>Delete</button>
                         </td>
                     </tr>
@@ -5104,11 +5351,12 @@ async def get_admin_panel(
                 }}
             }}
 
-            function editUser(id, username, role, email) {{
+            function editUser(id, username, role, email, emailNotifications) {{
                 document.getElementById('editUserId').value = id;
                 document.getElementById('editUsername').value = username;
                 document.getElementById('editRole').value = role;
                 document.getElementById('editEmail').value = email || '';
+                document.getElementById('editEmailNotifications').checked = emailNotifications !== false;
                 document.getElementById('editError').textContent = '';
                 document.getElementById('editSuccess').textContent = '';
 
@@ -5127,6 +5375,7 @@ async def get_admin_panel(
                 const userId = document.getElementById('editUserId').value;
                 const role = document.getElementById('editRole').value;
                 const email = document.getElementById('editEmail').value || null;
+                const emailNotifications = document.getElementById('editEmailNotifications').checked;
                 const errorDiv = document.getElementById('editError');
                 const successDiv = document.getElementById('editSuccess');
 
@@ -5149,6 +5398,22 @@ async def get_admin_panel(
                     if (!roleResponse.ok) {{
                         const errorData = await roleResponse.json();
                         errorDiv.textContent = errorData.detail || 'Failed to update role';
+                        return;
+                    }}
+
+                    // Update email notifications
+                    const notificationsResponse = await fetch(`/auth/users/${{userId}}/email-notifications`, {{
+                        method: 'PUT',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: JSON.stringify({{ enabled: emailNotifications }})
+                    }});
+
+                    if (!notificationsResponse.ok) {{
+                        const errorData = await notificationsResponse.json();
+                        errorDiv.textContent = errorData.detail || 'Failed to update email notifications';
                         return;
                     }}
 
