@@ -1074,6 +1074,12 @@ def init_database() -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
 
+    try:
+        conn.execute('ALTER TABLE builds ADD COLUMN first_missing_at REAL')
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     return conn
 
@@ -1913,7 +1919,8 @@ async def update_single_build_status(build_id: str, server_url: str):
                         last_known_status = ?,
                         last_status_update = ?,
                         server_available = 1,
-                        cached_response = ?
+                        cached_response = ?,
+                        first_missing_at = NULL
                     WHERE id = ?
                 ''', (status,
                          current_time if status in [BuildStatus.COMPLETED, BuildStatus.FAILED] else None,
@@ -1923,6 +1930,47 @@ async def update_single_build_status(build_id: str, server_url: str):
                          build_id))
                 build_database.commit()
                 logger.debug(f"Updated status for build {build_id}: {status}")
+            elif response.status == 404:
+                # Build not found on server - track when first missing
+                current_time = time.time()
+                cursor = build_database.cursor()
+
+                # Check if this is the first time we detected it missing
+                cursor.execute('SELECT first_missing_at FROM builds WHERE id = ?', (build_id,))
+                result = cursor.fetchone()
+                first_missing_at = result[0] if result and result[0] else None
+
+                if first_missing_at is None:
+                    # First time missing - record timestamp
+                    logger.warning(f"Build {build_id} not found on server {server_url} - starting 15-minute timeout")
+                    cursor.execute('''
+                        UPDATE builds SET
+                            last_status_update = ?,
+                            first_missing_at = ?
+                        WHERE id = ?
+                    ''', (current_time, current_time, build_id))
+                else:
+                    # Already missing - check if timeout exceeded
+                    missing_duration = current_time - first_missing_at
+                    if missing_duration > 900:  # 15 minutes = 900 seconds
+                        logger.error(f"Build {build_id} missing from server {server_url} for {missing_duration:.0f} seconds - marking as failed")
+                        cursor.execute('''
+                            UPDATE builds SET
+                                status = ?,
+                                end_time = ?,
+                                last_status_update = ?,
+                                last_known_status = 'failed_missing_from_server'
+                            WHERE id = ?
+                        ''', (BuildStatus.FAILED, current_time, current_time, build_id))
+                    else:
+                        # Still within timeout window
+                        cursor.execute('''
+                            UPDATE builds SET
+                                last_status_update = ?
+                            WHERE id = ?
+                        ''', (current_time, build_id))
+
+                build_database.commit()
             else:
                 logger.warning(f"Server {server_url} returned HTTP {response.status} for build {build_id}")
                 # Update last status check time

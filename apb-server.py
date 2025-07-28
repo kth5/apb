@@ -916,10 +916,12 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
         def log_output(message: str):
             build_outputs[build_id].append(message)
-            # Send to streams
+            # Send to streams asynchronously
             for stream_queue in build_streams.get(build_id, []):
                 try:
-                    stream_queue.put(("output", message))
+                    stream_queue.put_nowait(("output", message))  # Non-blocking
+                except queue.Full:
+                    pass  # Drop messages if queue is full
                 except:
                     pass
 
@@ -1143,10 +1145,12 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         # Send completion event to streams
         for stream_queue in build_streams.get(build_id, []):
             try:
-                stream_queue.put(("complete", {
+                stream_queue.put_nowait(("complete", {
                     "status": active_builds[build_id]["status"],
                     "exit_code": active_builds[build_id].get("exit_code", 1)
                 }))
+            except queue.Full:
+                pass  # Drop completion event if queue is full
             except:
                 pass
 

@@ -105,7 +105,7 @@ def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
         }
 
 
-def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str, pkgrel: str, arch: str, epoch: str = None) -> tuple[bool, str]:
+def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str, pkgrel: str, arch: str, pkgbuild_archs: List[str] = None, epoch: str = None) -> tuple[bool, str]:
     """
     Check if package files already exist in the output directory.
 
@@ -115,6 +115,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
         pkgver: Package version
         pkgrel: Package release
         arch: Target architecture (can be "any" to check all architectures)
+        pkgbuild_archs: List of architectures from PKGBUILD arch=() array
         epoch: Package epoch (optional)
 
     Returns:
@@ -125,6 +126,15 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
     arch_suffix_map = {
         'espresso': 'powerpc',  # espresso builds produce powerpc packages
     }
+
+    # Use PKGBUILD architectures or fallback to common ones
+    if pkgbuild_archs:
+        potential_suffixes = [arch_suffix_map.get(a, a) for a in pkgbuild_archs]
+        # Remove duplicates while preserving order
+        potential_suffixes = list(dict.fromkeys(potential_suffixes))
+    else:
+        # Fallback to common architectures if PKGBUILD archs not provided
+        potential_suffixes = ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']
 
     # Helper function to construct version string with epoch
     def construct_version_string():
@@ -141,39 +151,62 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
         if not output_dir.exists():
             return False, "Package not found for any architecture"
 
+        found_packages = []
+        missing_packages = []
+
         # Look for packages in all subdirectories of output_dir
         for pkgname in pkgname_list:
+            package_found = False
+
             # Check "any" subdirectory first for arch=(any) packages
             any_arch_dir = output_dir / "any"
-            if any_arch_dir.is_dir():
-                for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
+            if any_arch_dir.is_dir() and not package_found:
+                for potential_suffix in potential_suffixes:
                     package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
                     package_path = any_arch_dir / package_filename
                     if package_path.exists():
-                        return True, f"{package_filename} (found in any)"
+                        found_packages.append(f"{package_filename} (found in any)")
+                        package_found = True
+                        break
 
             # Check all architecture subdirectories
-            try:
-                for arch_dir in output_dir.iterdir():
-                    if arch_dir.is_dir() and arch_dir.name != "any":  # Skip "any" as we checked it above
-                        # Try different architecture suffixes
-                        for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
-                            package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
-                            package_path = arch_dir / package_filename
-                            if package_path.exists():
-                                return True, f"{package_filename} (found in {arch_dir.name})"
-            except (OSError, FileNotFoundError):
-                # Directory doesn't exist or can't be read
-                pass
+            if not package_found:
+                try:
+                    for arch_dir in output_dir.iterdir():
+                        if arch_dir.is_dir() and arch_dir.name != "any" and not package_found:  # Skip "any" as we checked it above
+                            # Try different architecture suffixes
+                            for potential_suffix in potential_suffixes:
+                                package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
+                                package_path = arch_dir / package_filename
+                                if package_path.exists():
+                                    found_packages.append(f"{package_filename} (found in {arch_dir.name})")
+                                    package_found = True
+                                    break
+                except (OSError, FileNotFoundError):
+                    # Directory doesn't exist or can't be read
+                    pass
 
             # Also check main output directory with common suffixes
-            for potential_suffix in ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']:
-                package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
-                package_path = output_dir / package_filename
-                if package_path.exists():
-                    return True, package_filename
+            if not package_found:
+                for potential_suffix in potential_suffixes:
+                    package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
+                    package_path = output_dir / package_filename
+                    if package_path.exists():
+                        found_packages.append(package_filename)
+                        package_found = True
+                        break
 
-        return False, "Package not found for any architecture"
+            if not package_found:
+                missing_packages.append(pkgname)
+
+        # All packages must exist to consider the build complete
+        if not missing_packages:
+            if len(found_packages) == 1:
+                return True, found_packages[0]
+            else:
+                return True, f"{len(found_packages)} packages found"
+
+        return False, f"Missing {len(missing_packages)} packages for any architecture"
     else:
         # Get the actual suffix used in package filenames
         package_arch_suffix = arch_suffix_map.get(arch, arch)
@@ -237,7 +270,7 @@ def should_skip_build(output_dir: Path, pkgbuild_path: Path, arch: str, force: b
         pkgname_list = [pkg_info["pkgname"]]
 
     exists, found_filename = check_package_exists(output_dir, pkgname_list, pkg_info["pkgver"],
-                                                 pkg_info["pkgrel"], arch, pkg_info.get("epoch"))
+                                                 pkg_info["pkgrel"], arch, pkg_info.get("arch", []), pkg_info.get("epoch"))
     if exists:
         return True, f"Package already exists: {found_filename}"
 

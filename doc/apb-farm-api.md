@@ -1233,6 +1233,7 @@ CREATE TABLE builds (
     cached_response TEXT,              -- Cached server response (JSON)
     user_id INTEGER,                   -- User who submitted the build
     build_timeout INTEGER DEFAULT 7200, -- Custom build timeout in seconds
+    first_missing_at REAL,             -- When build was first detected as missing from server
     FOREIGN KEY (user_id) REFERENCES users (id)
 );
 
@@ -1252,6 +1253,7 @@ CREATE INDEX idx_builds_server_arch ON builds(server_arch);
 - **Submission Grouping**: Links related builds from same PKGBUILD submission
 - **Queue Management**: Tracks build queue positions and timing
 - **Custom Timeouts**: Stores per-build timeout configurations
+- **Missing Build Detection**: Automatically marks builds as failed after 15 minutes if they disappear from their assigned server
 
 ---
 
