@@ -1944,27 +1944,6 @@ async def update_single_build_status(build_id: str, server_url: str):
                          build_id))
                 build_database.commit()
                 logger.debug(f"Updated status for build {build_id}: {status}")
-            elif response.status == 404:
-                # Build not found on server - mark as failed
-                current_time = time.time()
-                logger.warning(f"Build {build_id} not found on server {server_url} (404) - marking as failed")
-                cursor = build_database.cursor()
-                cursor.execute('''
-                    UPDATE builds SET
-                        status = ?,
-                        end_time = ?,
-                        last_known_status = ?,
-                        last_status_update = ?,
-                        server_available = 1,
-                        cached_response = ?
-                    WHERE id = ?
-                ''', (BuildStatus.FAILED,
-                         current_time,
-                         "failed_not_found",
-                         current_time,
-                         json.dumps({"status": "failed", "error": "Build not found on server"}),
-                         build_id))
-                build_database.commit()
             else:
                 logger.warning(f"Server {server_url} returned HTTP {response.status} for build {build_id}")
                 # Update last status check time
@@ -4105,40 +4084,6 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     build_database.commit()
 
                     return build_status
-                elif response.status == 404:
-                    # Build not found on server - mark as failed
-                    current_time = time.time()
-                    logger.warning(f"Build {build_id} not found on server {server_url} (404) - marking as failed")
-
-                    # Update build status to failed
-                    cursor = build_database.cursor()
-                    cursor.execute('''
-                        UPDATE builds SET
-                            status = ?,
-                            end_time = ?,
-                            last_known_status = ?,
-                            last_status_update = ?,
-                            server_available = 1,
-                            cached_response = ?
-                        WHERE id = ?
-                    ''', (BuildStatus.FAILED,
-                         current_time,
-                         "failed_not_found",
-                         current_time,
-                         json.dumps({"status": "failed", "error": "Build not found on server"}),
-                         build_id))
-                    build_database.commit()
-
-                    raise HTTPException(
-                        status_code=404,
-                        detail={
-                            "error": "Build not found",
-                            "detail": f"Build {build_id} no longer exists on server {obfuscate_server_url(server_url)}",
-                            "build_id": build_id,
-                            "status": "failed",
-                            "server_url": obfuscate_server_url(server_url)
-                        }
-                    )
                 else:
                     raise HTTPException(status_code=response.status, detail="Build not found")
         except Exception as e:
