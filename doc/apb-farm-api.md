@@ -209,7 +209,7 @@ Get farm information and status of all managed servers.
 ```json
 {
   "status": "running",
-  "version": "2025-07-16",
+  "version": "2025-07-28",
   "servers": [
     {
       "url": "http://server1.example.com:8000",
@@ -217,7 +217,7 @@ Get farm information and status of all managed servers.
       "status": "online",
       "health": "healthy",
       "info": {
-        "version": "2025-07-16",
+        "version": "2025-07-28",
         "supported_architecture": "x86_64",
         "system_info": {
           "architecture": "x86_64",
@@ -261,7 +261,7 @@ Simple health check endpoint for the farm.
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-16"
+  "version": "2025-07-28"
 }
 ```
 

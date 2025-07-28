@@ -226,7 +226,7 @@ Get comprehensive server information and status.
 ```json
 {
   "status": "running",
-  "version": "2025-07-16",
+  "version": "2025-07-28",
   "supported_architecture": "x86_64",
   "system_info": {
     "architecture": "x86_64",
@@ -283,7 +283,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-16",
+  "version": "2025-07-28",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 45.2,
   "checks": {
@@ -318,7 +318,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "degraded",
-  "version": "2025-07-16",
+  "version": "2025-07-28",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 2500.1,
   "warning": "High response time",

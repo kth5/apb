@@ -44,7 +44,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Version and constants
-VERSION = "2025-07-16"
+VERSION = "2025-07-28"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8000
 DEFAULT_BUILDROOT = Path.home() / ".apb" / "buildroot"

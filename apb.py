@@ -21,7 +21,7 @@ import re
 from datetime import datetime
 
 # Version information
-VERSION = "2025-07-16"
+VERSION = "2025-07-28"
 
 
 def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
