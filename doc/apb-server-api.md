@@ -827,6 +827,37 @@ validpgpkeys=(
 )
 ```
 
+### Build Timeout Configuration
+
+The server supports configurable output timeouts for build processes to handle hung builds:
+
+#### Output Timeout Control
+- **PKGBUILD Variable**: Set `apb_output_timeout=<seconds>` in PKGBUILD to customize timeout
+- **Default Behavior**: 30 minutes (1800 seconds) if not specified
+- **Validation**: Range limited to 60 seconds minimum, 24 hours (86400 seconds) maximum
+- **Hung Build Detection**: Terminates builds that produce no output for the specified duration
+
+#### Configuration Examples
+```bash
+# Example PKGBUILD with custom output timeout
+pkgname=my-package
+pkgver=1.0.0
+pkgrel=1
+apb_output_timeout=3600  # 1 hour timeout instead of default 30 minutes
+
+# For packages with very long compile times without output
+apb_output_timeout=7200  # 2 hours for complex builds
+
+# Quick builds that should fail fast
+apb_output_timeout=300   # 5 minutes for simple packages
+```
+
+#### Validation Rules
+- **Minimum**: 60 seconds (prevents accidental immediate timeouts)
+- **Maximum**: 86400 seconds (24 hours, prevents indefinite hangs)
+- **Invalid Values**: Logged as warnings and ignored, fallback to default
+- **Format**: Must be a valid integer value
+
 ### SRCDEST Locking
 
 The server implements sophisticated SRCDEST directory locking for concurrent builds:

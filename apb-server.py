@@ -44,7 +44,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Version and constants
-VERSION = "2025-07-28"
+VERSION = "2025-09-04"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8000
 DEFAULT_BUILDROOT = Path.home() / ".apb" / "buildroot"
@@ -548,7 +548,7 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
             content = f.read()
 
         # Simple parsing - in production, this would be more robust
-        info = {"pkgname": "unknown", "arch": ["x86_64"], "validpgpkeys": []}
+        info = {"pkgname": "unknown", "arch": ["x86_64"], "validpgpkeys": [], "apb_output_timeout": None}
         pkgbase = None
 
         # Handle multi-line arrays
@@ -604,6 +604,19 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
                             keys.extend([key.strip('\'"') for key in keys_content.split() if key.strip('\'"')])
 
                     info["validpgpkeys"] = keys
+            elif line.startswith('apb_output_timeout='):
+                timeout_str = line.split('=', 1)[1].split('#')[0].strip().strip('\'"')
+                try:
+                    timeout_value = int(timeout_str)
+                    # Validate timeout range (minimum 60 seconds, maximum 24 hours)
+                    if timeout_value < 60:
+                        logger.warning(f"apb_output_timeout value {timeout_value} too low, minimum is 60 seconds, ignoring")
+                    elif timeout_value > 86400:  # 24 hours
+                        logger.warning(f"apb_output_timeout value {timeout_value} too high, maximum is 86400 seconds (24 hours), ignoring")
+                    else:
+                        info["apb_output_timeout"] = timeout_value
+                except ValueError:
+                    logger.warning(f"Invalid apb_output_timeout value '{timeout_str}', ignoring")
 
             i += 1
 
@@ -614,7 +627,7 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
         return info
     except Exception as e:
         logger.error(f"Error parsing PKGBUILD: {e}")
-        return {"pkgname": "unknown", "arch": ["x86_64"], "validpgpkeys": []}
+        return {"pkgname": "unknown", "arch": ["x86_64"], "validpgpkeys": [], "apb_output_timeout": None}
 
 
 def download_gpg_keys(gpg_keys: List[str], log_output_func) -> bool:
@@ -1035,6 +1048,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
             # Stream output with timeout management
             start_time = time.time()
             last_output_time = start_time
+            
+            # Calculate output timeout - use PKGBUILD variable if set, otherwise default to 30 minutes
+            output_timeout = pkgbuild_info.get("apb_output_timeout", 1800)  # Default 1800 seconds = 30 minutes
 
             while True:
                 try:
@@ -1051,9 +1067,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                         process.terminate()
                         break
 
-                    # Check for output timeout (no output for 30 minutes = hung build)
-                    if current_time - last_output_time > 1800:  # 30 minutes
-                        log_output("Build appears to be hung (no output for 30 minutes), terminating")
+                    # Check for output timeout (no output for configured time = hung build)
+                    if current_time - last_output_time > output_timeout:
+                        log_output(f"Build appears to be hung (no output for {output_timeout} seconds), terminating")
                         process.terminate()
                         break
 
