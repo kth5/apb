@@ -47,7 +47,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Version and constants
-VERSION = "2025-07-28"
+VERSION = "2025-09-04"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_CONFIG_PATHS = [
