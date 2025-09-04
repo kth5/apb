@@ -1418,7 +1418,7 @@ async def submit_build(
                 try:
                     with tarfile.open(tarball_path, 'r:gz') as tar:
                         # Extract all files to build directory
-                        tar.extractall(path=build_dir)
+                        tar.extractall(path=build_dir, filter='data')
 
                     # Remove the tarball after extraction
                     tarball_path.unlink(missing_ok=True)
