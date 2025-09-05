@@ -1050,7 +1050,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
             last_output_time = start_time
             
             # Calculate output timeout - use PKGBUILD variable if set, otherwise default to 30 minutes
-            output_timeout = pkgbuild_info.get("apb_output_timeout", 1800)  # Default 1800 seconds = 30 minutes
+            output_timeout = pkgbuild_info.get("apb_output_timeout") or 1800  # Default 1800 seconds = 30 minutes
 
             while True:
                 try:
