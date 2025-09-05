@@ -134,7 +134,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
         potential_suffixes = list(dict.fromkeys(potential_suffixes))
     else:
         # Fallback to common architectures if PKGBUILD archs not provided
-        potential_suffixes = ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'any']
+        potential_suffixes = ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'espresso', 'any']
 
     # Helper function to construct version string with epoch
     def construct_version_string():
@@ -161,13 +161,12 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
             # Check "any" subdirectory first for arch=(any) packages
             any_arch_dir = output_dir / "any"
             if any_arch_dir.is_dir() and not package_found:
-                for potential_suffix in potential_suffixes:
-                    package_filename = f"{pkgname}-{version_string}-{potential_suffix}.pkg.tar.zst"
-                    package_path = any_arch_dir / package_filename
-                    if package_path.exists():
-                        found_packages.append(f"{package_filename} (found in any)")
-                        package_found = True
-                        break
+                package_filename = f"{pkgname}-{version_string}-any.pkg.tar.zst"
+                package_path = any_arch_dir / package_filename
+                if package_path.exists():
+                    found_packages.append(f"{package_filename} (found in any)")
+                    package_found = True
+                    break
 
             # Check all architecture subdirectories
             if not package_found:
@@ -182,6 +181,8 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
                                     found_packages.append(f"{package_filename} (found in {arch_dir.name})")
                                     package_found = True
                                     break
+                                else:
+                                    found_packages.append(f"{package_filename} (not found in {arch_dir.name})")
                 except (OSError, FileNotFoundError):
                     # Directory doesn't exist or can't be read
                     pass
