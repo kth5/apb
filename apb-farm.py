@@ -3863,7 +3863,7 @@ async def submit_build(
                 try:
                     with tarfile.open(tarball_path, 'r:gz') as tar:
                         # Extract all files to temp directory
-                        tar.extractall(path=temp_dir_path)
+                        tar.extractall(path=temp_dir_path, filter='data')
 
                     # Read PKGBUILD content for metadata
                     pkgbuild_path = temp_dir_path / "PKGBUILD"
