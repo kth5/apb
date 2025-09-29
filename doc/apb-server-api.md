@@ -872,7 +872,7 @@ The server implements sophisticated SRCDEST directory locking for concurrent bui
 #### Orphan Lock Cleanup
 - **Startup Cleanup**: Removes orphaned locks from previous server sessions
 - **Process Detection**: Uses `lsof` to verify if locks are actually held
-- **Age-based Cleanup**: Removes locks older than 30 minutes if lsof unavailable
+- **Age-based Cleanup**: Removes locks older than 5 minutes if lsof unavailable
 - **Graceful Degradation**: Continues build even if locking fails
 
 #### SRCDEST Configuration

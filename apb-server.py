@@ -913,8 +913,8 @@ def lock_srcdest(srcdest_path: str, pkgname: str) -> Optional[int]:
                 try:
                     stat_info = os.stat(lock_file)
                     age_seconds = time.time() - stat_info.st_mtime
-                    # If lock file is older than 30 minutes, consider it orphaned
-                    if age_seconds > 600:
+                    # If lock file is older than 5 minutes, consider it orphaned
+                    if age_seconds > 300:
                         logger.warning(f"SRCDEST lock file is {age_seconds:.0f}s old, considering it orphaned")
                         try:
                             os.unlink(lock_file)
@@ -985,8 +985,8 @@ def cleanup_orphaned_srcdest_locks():
                     try:
                         stat_info = os.stat(lock_file)
                         age_seconds = time.time() - stat_info.st_mtime
-                        # If lock file is older than 30 minutes, consider it orphaned
-                        if age_seconds > 1800:
+                        # If lock file is older than 5 minutes, consider it orphaned
+                        if age_seconds > 300:
                             logger.warning(f"SRCDEST lock file {os.path.basename(lock_file)} is {age_seconds:.0f}s old, removing orphaned lock from previous session")
                             os.unlink(lock_file)
                             cleaned_count += 1
@@ -1175,6 +1175,8 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 # Download and trust GPG keys for custom repositories
                 if not download_repo_gpg_keys(extra_repos, log_output):
                     log_output("ERROR: Failed to download GPG keys for custom repositories")
+                    if srcdest_lock:
+                        unlock_srcdest(srcdest_lock)
                     finalize_failed_build(build_id, build_dir, "Failed to download GPG keys for custom repositories")
                     return
 
@@ -1182,6 +1184,8 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 custom_pacman_conf = create_custom_pacman_conf(buildroot_path, build_dir, extra_repos, log_output)
                 if custom_pacman_conf is None:
                     log_output("ERROR: Failed to create custom pacman.conf for custom repositories")
+                    if srcdest_lock:
+                        unlock_srcdest(srcdest_lock)
                     finalize_failed_build(build_id, build_dir, "Failed to create custom pacman.conf for custom repositories")
                     return
 
@@ -1351,6 +1355,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
     except Exception as e:
         logger.error(f"Build error: {e}")
+        # Release SRCDEST lock if it was acquired
+        if 'srcdest_lock' in locals() and srcdest_lock:
+            unlock_srcdest(srcdest_lock)
         active_builds[build_id]["status"] = BuildStatus.FAILED
         active_builds[build_id]["end_time"] = time.time()
         active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
