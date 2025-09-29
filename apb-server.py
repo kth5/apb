@@ -835,6 +835,13 @@ def download_repo_gpg_keys(extra_repos: List[Dict], log_output_func) -> bool:
                 log_output_func(f"Warning: No GPG key ID for repository {repo['name']}")
                 continue
 
+            # Check if pacman-key already knows about the key
+            cmd = ["sudo","pacman-key", "--list-keys", gpg_key_id]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                log_output_func(f"GPG key {gpg_key_id} already known to pacman-key")
+                continue
+
             log_output_func(f"Downloading GPG key {gpg_key_id} for repository {repo['name']}")
 
             # Download the GPG key
@@ -852,7 +859,7 @@ def download_repo_gpg_keys(extra_repos: List[Dict], log_output_func) -> bool:
                 log_output_func(f"Failed to sign GPG key {gpg_key_id}: {result.stderr}")
                 return False
 
-        log_output_func(f"Successfully downloaded and trusted GPG keys for {len(extra_repos)} repositories")
+        log_output_func(f"Successfully trusted GPG keys for {len(extra_repos)} repositories")
         return True
 
     except Exception as e:
