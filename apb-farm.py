@@ -47,7 +47,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Version and constants
-VERSION = "2025-09-04"
+VERSION = "2025-09-29"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_CONFIG_PATHS = [
@@ -288,6 +288,21 @@ class AuthManager:
                     expires_at REAL NOT NULL,
                     is_active BOOLEAN DEFAULT 1,
                     FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            ''')
+
+            # Custom repositories table
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS custom_repositories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    url TEXT NOT NULL,
+                    gpg_key_id TEXT NOT NULL,
+                    description TEXT,
+                    is_active BOOLEAN DEFAULT 1,
+                    created_at REAL NOT NULL,
+                    created_by INTEGER NOT NULL,
+                    FOREIGN KEY (created_by) REFERENCES users (id)
                 )
             ''')
 
@@ -1370,6 +1385,100 @@ def parse_pkgbuild_version(pkgbuild_content: str) -> Dict[str, str]:
         }
 
 
+def parse_pkgbuild_extra_repos(pkgbuild_content: str) -> List[str]:
+    """Parse PKGBUILD content to extract apb_extra_repos array"""
+    try:
+        lines = pkgbuild_content.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if line.startswith('apb_extra_repos='):
+                # Handle both single-line and multi-line arrays
+                repos_content = line.split('=', 1)[1].strip()
+
+                # If it's a single line array
+                if repos_content.startswith('(') and repos_content.endswith(')'):
+                    repos_content = repos_content[1:-1]
+                    return [repo.strip('\'"') for repo in repos_content.split() if repo.strip('\'"')]
+                # If it's a multi-line array
+                elif repos_content.startswith('('):
+                    repos_content = repos_content[1:]  # Remove opening parenthesis
+                    repos = []
+
+                    # Continue reading lines until we find the closing parenthesis
+                    while i < len(lines) and not repos_content.endswith(')'):
+                        if repos_content.strip():
+                            repos.extend([repo.strip('\'"') for repo in repos_content.split() if repo.strip('\'"')])
+                        i += 1
+                        if i < len(lines):
+                            repos_content = lines[i].strip()
+
+                    # Handle the last line with closing parenthesis
+                    if repos_content.endswith(')'):
+                        repos_content = repos_content[:-1]  # Remove closing parenthesis
+                        if repos_content.strip():
+                            repos.extend([repo.strip('\'"') for repo in repos_content.split() if repo.strip('\'"')])
+
+                    return repos
+            i += 1
+
+        return []
+    except Exception as e:
+        logger.error(f"Error parsing PKGBUILD apb_extra_repos: {e}")
+        return []
+
+
+def validate_extra_repos(requested_repos: List[str]) -> Tuple[List[Dict], List[str]]:
+    """Validate requested repositories against admin-configured list
+
+    Returns:
+        Tuple of (valid_repos, invalid_repos)
+        valid_repos: List of dicts with name, url, gpg_key_id
+        invalid_repos: List of repository names that are not configured
+    """
+    if not requested_repos:
+        return [], []
+
+    try:
+        cursor = build_database.cursor()
+        cursor.execute('''
+            SELECT name, url, gpg_key_id FROM custom_repositories
+            WHERE is_active = 1
+        ''')
+        configured_repos = {row[0]: {'url': row[1], 'gpg_key_id': row[2]} for row in cursor.fetchall()}
+
+        valid_repos = []
+        invalid_repos = []
+
+        for repo_spec in requested_repos:
+            # Parse repository specification: "reponame::https://repo.url"
+            if '::' not in repo_spec:
+                invalid_repos.append(repo_spec)
+                continue
+
+            repo_name, repo_url = repo_spec.split('::', 1)
+
+            if repo_name in configured_repos:
+                # Validate URL matches configured URL
+                if configured_repos[repo_name]['url'] == repo_url:
+                    valid_repos.append({
+                        'name': repo_name,
+                        'url': repo_url,
+                        'gpg_key_id': configured_repos[repo_name]['gpg_key_id']
+                    })
+                else:
+                    invalid_repos.append(repo_spec)
+            else:
+                invalid_repos.append(repo_spec)
+
+        return valid_repos, invalid_repos
+
+    except Exception as e:
+        logger.error(f"Error validating extra repositories: {e}")
+        return [], requested_repos
+
+
 def get_cache_config() -> Dict[str, Any]:
     """Get cache configuration from the main config"""
     config = load_config()
@@ -1998,7 +2107,7 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     build_database.commit()
 
 
-async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = 7200, original_tarball: Optional[bytes] = None) -> List[Dict]:
+async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = 7200, original_tarball: Optional[bytes] = None, extra_repos: List[Dict] = None) -> List[Dict]:
     """
     Queue builds for each architecture that has available servers.
 
@@ -2104,7 +2213,8 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             "submission_group": submission_group,
             "arch": arch,
             "build_timeout": build_timeout,
-            "original_tarball": original_tarball
+            "original_tarball": original_tarball,
+            "extra_repos": extra_repos or []
         }
 
         build_queue.append(build_info)
@@ -2282,6 +2392,11 @@ async def forward_build_to_server(build_info: Dict, server_url: str):
         # Add build timeout if specified
         if "build_timeout" in build_info:
             data.add_field('build_timeout', str(build_info["build_timeout"]))
+
+        # Add extra repositories if specified
+        if "extra_repos" in build_info and build_info["extra_repos"]:
+            import json
+            data.add_field('extra_repos', json.dumps(build_info["extra_repos"]))
 
         # Use longer timeout for build submissions (increased from 30 to 60 seconds)
         timeout = aiohttp.ClientTimeout(total=120, connect=15)  # Increased for large files
@@ -3910,6 +4025,18 @@ async def submit_build(
         pkgname = parse_pkgbuild_name(pkgbuild_content)
         pkgbuild_archs = parse_pkgbuild_arch(pkgbuild_content)
 
+        # Parse and validate extra repositories
+        requested_repos = parse_pkgbuild_extra_repos(pkgbuild_content)
+        valid_repos, invalid_repos = validate_extra_repos(requested_repos)
+
+        if invalid_repos:
+            return {
+                "error": "Invalid custom repositories",
+                "message": f"The following custom repositories are not configured by an admin: {', '.join(invalid_repos)}",
+                "pkgname": pkgname,
+                "invalid_repositories": invalid_repos
+            }
+
         # Determine target architectures
         if architectures:
             # Use architectures provided by client (filtered list)
@@ -3939,7 +4066,7 @@ async def submit_build(
         # Queue builds for each architecture - pass original tarball if available
         original_tarball = original_tarball_content if 'original_tarball_content' in locals() else None
         queued_builds = await queue_builds_for_architectures(
-            pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds, original_tarball
+            pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds, original_tarball, valid_repos
         )
 
         if not queued_builds:
@@ -5022,6 +5149,172 @@ async def manual_cache_cleanup(current_user: User = Depends(require_admin)):
         }
 
 
+# Repository management endpoints
+@app.get("/admin/repositories")
+async def get_repositories(current_user: User = Depends(require_admin)):
+    """Get all custom repositories (admin only)"""
+    try:
+        cursor = build_database.cursor()
+        cursor.execute('''
+            SELECT id, name, url, gpg_key_id, description, is_active, created_at, created_by
+            FROM custom_repositories
+            ORDER BY created_at DESC
+        ''')
+
+        repos = []
+        for row in cursor.fetchall():
+            repos.append({
+                "id": row[0],
+                "name": row[1],
+                "url": row[2],
+                "gpg_key_id": row[3],
+                "description": row[4],
+                "is_active": bool(row[5]),
+                "created_at": row[6],
+                "created_by": row[7]
+            })
+
+        return {"repositories": repos}
+    except Exception as e:
+        logger.error(f"Error fetching repositories: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch repositories")
+
+
+@app.post("/admin/repositories")
+async def create_repository(
+    name: str = Form(...),
+    url: str = Form(...),
+    gpg_key_id: str = Form(...),
+    description: str = Form(""),
+    current_user: User = Depends(require_admin)
+):
+    """Create a new custom repository (admin only)"""
+    try:
+        # Validate URL format
+        from urllib.parse import urlparse
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            raise HTTPException(status_code=400, detail="Invalid URL format")
+
+        # Check if repository name already exists
+        cursor = build_database.cursor()
+        cursor.execute('SELECT id FROM custom_repositories WHERE name = ?', (name,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Repository name already exists")
+
+        # Insert new repository
+        cursor.execute('''
+            INSERT INTO custom_repositories (name, url, gpg_key_id, description, is_active, created_at, created_by)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+        ''', (name, url, gpg_key_id, description, time.time(), current_user.id))
+        build_database.commit()
+
+        return {"success": True, "message": f"Repository '{name}' created successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating repository: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create repository")
+
+
+@app.put("/admin/repositories/{repo_id}")
+async def update_repository(
+    repo_id: int,
+    name: str = Form(None),
+    url: str = Form(None),
+    gpg_key_id: str = Form(None),
+    description: str = Form(None),
+    is_active: bool = Form(None),
+    current_user: User = Depends(require_admin)
+):
+    """Update a custom repository (admin only)"""
+    try:
+        cursor = build_database.cursor()
+
+        # Check if repository exists
+        cursor.execute('SELECT id FROM custom_repositories WHERE id = ?', (repo_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Repository not found")
+
+        # Build update query dynamically
+        updates = []
+        params = []
+
+        if name is not None:
+            # Check if new name conflicts with existing repository
+            cursor.execute('SELECT id FROM custom_repositories WHERE name = ? AND id != ?', (name, repo_id))
+            if cursor.fetchone():
+                raise HTTPException(status_code=400, detail="Repository name already exists")
+            updates.append("name = ?")
+            params.append(name)
+
+        if url is not None:
+            # Validate URL format
+            from urllib.parse import urlparse
+            parsed_url = urlparse(url)
+            if not parsed_url.scheme or not parsed_url.netloc:
+                raise HTTPException(status_code=400, detail="Invalid URL format")
+            updates.append("url = ?")
+            params.append(url)
+
+        if gpg_key_id is not None:
+            updates.append("gpg_key_id = ?")
+            params.append(gpg_key_id)
+
+        if description is not None:
+            updates.append("description = ?")
+            params.append(description)
+
+        if is_active is not None:
+            updates.append("is_active = ?")
+            params.append(1 if is_active else 0)
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        params.append(repo_id)
+        query = f"UPDATE custom_repositories SET {', '.join(updates)} WHERE id = ?"
+
+        cursor.execute(query, params)
+        build_database.commit()
+
+        return {"success": True, "message": f"Repository updated successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating repository: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update repository")
+
+
+@app.delete("/admin/repositories/{repo_id}")
+async def delete_repository(repo_id: int, current_user: User = Depends(require_admin)):
+    """Delete a custom repository (admin only)"""
+    try:
+        cursor = build_database.cursor()
+
+        # Check if repository exists
+        cursor.execute('SELECT name FROM custom_repositories WHERE id = ?', (repo_id,))
+        result = cursor.fetchone()
+        if not result:
+            raise HTTPException(status_code=404, detail="Repository not found")
+
+        repo_name = result[0]
+
+        # Delete repository
+        cursor.execute('DELETE FROM custom_repositories WHERE id = ?', (repo_id,))
+        build_database.commit()
+
+        return {"success": True, "message": f"Repository '{repo_name}' deleted successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting repository: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete repository")
+
+
 @app.get("/admin")
 async def get_admin_panel(
     request: Request,
@@ -5131,6 +5424,7 @@ async def get_admin_panel(
         <div class="tabs">
             <div class="tab-buttons">
                 <div class="tab-button active" onclick="switchTab('smtp-tab')">📧 SMTP Configuration</div>
+                <div class="tab-button" onclick="switchTab('repositories-tab')">📦 Repository Management</div>
                 <div class="tab-button" onclick="switchTab('users-tab')">👥 User Management</div>
                 <div class="tab-button" onclick="switchTab('admin-functions-tab')">⚙️ Admin Functions</div>
             </div>
@@ -5172,6 +5466,36 @@ async def get_admin_panel(
                                 <button type="submit" class="submit-button">Send Test Email</button>
                             </form>
                         </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="repositories-tab" class="tab-content">
+                <div class="admin-section">
+                    <h2>📦 Custom Repository Management</h2>
+                    <p>Manage custom pacman repositories that users can request in their PKGBUILD files using the <code>apb_extra_repos</code> variable.</p>
+
+                    <div class="smtp-config-form">
+                        <h3>Add New Repository</h3>
+                        <form id="addRepoForm" onsubmit="submitAddRepository(event)">
+                            <label>Repository Name:</label>
+                            <input type="text" id="repoName" placeholder="myrepo" required>
+                            <label>Repository URL:</label>
+                            <input type="url" id="repoUrl" placeholder="https://myrepo.example.com" required>
+                            <label>GPG Key ID:</label>
+                            <input type="text" id="repoGpgKey" placeholder="ABCD1234..." required>
+                            <label>Description (optional):</label>
+                            <input type="text" id="repoDescription" placeholder="My custom repository">
+                            <div class="error-message" id="repoAddError"></div>
+                            <div class="success-message" id="repoAddSuccess"></div>
+                            <button type="submit" class="submit-button">Add Repository</button>
+                            <button type="button" class="cancel-button" onclick="clearRepoForm()">Clear</button>
+                        </form>
+                    </div>
+
+                    <div style="margin-top: 30px;">
+                        <h3>Existing Repositories</h3>
+                        <div id="repositoriesList">Loading repositories...</div>
                     </div>
                 </div>
             </div>
@@ -5685,10 +6009,140 @@ async def get_admin_panel(
                 }}
             }}
 
+            // Repository management functions
+            async function loadRepositories() {{
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch('/admin/repositories', {{
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }}
+                    }});
+
+                    if (response.ok) {{
+                        const data = await response.json();
+                        displayRepositories(data.repositories);
+                    }} else {{
+                        document.getElementById('repositoriesList').innerHTML = 'Error loading repositories';
+                    }}
+                }} catch (error) {{
+                    console.error('Error loading repositories:', error);
+                    document.getElementById('repositoriesList').innerHTML = 'Error loading repositories';
+                }}
+            }}
+
+            function displayRepositories(repositories) {{
+                const container = document.getElementById('repositoriesList');
+
+                if (repositories.length === 0) {{
+                    container.innerHTML = '<p>No repositories configured.</p>';
+                    return;
+                }}
+
+                let html = '<table class="user-table"><thead><tr><th>Name</th><th>URL</th><th>GPG Key</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
+
+                repositories.forEach(repo => {{
+                    const statusBadge = repo.is_active ?
+                        '<span class="admin-badge">Active</span>' :
+                        '<span style="background-color: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;">Inactive</span>';
+
+                    html += `<tr>
+                        <td>${{repo.name}}</td>
+                        <td class="email-cell">${{repo.url}}</td>
+                        <td>${{repo.gpg_key_id}}</td>
+                        <td>${{repo.description || '-'}}</td>
+                        <td>${{statusBadge}}</td>
+                        <td>
+                            <button class="action-button edit-button" onclick="editRepository(${{repo.id}}, '${{repo.name}}', '${{repo.url}}', '${{repo.gpg_key_id}}', '${{repo.description || ''}}', ${{repo.is_active}})">Edit</button>
+                            <button class="action-button delete-button" onclick="deleteRepository(${{repo.id}}, '${{repo.name}}')">Delete</button>
+                        </td>
+                    </tr>`;
+                }});
+
+                html += '</tbody></table>';
+                container.innerHTML = html;
+            }}
+
+            async function submitAddRepository(event) {{
+                event.preventDefault();
+
+                const name = document.getElementById('repoName').value;
+                const url = document.getElementById('repoUrl').value;
+                const gpgKey = document.getElementById('repoGpgKey').value;
+                const description = document.getElementById('repoDescription').value;
+                const errorDiv = document.getElementById('repoAddError');
+                const successDiv = document.getElementById('repoAddSuccess');
+
+                errorDiv.textContent = '';
+                successDiv.textContent = '';
+
+                try {{
+                    const token = getAuthToken();
+                    const formData = new FormData();
+                    formData.append('name', name);
+                    formData.append('url', url);
+                    formData.append('gpg_key_id', gpgKey);
+                    formData.append('description', description);
+
+                    const response = await fetch('/admin/repositories', {{
+                        method: 'POST',
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }},
+                        body: formData
+                    }});
+
+                    const data = await response.json();
+
+                    if (response.ok && data.success) {{
+                        successDiv.textContent = data.message;
+                        clearRepoForm();
+                        loadRepositories();
+                    }} else {{
+                        errorDiv.textContent = data.message || 'Failed to add repository';
+                    }}
+                }} catch (error) {{
+                    errorDiv.textContent = 'Error adding repository';
+                }}
+            }}
+
+            function clearRepoForm() {{
+                document.getElementById('addRepoForm').reset();
+                document.getElementById('repoAddError').textContent = '';
+                document.getElementById('repoAddSuccess').textContent = '';
+            }}
+
+            async function deleteRepository(repoId, repoName) {{
+                if (!confirm(`Are you sure you want to delete repository "${{repoName}}"?`)) {{
+                    return;
+                }}
+
+                try {{
+                    const token = getAuthToken();
+                    const response = await fetch(`/admin/repositories/${{repoId}}`, {{
+                        method: 'DELETE',
+                        headers: {{
+                            'Authorization': `Bearer ${{token}}`
+                        }}
+                    }});
+
+                    const data = await response.json();
+
+                    if (response.ok && data.success) {{
+                        loadRepositories();
+                    }} else {{
+                        alert(data.message || 'Failed to delete repository');
+                    }}
+                }} catch (error) {{
+                    alert('Error deleting repository');
+                }}
+            }}
+
             // Load SMTP config and cache status on page load
             window.addEventListener('load', function() {{
                 loadSmtpConfig();
                 loadCacheStatus();
+                loadRepositories();
             }});
         </script>
     </body>

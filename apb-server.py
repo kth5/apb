@@ -44,7 +44,7 @@ except ImportError as e:
     sys.exit(1)
 
 # Version and constants
-VERSION = "2025-09-04"
+VERSION = "2025-09-29"
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8000
 DEFAULT_BUILDROOT = Path.home() / ".apb" / "buildroot"
@@ -762,6 +762,104 @@ def get_makepkg_config() -> Dict[str, str]:
     return config
 
 
+def create_custom_pacman_conf(buildroot_path: Path, build_dir: Path, extra_repos: List[Dict], log_output_func) -> Optional[Path]:
+    """Create a modified pacman.conf with custom repositories in the build directory"""
+    try:
+        if not extra_repos:
+            return None
+
+        chroot_pacman_conf = buildroot_path / "root" / "etc" / "pacman.conf"
+
+        if not chroot_pacman_conf.exists():
+            log_output_func("Warning: pacman.conf not found in buildroot")
+            return None
+
+        # Read current pacman.conf
+        with open(chroot_pacman_conf, 'r') as f:
+            lines = f.readlines()
+
+        # Find the [core] section and insert custom repos before it
+        new_lines = []
+        inserted_repos = False
+
+        for line in lines:
+            # Insert custom repos before the first [section] (usually [core])
+            if line.strip().startswith('[') and not inserted_repos:
+                # Add custom repositories as highest priority
+                for repo in extra_repos:
+                    repo_name = repo['name']
+                    repo_url = repo['url']
+                    new_lines.append(f"\n# Custom repository: {repo_name}\n")
+                    new_lines.append(f"[{repo_name}]\n")
+                    new_lines.append(f"SigLevel = Required\n")
+                    new_lines.append(f"Server = {repo_url}\n")
+
+                inserted_repos = True
+
+            new_lines.append(line)
+
+        # If no sections found, append at the end
+        if not inserted_repos:
+            new_lines.append("\n# Custom repositories\n")
+            for repo in extra_repos:
+                repo_name = repo['name']
+                repo_url = repo['url']
+                new_lines.append(f"[{repo_name}]\n")
+                new_lines.append(f"SigLevel = Required\n")
+                new_lines.append(f"Server = {repo_url}\n")
+
+        # Write modified pacman.conf to build directory
+        custom_pacman_conf = build_dir / "pacman.conf"
+        with open(custom_pacman_conf, 'w') as f:
+            f.writelines(new_lines)
+
+        log_output_func(f"Created custom pacman.conf with {len(extra_repos)} custom repositories")
+        return custom_pacman_conf
+
+    except Exception as e:
+        log_output_func(f"Error creating custom pacman.conf: {e}")
+        return None
+
+
+def download_repo_gpg_keys(extra_repos: List[Dict], log_output_func) -> bool:
+    """Download and trust GPG keys for custom repositories"""
+    try:
+        if not extra_repos:
+            return True
+
+        buildroot_path = Path(server_config["buildroot"])
+
+        for repo in extra_repos:
+            gpg_key_id = repo.get('gpg_key_id')
+            if not gpg_key_id:
+                log_output_func(f"Warning: No GPG key ID for repository {repo['name']}")
+                continue
+
+            log_output_func(f"Downloading GPG key {gpg_key_id} for repository {repo['name']}")
+
+            # Download the GPG key
+            cmd = ["sudo","pacman-key", "--recv-keys", gpg_key_id]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                log_output_func(f"Failed to download GPG key {gpg_key_id}: {result.stderr}")
+                return False
+
+            # Refresh pacman keys in target chroot
+            cmd = ["sudo","pacman-key", "--lsign-key", gpg_key_id ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                log_output_func(f"Failed to sign GPG key {gpg_key_id}: {result.stderr}")
+                return False
+
+        log_output_func(f"Successfully downloaded and trusted GPG keys for {len(extra_repos)} repositories")
+        return True
+
+    except Exception as e:
+        log_output_func(f"Error downloading GPG keys: {e}")
+        return False
+
+
 def lock_srcdest(srcdest_path: str, pkgname: str) -> Optional[int]:
     """Lock SRCDEST directory with package-specific lock file"""
     try:
@@ -913,7 +1011,53 @@ def unlock_srcdest(lock_fd: int):
         logger.error(f"Error unlocking SRCDEST: {e}")
 
 
-def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any], build_timeout: int = BUILD_TIMEOUT):
+def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code: int = 1):
+    """Finalize a failed build with proper logging and cleanup"""
+    try:
+        # Update build status
+        active_builds[build_id]["status"] = BuildStatus.FAILED
+        active_builds[build_id]["exit_code"] = exit_code
+        active_builds[build_id]["end_time"] = time.time()
+        active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
+
+        # Add failure reason to build outputs
+        if build_id in build_outputs:
+            build_outputs[build_id].append(f"ERROR: {reason}")
+
+        # Create build log file
+        log_file = build_dir / "build.log"
+        with open(log_file, 'w') as f:
+            f.write('\n'.join(build_outputs.get(build_id, [f"ERROR: {reason}"])))
+
+        # Add log to build record
+        active_builds[build_id]["logs"] = [{
+            "filename": "build.log",
+            "size": log_file.stat().st_size,
+            "download_url": f"/build/{build_id}/download/build.log"
+        }]
+
+        # Send completion event to streams
+        for stream_queue in build_streams.get(build_id, []):
+            try:
+                stream_queue.put_nowait(("complete", {
+                    "status": active_builds[build_id]["status"],
+                    "exit_code": active_builds[build_id]["exit_code"]
+                }))
+            except queue.Full:
+                pass  # Drop completion event if queue is full
+            except:
+                pass
+
+        # Move to history
+        build_history[build_id] = active_builds[build_id].copy()
+
+        logger.info(f"Build {build_id} failed: {reason}")
+
+    except Exception as e:
+        logger.error(f"Error finalizing failed build {build_id}: {e}")
+
+
+def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any], build_timeout: int = BUILD_TIMEOUT, extra_repos: List[Dict] = None):
     """Build package using makechrootpkg"""
     global build_counter
 
@@ -1016,6 +1160,24 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 if not download_gpg_keys(pkgbuild_info["validpgpkeys"], log_output):
                     log_output("GPG key download failed, continuing build (may fail during source validation)")
 
+            # Handle custom repositories
+            custom_pacman_conf = None
+            if extra_repos:
+                log_output(f"Setting up {len(extra_repos)} custom repositories...")
+
+                # Download and trust GPG keys for custom repositories
+                if not download_repo_gpg_keys(extra_repos, log_output):
+                    log_output("ERROR: Failed to download GPG keys for custom repositories")
+                    finalize_failed_build(build_id, build_dir, "Failed to download GPG keys for custom repositories")
+                    return
+
+                # Create custom pacman.conf with custom repositories
+                custom_pacman_conf = create_custom_pacman_conf(buildroot_path, build_dir, extra_repos, log_output)
+                if custom_pacman_conf is None:
+                    log_output("ERROR: Failed to create custom pacman.conf for custom repositories")
+                    finalize_failed_build(build_id, build_dir, "Failed to create custom pacman.conf for custom repositories")
+                    return
+
             # Build makechrootpkg command with correct flags
             # Check if we need to prefix with ppc32 for PowerPC architectures
             server_arch = get_server_architecture()
@@ -1030,6 +1192,11 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 cmd.extend(["-d", makepkg_config['CCACHE_DIR']])
             if 'SRCDEST' in makepkg_config:
                 cmd.extend(["-d", makepkg_config['SRCDEST']])
+
+            # Add custom pacman.conf and gpgdir if we have custom repositories
+            if custom_pacman_conf:
+                cmd.extend(["-D", f"{custom_pacman_conf}:/etc/pacman.conf"])
+                cmd.extend(["-D", "/etc/pacman.d/gnupg:/etc/pacman.d/gnupg"])
 
             log_output(f"Running: {' '.join(cmd)}")
 
@@ -1048,7 +1215,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
             # Stream output with timeout management
             start_time = time.time()
             last_output_time = start_time
-            
+
             # Calculate output timeout - use PKGBUILD variable if set, otherwise default to 30 minutes
             output_timeout = pkgbuild_info.get("apb_output_timeout") or 1800  # Default 1800 seconds = 30 minutes
 
@@ -1210,7 +1377,8 @@ def process_build_queue():
                 build_data["build_id"],
                 build_data["build_dir"],
                 build_data["pkgbuild_info"],
-                build_data.get("build_timeout", BUILD_TIMEOUT)
+                build_data.get("build_timeout", BUILD_TIMEOUT),
+                build_data.get("extra_repos", [])
             )
             logger.info(f"Build {build_id} submitted to executor")
 
@@ -1355,7 +1523,8 @@ async def submit_build(
     pkgbuild: UploadFile = File(None),
     build_id: str = Form(...),
     sources: List[UploadFile] = File(default=[]),
-    build_timeout: Optional[int] = Form(None)
+    build_timeout: Optional[int] = Form(None),
+    extra_repos: Optional[str] = Form(None)
 ):
     """Submit a new build request (supports both tarball and individual file uploads)"""
     try:
@@ -1555,6 +1724,16 @@ async def submit_build(
                 detail={"error": "Invalid PKGBUILD file", "detail": "Missing required pkgname field"}
             )
 
+        # Parse extra repositories
+        extra_repos_list = []
+        if extra_repos:
+            try:
+                import json
+                extra_repos_list = json.loads(extra_repos)
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"Invalid extra_repos JSON: {e}")
+                extra_repos_list = []
+
         # Create build record
         active_builds[build_id] = {
             "build_id": build_id,
@@ -1564,7 +1743,8 @@ async def submit_build(
             "arch": pkgbuild_info["arch"],
             "packages": [],
             "logs": [],
-            "build_timeout": timeout_seconds
+            "build_timeout": timeout_seconds,
+            "extra_repos": extra_repos_list
         }
 
         # Add to queue
@@ -1572,7 +1752,8 @@ async def submit_build(
             "build_id": build_id,
             "build_dir": build_dir,
             "pkgbuild_info": pkgbuild_info,
-            "build_timeout": timeout_seconds
+            "build_timeout": timeout_seconds,
+            "extra_repos": extra_repos_list
         })
 
         logger.info(f"Build {build_id} added to queue (queue size now: {build_queue.qsize()})")

@@ -42,6 +42,7 @@ The APB Farm implements a comprehensive token-based authentication system with r
 - Revoke user tokens
 - Configure SMTP settings
 - Send email notifications
+- Manage custom pacman repositories
 
 ### Authentication Flow
 
@@ -641,6 +642,94 @@ Download a build artifact by forwarding to the appropriate server.
 - **404 Not Found**: File not found on any server
 - **503 Service Unavailable**: All servers unavailable
 - **403 Forbidden**: Insufficient permissions to access build
+
+---
+
+### Custom Repository Management
+
+The APB Farm supports custom pacman repositories that users can request in their PKGBUILD files using the `apb_extra_repos` variable. These repositories are managed by administrators and must be pre-configured with GPG key validation for security.
+
+#### Custom Repository Format
+
+Users can specify custom repositories in their PKGBUILD files using the following format:
+
+```bash
+apb_extra_repos=(
+  reponame::https://myrepo.example.com
+  anotherrepo::https://another.example.com
+)
+```
+
+#### Repository Validation
+
+- All requested repositories must be pre-configured by an administrator
+- Repository URLs must match exactly what was configured
+- GPG keys must be valid and trusted
+- Builds will fail if invalid repositories are requested
+- Builds fail immediately if custom repository setup fails (GPG key download or pacman.conf modification)
+- Failed builds produce build.log files with detailed error messages for client download
+- Custom pacman.conf is created in build directory and mounted via makechrootpkg -d flag instead of modifying buildroot
+
+#### Admin Repository Management
+
+##### GET /admin/repositories
+Get all configured custom repositories (admin only).
+
+**Response:**
+```json
+{
+  "repositories": [
+    {
+      "id": 1,
+      "name": "myrepo",
+      "url": "https://myrepo.example.com",
+      "gpg_key_id": "ABCD1234...",
+      "description": "My custom repository",
+      "is_active": true,
+      "created_at": 1640995200.0,
+      "created_by": 1
+    }
+  ]
+}
+```
+
+##### POST /admin/repositories
+Create a new custom repository (admin only).
+
+**Parameters:**
+- `name` (string, required): Repository name
+- `url` (string, required): Repository URL
+- `gpg_key_id` (string, required): GPG key ID for repository signing
+- `description` (string, optional): Repository description
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Repository 'myrepo' created successfully"
+}
+```
+
+##### PUT /admin/repositories/{repo_id}
+Update an existing custom repository (admin only).
+
+**Parameters:**
+- `name` (string, optional): New repository name
+- `url` (string, optional): New repository URL
+- `gpg_key_id` (string, optional): New GPG key ID
+- `description` (string, optional): New description
+- `is_active` (boolean, optional): Repository status
+
+##### DELETE /admin/repositories/{repo_id}
+Delete a custom repository (admin only).
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Repository 'myrepo' deleted successfully"
+}
+```
 
 ---
 
