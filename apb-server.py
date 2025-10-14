@@ -548,7 +548,7 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
             content = f.read()
 
         # Simple parsing - in production, this would be more robust
-        info = {"pkgname": "unknown", "arch": ["x86_64"], "validpgpkeys": [], "apb_output_timeout": None}
+        info = {"pkgname": "unknown", "arch": ["x86_64"], "apb_output_timeout": None}
         pkgbase = None
 
         # Handle multi-line arrays
@@ -576,34 +576,6 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
                 if arch_str.startswith('(') and arch_str.endswith(')'):
                     arch_str = arch_str[1:-1]
                 info["arch"] = [a.strip('\'"') for a in arch_str.split()]
-            elif line.startswith('validpgpkeys='):
-                # Handle both single-line and multi-line arrays
-                keys_content = line.split('=', 1)[1].strip()
-
-                # If it's a single line array
-                if keys_content.startswith('(') and keys_content.endswith(')'):
-                    keys_content = keys_content[1:-1]
-                    info["validpgpkeys"] = [key.strip('\'"') for key in keys_content.split() if key.strip('\'"')]
-                # If it's a multi-line array
-                elif keys_content.startswith('('):
-                    keys_content = keys_content[1:]  # Remove opening parenthesis
-                    keys = []
-
-                    # Continue reading lines until we find the closing parenthesis
-                    while i < len(lines) and not keys_content.endswith(')'):
-                        if keys_content.strip():
-                            keys.extend([key.strip('\'"') for key in keys_content.split() if key.strip('\'"')])
-                        i += 1
-                        if i < len(lines):
-                            keys_content = lines[i].strip()
-
-                    # Handle the last line with closing parenthesis
-                    if keys_content.endswith(')'):
-                        keys_content = keys_content[:-1]  # Remove closing parenthesis
-                        if keys_content.strip():
-                            keys.extend([key.strip('\'"') for key in keys_content.split() if key.strip('\'"')])
-
-                    info["validpgpkeys"] = keys
             elif line.startswith('apb_output_timeout='):
                 timeout_str = line.split('=', 1)[1].split('#')[0].strip().strip('\'"')
                 try:
@@ -627,55 +599,66 @@ def parse_pkgbuild(pkgbuild_path: Path) -> Dict[str, Any]:
         return info
     except Exception as e:
         logger.error(f"Error parsing PKGBUILD: {e}")
-        return {"pkgname": "unknown", "arch": ["x86_64"], "validpgpkeys": [], "apb_output_timeout": None}
+        return {"pkgname": "unknown", "arch": ["x86_64"], "apb_output_timeout": None}
 
 
-def download_gpg_keys(gpg_keys: List[str], log_output_func) -> bool:
-    """Download GPG keys for package validation"""
-    if not gpg_keys:
-        return True
-
+def import_local_gpg_keys(pkgbuild_path: Path, log_output_func) -> bool:
+    """Import GPG keys from local keys/ subdirectory relative to PKGBUILD"""
     try:
-        log_output_func(f"Downloading {len(gpg_keys)} GPG keys for source validation")
+        # Look for keys/ subdirectory relative to PKGBUILD location
+        keys_dir = pkgbuild_path.parent / "keys" / "pgp"
 
-        # Create GPG command to receive keys
-        cmd = ["gpg", "--recv-keys"] + gpg_keys
-
-        log_output_func(f"Running: {' '.join(cmd)}")
-
-        # Execute GPG command
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-
-        # Log GPG output
-        if result.stdout:
-            for line in result.stdout.split('\n'):
-                if line.strip():
-                    log_output_func(f"GPG: {line}")
-
-        if result.stderr:
-            for line in result.stderr.split('\n'):
-                if line.strip():
-                    log_output_func(f"GPG: {line}")
-
-        if result.returncode != 0:
-            log_output_func(f"Warning: GPG key download failed with exit code {result.returncode}")
-            log_output_func("This may cause source validation to fail during build")
-            # Don't fail the build, just warn - some packages may have optional key validation
+        if not keys_dir.exists():
+            log_output_func("No keys/ subdirectory found, skipping GPG key import")
             return True
 
-        log_output_func("GPG keys downloaded successfully")
+        # Find all .asc files in the keys/pgp directory
+        key_files = list(keys_dir.glob("*.asc"))
+
+        if not key_files:
+            log_output_func("No .asc key files found in keys/pgp/ directory")
+            return True
+
+        log_output_func(f"Importing {len(key_files)} GPG keys from local keys/ directory")
+
+        # Import each key file
+        for key_file in key_files:
+            log_output_func(f"Importing GPG key from {key_file.name}")
+
+            cmd = ["gpg", "--import", str(key_file)]
+            log_output_func(f"Running: {' '.join(cmd)}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60  # 1 minute timeout per key
+            )
+
+            # Log GPG output
+            if result.stdout:
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        log_output_func(f"GPG: {line}")
+
+            if result.stderr:
+                for line in result.stderr.split('\n'):
+                    if line.strip():
+                        log_output_func(f"GPG: {line}")
+
+            if result.returncode != 0:
+                log_output_func(f"Warning: Failed to import GPG key from {key_file.name} (exit code {result.returncode})")
+                # Continue with other keys even if one fails
+                continue
+
+        log_output_func("Local GPG key import completed")
         return True
 
     except subprocess.TimeoutExpired:
-        log_output_func("Error: GPG key download timed out after 5 minutes")
+        log_output_func("Error: GPG key import timed out")
         return False
     except Exception as e:
-        log_output_func(f"Error downloading GPG keys: {e}")
+        log_output_func(f"Error importing local GPG keys: {e}")
         return False
 
 
@@ -1161,11 +1144,11 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 log_output("Proceeding without SRCDEST lock (timeout or unavailable)")
 
         try:
-            # Download GPG keys if specified in PKGBUILD
-            if pkgbuild_info.get("validpgpkeys"):
-                log_output("Downloading GPG keys for source validation...")
-                if not download_gpg_keys(pkgbuild_info["validpgpkeys"], log_output):
-                    log_output("GPG key download failed, continuing build (may fail during source validation)")
+            # Import GPG keys from local keys/ directory if it exists
+            log_output("Checking for local GPG keys...")
+            pkgbuild_path = build_dir / "PKGBUILD"
+            if not import_local_gpg_keys(pkgbuild_path, log_output):
+                log_output("Local GPG key import failed, continuing build (may fail during source validation)")
 
             # Handle custom repositories
             custom_pacman_conf = None
