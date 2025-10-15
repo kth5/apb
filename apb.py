@@ -21,7 +21,7 @@ import re
 from datetime import datetime
 
 # Version information
-VERSION = "2025-09-29"
+VERSION = "2025-10-14"
 
 
 def parse_pkgbuild_info(pkgbuild_path: Path) -> Dict[str, Any]:
@@ -513,14 +513,17 @@ class APBotClient:
         if not pkgbuild_path.exists():
             raise ValueError(f"PKGBUILD not found in {build_path}")
 
-        # Create a temporary tarball containing all files (excluding subdirectories)
+        # Create a temporary tarball containing all files (excluding subdirectories except keys/)
         with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
             try:
                 with tarfile.open(temp_tarball.name, 'w:gz') as tar:
-                    # Add all files from the build directory, excluding subdirectories
+                    # Add all files from the build directory, excluding subdirectories except keys/
                     for item in build_path.iterdir():
                         if item.is_file():
                             # Add file with just its name (not full path)
+                            tar.add(item, arcname=item.name)
+                        elif item.is_dir() and item.name == "keys":
+                            # Add keys/ directory and all its contents recursively
                             tar.add(item, arcname=item.name)
 
                 # Submit the tarball using streaming to avoid memory issues
@@ -881,14 +884,17 @@ def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[
 
         client = APBotClient(server_url, auth_client)
 
-        # Create a temporary tarball containing all files (excluding subdirectories)
+        # Create a temporary tarball containing all files (excluding subdirectories except keys/)
         with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
             try:
                 with tarfile.open(temp_tarball.name, 'w:gz') as tar:
-                    # Add all files from the build directory, excluding subdirectories
+                    # Add all files from the build directory, excluding subdirectories except keys/
                     for item in build_path.iterdir():
                         if item.is_file():
                             # Add file with just its name (not full path)
+                            tar.add(item, arcname=item.name)
+                        elif item.is_dir() and item.name == "keys":
+                            # Add keys/ directory and all its contents recursively
                             tar.add(item, arcname=item.name)
 
                 # Prepare form data
