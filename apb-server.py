@@ -738,7 +738,7 @@ def get_makepkg_config() -> Dict[str, str]:
                 line = line.strip()
                 if line.startswith('SRCDEST=') and not line.startswith('#'):
                     config['SRCDEST'] = line.split('=', 1)[1].strip('\'"')
-                elif line.startswith('CCACHE_DIR=') and not line.startswith('#'):
+                elif line.startswith('export CCACHE_DIR=') and not line.startswith('#'):
                     config['CCACHE_DIR'] = line.split('=', 1)[1].strip('\'"')
     except Exception as e:
         logger.error(f"Error reading makepkg.conf: {e}")
@@ -854,7 +854,7 @@ def download_repo_gpg_keys(extra_repos: List[Dict], log_output_func) -> bool:
 def lock_srcdest(srcdest_path: str, pkgname: str) -> Optional[int]:
     """Lock SRCDEST directory with package-specific lock file"""
     try:
-        pkgname_hash = hashlib.md5(b'{pkgname}')
+        pkgname_hash = hashlib.md5(b'{pkgname}').hexdigest()
         lock_file = os.path.join(srcdest_path, f'.apb-{pkgname_hash}.lock')
 
         # Try to acquire lock
