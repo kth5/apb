@@ -30,6 +30,7 @@ import resource
 import select
 from contextlib import asynccontextmanager
 import tarfile
+import hashlib
 
 # Minimal dependencies - only FastAPI and uvicorn
 try:
@@ -853,7 +854,8 @@ def download_repo_gpg_keys(extra_repos: List[Dict], log_output_func) -> bool:
 def lock_srcdest(srcdest_path: str, pkgname: str) -> Optional[int]:
     """Lock SRCDEST directory with package-specific lock file"""
     try:
-        lock_file = os.path.join(srcdest_path, f'.apb-{pkgname}.lock')
+        pkgname_hash = hashlib.md5(b'{pkgname}')
+        lock_file = os.path.join(srcdest_path, f'.apb-{pkgname_hash}.lock')
 
         # Try to acquire lock
         fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
