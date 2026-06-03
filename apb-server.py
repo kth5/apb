@@ -1203,7 +1203,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1,
+                bufsize=0,
                 preexec_fn=os.setsid  # Create new process group for better cleanup
             )
             running_processes[build_id] = process  # Track the process
