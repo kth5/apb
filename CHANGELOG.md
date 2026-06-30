@@ -23,10 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Farm dashboard pagination on Recent Builds now preserves the active tab across page changes
 - `dev` optional dependencies now include full runtime packages needed to spawn server and farm during integration tests
-
-### Changed
-
 - Refactored buildroot host config copy in `setup_buildroot()` to loop over config filenames
 
 ## [2026-06-30]

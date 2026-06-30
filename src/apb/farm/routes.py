@@ -592,8 +592,16 @@ async def cancel_build(
 
 
 @router.get("/dashboard")
-async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.User] = Depends(core.get_current_user_optional)):
+async def get_dashboard(
+    page: int = Query(1, ge=1),
+    tab: str = Query("servers"),
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
     """Get farm dashboard HTML"""
+    valid_tabs = {"servers", "builds", "statistics"}
+    active_tab = tab if tab in valid_tabs else "servers"
+    if active_tab == "statistics" and not current_user:
+        active_tab = "servers"
     # Get server status grouped by actual supported architecture
     available_archs = await core.get_available_architectures()
     servers_by_arch = {}
@@ -881,12 +889,12 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
 
         <div class="tabs">
             <div class="tab-buttons">
-                <div class="tab-button active" onclick="switchTab('servers-tab')">🌾 Servers by Architecture</div>
-                <div class="tab-button" onclick="switchTab('builds-tab')">📋 Recent Builds</div>
-                {'<div class="tab-button" onclick="switchTab(\'statistics-tab\')">📊 Statistics</div>' if current_user else ''}
+                <div class="tab-button{' active' if active_tab == 'servers' else ''}" onclick="switchTab('servers-tab', this)">🌾 Servers by Architecture</div>
+                <div class="tab-button{' active' if active_tab == 'builds' else ''}" onclick="switchTab('builds-tab', this)">📋 Recent Builds</div>
+                {'<div class="tab-button' + (' active' if active_tab == 'statistics' else '') + '" onclick="switchTab(\'statistics-tab\', this)">📊 Statistics</div>' if current_user else ''}
             </div>
 
-            <div id="servers-tab" class="tab-content active">
+            <div id="servers-tab" class="tab-content{' active' if active_tab == 'servers' else ''}">
                 <div class="servers">
     """
 
@@ -938,7 +946,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
                 </div>
             </div>
 
-            <div id="builds-tab" class="tab-content">
+            <div id="builds-tab" class="tab-content{' active' if active_tab == 'builds' else ''}">
                 <div class="builds">
     """
 
@@ -961,13 +969,13 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
     html += f"""
                 </div>
                 <div class="pagination">
-                    <a href="/dashboard?page={max(1, page-1)}">&laquo; Previous</a>
+                    <a href="/dashboard?page={max(1, page-1)}&tab=builds">&laquo; Previous</a>
                     <span>Page {page}</span>
-                    <a href="/dashboard?page={page+1}">Next &raquo;</a>
+                    <a href="/dashboard?page={page+1}&tab=builds">Next &raquo;</a>
                 </div>
             </div>
 
-            {'<div id="statistics-tab" class="tab-content">' if current_user else ''}
+            {'<div id="statistics-tab" class="tab-content' + (' active' if active_tab == 'statistics' else '') + '">' if current_user else ''}
             {'<div class="statistics">' if current_user else ''}
 
             {'<div class="stat-section">' if current_user else ''}
@@ -999,7 +1007,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
 
         <script>
             // Tab switching function
-            function switchTab(tabId) {{
+            function switchTab(tabId, button) {{
                 // Hide all tab contents
                 const tabContents = document.querySelectorAll('.tab-content');
                 tabContents.forEach(content => {{
@@ -1008,15 +1016,24 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
 
                 // Remove active class from all tab buttons
                 const tabButtons = document.querySelectorAll('.tab-button');
-                tabButtons.forEach(button => {{
-                    button.classList.remove('active');
+                tabButtons.forEach(btn => {{
+                    btn.classList.remove('active');
                 }});
 
                 // Show selected tab content
                 document.getElementById(tabId).classList.add('active');
 
                 // Add active class to clicked tab button
-                event.target.classList.add('active');
+                button.classList.add('active');
+
+                // Persist active tab in URL so pagination and reloads keep the selection
+                const tabName = tabId.replace('-tab', '');
+                const url = new URL(window.location);
+                url.searchParams.set('tab', tabName);
+                if (tabName !== 'builds') {{
+                    url.searchParams.delete('page');
+                }}
+                history.replaceState(null, '', url);
             }}
 
             function showLoginForm() {{

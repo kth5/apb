@@ -271,6 +271,7 @@ Get the comprehensive farm dashboard (HTML page) showing all servers, their curr
 
 **Parameters:**
 - `page` (integer, optional): Page number for build history pagination (default: 1)
+- `tab` (string, optional): Active dashboard tab — `servers`, `builds`, or `statistics` (default: `servers`). Pagination links on Recent Builds include `tab=builds` so the tab stays selected across pages.
 
 **Response:** Enhanced HTML page with:
 
