@@ -27,15 +27,20 @@ def _find_package_artifact(output_dir: Path, pkgname: str, pkgver: str, pkgrel: 
 def _assert_test_package_contents(package_path: Path) -> None:
     expected_paths = (
         "usr/bin/apb-test",
-        "usr/share/man/man1/apb-test.1",
+        ("usr/share/man/man1/apb-test.1", "usr/share/man/man1/apb-test.1.gz"),
     )
     with tarfile.open(package_path, "r:*") as archive:
         members = archive.getnames()
 
     for expected in expected_paths:
-        assert any(member.endswith(expected) for member in members), (
-            f"Expected {expected!r} in {package_path.name}, got members: {members[:20]}"
-        )
+        if isinstance(expected, tuple):
+            assert any(member.endswith(path) for member in members for path in expected), (
+                f"Expected one of {expected!r} in {package_path.name}, got members: {members[:20]}"
+            )
+        else:
+            assert any(member.endswith(expected) for member in members), (
+                f"Expected {expected!r} in {package_path.name}, got members: {members[:20]}"
+            )
 
 
 @pytest.mark.integration
