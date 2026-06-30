@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Type checkers & linters
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Local configuration (use apb.json.example as template)
+apb.json
+
+# APB runtime / test artifacts
+test/output/
+test/logs/
+test/buildroot/
+test/builds/
+.apb/
+
+# Arch packaging (makepkg)
+pkg/
+*.pkg.tar.*
+*.pkg.tar.zst
+
+# Editor & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Cursor (keep rules; ignore local state)
+.cursor/*
+!.cursor/rules/

@@ -59,8 +59,8 @@ cleanup() {
     fi
     
     # Clean up any remaining processes
-    pkill -f "apb-server.py" 2>/dev/null || true
-    pkill -f "apb-farm.py" 2>/dev/null || true
+    pkill -f "apb-server" 2>/dev/null || true
+    pkill -f "apb-farm" 2>/dev/null || true
     
     log "Cleanup completed"
 }
@@ -96,8 +96,13 @@ check_dependencies() {
     local missing_deps=()
     
     # Check for required Python packages
-    if ! python3 -c "import fastapi, uvicorn, psutil, aiohttp" 2>/dev/null; then
-        missing_deps+=("python-fastapi python-uvicorn python-psutil python-aiohttp")
+    if ! python3 -c "import fastapi, uvicorn, psutil, httpx" 2>/dev/null; then
+        missing_deps+=("python-fastapi python-uvicorn python-psutil python-httpx")
+    fi
+
+    if ! command -v apb-server >/dev/null 2>&1; then
+        log "Installing APB package in editable mode..."
+        (cd "$ROOT_DIR" && python3 -m pip install -e . -q)
     fi
     
     # Check for makepkg and sudo
@@ -123,7 +128,7 @@ start_server() {
     log "Starting APB Server..."
     
     cd "$ROOT_DIR"
-    python3 apb-server.py --host localhost --port 8000 > "$LOGS_DIR/server.log" 2>&1 &
+    apb-server --host localhost --port 8000 > "$LOGS_DIR/server.log" 2>&1 &
     SERVER_PID=$!
     
     log "APB Server started with PID: $SERVER_PID"
@@ -148,7 +153,7 @@ start_farm() {
     log "Starting APB Farm..."
     
     cd "$ROOT_DIR"
-    python3 apb-farm.py --config "$CONFIG_FILE" --host localhost --port 8080 > "$LOGS_DIR/farm.log" 2>&1 &
+    apb-farm --config "$CONFIG_FILE" --host localhost --port 8080 > "$LOGS_DIR/farm.log" 2>&1 &
     FARM_PID=$!
     
     log "APB Farm started with PID: $FARM_PID"
@@ -174,7 +179,7 @@ submit_build() {
     set -x
     cd "$ROOT_DIR"
     local build_output
-    build_output=$(python3 apb.py --config "$CONFIG_FILE" --farm --verbose "$PACKAGE_DIR" 2>&1)
+    build_output=$(apb --config "$CONFIG_FILE" --farm --verbose "$PACKAGE_DIR" 2>&1)
     local exit_code=$?
     
     echo "$build_output" | tee "$LOGS_DIR/client.log"

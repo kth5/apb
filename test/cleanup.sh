@@ -33,13 +33,13 @@ main() {
     
     # Stop all APB processes
     log "Stopping all APB processes..."
-    pkill -f "apb-server.py" 2>/dev/null || true
-    pkill -f "apb-farm.py" 2>/dev/null || true
+    pkill -f "apb-server" 2>/dev/null || true
+    pkill -f "apb-farm" 2>/dev/null || true
     sleep 2
     
     # Force kill if still running
-    pkill -9 -f "apb-server.py" 2>/dev/null || true
-    pkill -9 -f "apb-farm.py" 2>/dev/null || true
+    pkill -9 -f "apb-server" 2>/dev/null || true
+    pkill -9 -f "apb-farm" 2>/dev/null || true
     
     # Clean up APB data directories
     log "Cleaning up APB data directories..."

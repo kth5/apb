@@ -367,39 +367,38 @@ The client provides real-time monitoring capabilities:
 
 ## Installation
 
-APB requires Python 3.7+ and the following dependencies:
+APB requires Python 3.12+ and installs as a Python package with console scripts `apb`, `apb-farm`, and `apb-server`.
 
 ```bash
-pip install fastapi uvicorn aiohttp psutil requests
+pip install -e .
+# or: pip install -r requirements.txt && pip install -e .
 ```
 
-For development or testing, see `requirements.txt` for the complete dependency list.
+For development or testing, see `requirements.txt` and `pyproject.toml`.
 
 ## Getting Started
 
 1. **Set up a build server**:
    ```bash
-   python3 apb-server.py --host 0.0.0.0
+   apb-server --host 0.0.0.0
    ```
 
 2. **Start the farm**:
    ```bash
-   python3 apb-farm.py --config apb.json
+   apb-farm --config apb.json
    ```
 
 3. **Login to the farm** (first time setup):
    ```bash
-   # Login with default admin account
-   python3 apb.py --farm --login --username admin
+   apb --farm --login --username admin
    # Password: admin123 (change this immediately!)
-   
-   # Check authentication status
-   python3 apb.py --farm --auth-status
+
+   apb --farm --auth-status
    ```
 
 4. **Submit a build**:
    ```bash
-   python3 apb.py --farm /path/to/package/
+   apb --farm /path/to/package/
    ```
 
 5. **Create additional users** (admin only):
