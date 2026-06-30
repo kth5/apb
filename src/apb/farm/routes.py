@@ -942,11 +942,20 @@ async def get_dashboard(
             """
         html += "</div>"
 
-    html += """
+    builds_pagination = f"""
+                <div class="pagination">
+                    <a href="/dashboard?page={max(1, page-1)}&tab=builds">&laquo; Previous</a>
+                    <span>Page {page}</span>
+                    <a href="/dashboard?page={page+1}&tab=builds">Next &raquo;</a>
+                </div>
+    """
+
+    html += f"""
                 </div>
             </div>
 
             <div id="builds-tab" class="tab-content{' active' if active_tab == 'builds' else ''}">
+                {builds_pagination}
                 <div class="builds">
     """
 
@@ -968,11 +977,7 @@ async def get_dashboard(
 
     html += f"""
                 </div>
-                <div class="pagination">
-                    <a href="/dashboard?page={max(1, page-1)}&tab=builds">&laquo; Previous</a>
-                    <span>Page {page}</span>
-                    <a href="/dashboard?page={page+1}&tab=builds">Next &raquo;</a>
-                </div>
+                {builds_pagination}
             </div>
 
             {'<div id="statistics-tab" class="tab-content' + (' active' if active_tab == 'statistics' else '') + '">' if current_user else ''}
