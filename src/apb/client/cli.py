@@ -26,6 +26,56 @@ from apb.client.helpers import (
 
 logger = logging.getLogger(__name__)
 
+
+def _download_build_artifacts(
+    client: APBotClient,
+    build_id: str,
+    output_dir: Path,
+    *,
+    arch_prefix: str = "",
+) -> bool:
+    """Wait for the farm to cache artifacts, then download packages and logs."""
+    if not client.wait_for_farm_artifacts(build_id):
+        print(f"{arch_prefix}Timed out waiting for the farm to cache build artifacts")
+        return False
+
+    try:
+        final_status = client.get_build_status(build_id)
+    except httpx.HTTPError as exc:
+        print(f"{arch_prefix}Error getting build status for download: {exc}")
+        return False
+
+    if final_status.get("server_unavailable"):
+        print(f"{arch_prefix}Server unavailable - cannot download build artifacts")
+        print(f"{arch_prefix}You may need to download files manually when server recovers")
+        return False
+
+    downloaded_files = []
+
+    if final_status.get("packages"):
+        for package in final_status["packages"]:
+            if client.download_file(build_id, package["filename"], output_dir):
+                print(f"{arch_prefix}Downloaded: {package['filename']}")
+                downloaded_files.append(package["filename"])
+            else:
+                print(f"{arch_prefix}Failed to download: {package['filename']}")
+
+    if final_status.get("logs"):
+        for log in final_status["logs"]:
+            if client.download_file(build_id, log["filename"], output_dir):
+                print(f"{arch_prefix}Downloaded: {log['filename']}")
+                downloaded_files.append(log["filename"])
+            else:
+                print(f"{arch_prefix}Failed to download: {log['filename']}")
+
+    if downloaded_files:
+        print(f"{arch_prefix}Downloaded {len(downloaded_files)} files")
+        return True
+
+    print(f"{arch_prefix}No files available for download")
+    return False
+
+
 def submit_build(server_url: str, build_path: Path, auth_client: Optional[APBAuthClient] = None) -> Optional[str]:
     """
     Submit a build to a server using a tarball of the build directory.
@@ -233,43 +283,12 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                     if status['status'] in ['completed', 'failed', 'cancelled']:
                         # Download results if output_dir provided
                         if arch_output_dir and status['status'] in ['completed', 'failed']:
-                            try:
-                                downloaded_files = []
-
-                                # Check if server is unavailable
-                                if status.get('server_unavailable'):
-                                    print(f"[{arch}] Server unavailable - cannot download build artifacts")
-                                    print(f"[{arch}] You may need to download files manually when server recovers")
-                                else:
-                                    # Download packages (for successful builds)
-                                    if 'packages' in status and status['packages']:
-                                        for package in status['packages']:
-                                            if client.download_file(build_id, package['filename'], arch_output_dir):
-                                                print(f"[{arch}] Downloaded: {package['filename']}")
-                                                downloaded_files.append(package['filename'])
-                                            else:
-                                                print(f"[{arch}] Failed to download: {package['filename']}")
-
-                                    # Download logs (for all builds, including failed ones)
-                                    if 'logs' in status and status['logs']:
-                                        for log in status['logs']:
-                                            if client.download_file(build_id, log['filename'], arch_output_dir):
-                                                print(f"[{arch}] Downloaded: {log['filename']}")
-                                                downloaded_files.append(log['filename'])
-                                            else:
-                                                print(f"[{arch}] Failed to download: {log['filename']}")
-
-                                    if downloaded_files:
-                                        print(f"[{arch}] Downloaded {len(downloaded_files)} files")
-                                    else:
-                                        print(f"[{arch}] No files available for download")
-
-                            except httpx.HTTPError as e:
-                                if "503" in str(e) or "502" in str(e):
-                                    print(f"[{arch}] Server unavailable - cannot download build artifacts: {e}")
-                                    print(f"[{arch}] You may need to download files manually when server recovers")
-                                else:
-                                    print(f"[{arch}] Error downloading files: {e}")
+                            _download_build_artifacts(
+                                client,
+                                build_id,
+                                arch_output_dir,
+                                arch_prefix=f"[{arch}] ",
+                            )
 
                         # Build finished
                         success = status['status'] == 'completed'
@@ -579,47 +598,14 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                 print(f"{arch_prefix}Unable to get final status")
                 return False
 
-    # Download results if output_dir provided
     if output_dir and last_status in ['completed', 'failed']:
-        try:
-            final_status = client.get_build_status(build_id)
-            downloaded_files = []
-
-            # Check if server is unavailable
-            if final_status.get('server_unavailable'):
-                print(f"{arch_prefix}Server unavailable - cannot download build artifacts")
-                print(f"{arch_prefix}You may need to download files manually when server recovers")
-                return last_status == 'completed'
-
-            # Download packages (for successful builds)
-            if 'packages' in final_status and final_status['packages']:
-                for package in final_status['packages']:
-                    if client.download_file(build_id, package['filename'], output_dir):
-                        print(f"{arch_prefix}Downloaded: {package['filename']}")
-                        downloaded_files.append(package['filename'])
-                    else:
-                        print(f"{arch_prefix}Failed to download: {package['filename']}")
-
-            # Download logs (for all builds, including failed ones)
-            if 'logs' in final_status and final_status['logs']:
-                for log in final_status['logs']:
-                    if client.download_file(build_id, log['filename'], output_dir):
-                        print(f"{arch_prefix}Downloaded: {log['filename']}")
-                        downloaded_files.append(log['filename'])
-                    else:
-                        print(f"{arch_prefix}Failed to download: {log['filename']}")
-
-            if downloaded_files:
-                print(f"{arch_prefix}Downloaded {len(downloaded_files)} files")
-            else:
-                print(f"{arch_prefix}No files available for download")
-
-        except httpx.HTTPError as e:
-            if "503" in str(e) or "502" in str(e):
-                print(f"{arch_prefix}Server unavailable - cannot download build artifacts: {e}")
-                print(f"{arch_prefix}You may need to download files manually when server recovers")
-            else:
-                print(f"{arch_prefix}Error downloading files: {e}")
+        if not _download_build_artifacts(
+            client,
+            build_id,
+            output_dir,
+            arch_prefix=arch_prefix,
+        ):
+            return False
 
     return last_status == 'completed'
 
@@ -1003,10 +989,8 @@ def main():
     if args.download:
         try:
             status = client.get_build_status(args.download)
-            downloaded_files = []
 
             # Determine architecture for output directory
-            # Try to get arch from status (prefer server_arch for farm builds), command line arg, or use default
             status_arch = status.get('server_arch') or status.get('arch')
             if isinstance(status_arch, list):
                 status_arch = status_arch[0] if status_arch else None
@@ -1014,26 +998,7 @@ def main():
             build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch")
             arch_output_dir = args.output_dir / build_arch
 
-            # Download packages (for successful builds)
-            if 'packages' in status and status['packages']:
-                for package in status['packages']:
-                    if client.download_file(args.download, package['filename'], arch_output_dir):
-                        print(f"Downloaded: {package['filename']}")
-                        downloaded_files.append(package['filename'])
-                    else:
-                        print(f"Failed to download: {package['filename']}")
-
-            # Download logs (for all builds, including failed ones)
-            if 'logs' in status and status['logs']:
-                for log in status['logs']:
-                    if client.download_file(args.download, log['filename'], arch_output_dir):
-                        print(f"Downloaded: {log['filename']}")
-                        downloaded_files.append(log['filename'])
-                    else:
-                        print(f"Failed to download: {log['filename']}")
-
-            if not downloaded_files:
-                print("No files available for download")
+            if not _download_build_artifacts(client, args.download, arch_output_dir):
                 sys.exit(1)
 
             sys.exit(0)

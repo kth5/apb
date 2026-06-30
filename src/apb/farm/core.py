@@ -186,6 +186,7 @@ build_database: sqlite3.Connection = None
 http_session: httpx.AsyncClient = None
 shutdown_event = asyncio.Event()
 background_tasks: List[asyncio.Task] = []
+artifact_cache_tasks: Dict[str, asyncio.Task] = {}
 server_status_tracker: Dict[str, ServerStatus] = {}
 auth_manager = None
 
@@ -1364,61 +1365,177 @@ async def get_cached_artifact(build_id: str, filename: str) -> Optional[Dict[str
     }
 
 
-async def proactively_cache_build_artifacts(build_id: str, server_url: str, build_status: Dict):
-    """Proactively cache all artifacts for a completed build"""
+def get_expected_artifact_filenames(build_status: Dict) -> List[str]:
+    """Return artifact filenames that the farm should cache for a build."""
+    filenames: List[str] = []
+    seen = set()
+
+    for artifact in build_status.get("packages", []) + build_status.get("logs", []):
+        filename = artifact.get("filename")
+        if filename and filename not in seen:
+            seen.add(filename)
+            filenames.append(filename)
+
+    return filenames
+
+
+async def is_build_artifact_available(build_id: str, filename: str) -> bool:
+    """Check whether an artifact is available from the farm cache."""
+    cached = await get_cached_artifact(build_id, filename)
+    if cached:
+        return True
+    return get_local_artifact_path(build_id, filename) is not None
+
+
+async def are_build_artifacts_ready(build_id: str, build_status: Dict) -> bool:
+    """Return True when all expected artifacts are cached locally on the farm."""
+    expected_filenames = get_expected_artifact_filenames(build_status)
+    if not expected_filenames:
+        return build_status.get("status") not in (
+            BuildStatus.COMPLETED,
+            BuildStatus.FAILED,
+        )
+
+    for filename in expected_filenames:
+        if not await is_build_artifact_available(build_id, filename):
+            return False
+    return True
+
+
+async def download_artifact_from_server(
+    server_url: str,
+    build_id: str,
+    filename: str,
+    *,
+    max_retries: int = 5,
+) -> Optional[bytes]:
+    """Download a build artifact from the build server with retries."""
+    timeout = httpx.Timeout(300.0, connect=15.0)
+
+    for attempt in range(max_retries):
+        try:
+            response = await http_session.get(
+                f"{server_url}/build/{build_id}/download/{filename}",
+                timeout=timeout,
+            )
+            if response.status_code == 200:
+                return response.content
+
+            logger.warning(
+                f"Server returned HTTP {response.status_code} for {filename} "
+                f"(build {build_id}, attempt {attempt + 1}/{max_retries})"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to download {filename} from {server_url} for build {build_id} "
+                f"(attempt {attempt + 1}/{max_retries}): {exc}"
+            )
+
+        if attempt < max_retries - 1:
+            await asyncio.sleep(min(2 ** attempt, 30))
+
+    return None
+
+
+async def cache_build_artifacts_from_server(
+    build_id: str,
+    server_url: str,
+    build_status: Dict,
+) -> bool:
+    """Download build artifacts from the build server and cache them on the farm."""
     cache_config = get_cache_config()
-
     if not cache_config["enabled"]:
-        return
+        return False
 
-    artifacts_to_cache = []
-
-    # Add packages to cache list
-    packages = build_status.get("packages", [])
-    for package in packages:
-        filename = package.get("filename")
-        if filename:
-            artifacts_to_cache.append(filename)
-
-    # Add logs to cache list
-    logs = build_status.get("logs", [])
-    for log in logs:
-        filename = log.get("filename")
-        if filename:
-            artifacts_to_cache.append(filename)
-
+    artifacts_to_cache = get_expected_artifact_filenames(build_status)
     if not artifacts_to_cache:
         logger.debug(f"No artifacts to cache for build {build_id}")
-        return
+        return True
 
-    logger.info(f"Proactively caching {len(artifacts_to_cache)} artifacts for completed build {build_id}")
+    logger.info(f"Caching {len(artifacts_to_cache)} artifacts for build {build_id} from {server_url}")
 
     cached_count = 0
     for filename in artifacts_to_cache:
-        try:
-            # Check if already cached
-            existing_cache = await get_cached_artifact(build_id, filename)
-            if existing_cache:
-                logger.debug(f"Artifact {filename} for build {build_id} already cached")
-                continue
+        if await is_build_artifact_available(build_id, filename):
+            cached_count += 1
+            continue
 
-            # Download and cache the artifact
-            response = await http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300)
-            if response.status_code == 200:
-                content = response.content
-                if await cache_artifact(build_id, filename, content):
-                    cached_count += 1
-                    logger.debug(f"Proactively cached {filename} for build {build_id} ({len(content)} bytes)")
-                else:
-                    logger.warning(f"Failed to cache {filename} for build {build_id}")
-            else:
-                logger.warning(f"Failed to download {filename} for build {build_id} (HTTP {response.status_code})")
+        content = await download_artifact_from_server(server_url, build_id, filename)
+        if content and await cache_artifact(build_id, filename, content):
+            cached_count += 1
+            logger.debug(f"Cached {filename} for build {build_id} ({len(content)} bytes)")
+        else:
+            logger.warning(f"Failed to cache {filename} for build {build_id}")
 
-        except Exception as e:
-            logger.error(f"Error proactively caching {filename} for build {build_id}: {e}")
+    all_cached = cached_count == len(artifacts_to_cache)
+    if all_cached:
+        logger.info(f"All {cached_count} artifacts cached for build {build_id}")
+    else:
+        logger.warning(f"Cached {cached_count}/{len(artifacts_to_cache)} artifacts for build {build_id}")
 
-    if cached_count > 0:
-        logger.info(f"Successfully cached {cached_count}/{len(artifacts_to_cache)} artifacts for build {build_id}")
+    return all_cached
+
+
+def schedule_build_artifact_cache(build_id: str, server_url: str, build_status: Dict) -> None:
+    """Start a background task to cache build artifacts from the build server."""
+    if build_status.get("status") not in (BuildStatus.COMPLETED, BuildStatus.FAILED):
+        return
+
+    existing_task = artifact_cache_tasks.get(build_id)
+    if existing_task and not existing_task.done():
+        return
+
+    artifact_cache_tasks[build_id] = asyncio.create_task(
+        cache_build_artifacts_from_server(build_id, server_url, build_status)
+    )
+
+
+def persist_live_build_status(build_id: str, build_status: Dict) -> None:
+    """Persist live build-server status into the farm database."""
+    status = build_status.get("status", BuildStatus.QUEUED)
+    current_time = time.time()
+    terminal_statuses = (BuildStatus.COMPLETED, BuildStatus.FAILED, BuildStatus.CANCELLED)
+
+    cursor = build_database.cursor()
+    cursor.execute('''
+        UPDATE builds SET
+            status = ?,
+            end_time = CASE
+                WHEN ? IN (?, ?, ?) THEN COALESCE(end_time, ?)
+                ELSE end_time
+            END,
+            last_known_status = ?,
+            last_status_update = ?,
+            server_available = 1,
+            cached_response = ?
+        WHERE id = ?
+    ''', (
+        status,
+        status,
+        *terminal_statuses,
+        current_time,
+        status,
+        current_time,
+        json.dumps(build_status),
+        build_id,
+    ))
+    build_database.commit()
+
+
+async def enrich_build_status_with_artifact_cache(
+    build_id: str,
+    server_url: str,
+    build_status: Dict,
+) -> Dict:
+    """Schedule artifact caching and expose whether cached artifacts are ready."""
+    schedule_build_artifact_cache(build_id, server_url, build_status)
+    build_status["artifacts_ready"] = await are_build_artifacts_ready(build_id, build_status)
+    return build_status
+
+
+async def proactively_cache_build_artifacts(build_id: str, server_url: str, build_status: Dict):
+    """Proactively cache all artifacts for a completed build."""
+    await cache_build_artifacts_from_server(build_id, server_url, build_status)
 
 
 async def cleanup_expired_cache():

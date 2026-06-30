@@ -102,6 +102,34 @@ class APBotClient:
         response.raise_for_status()
         return response.json()
 
+    def wait_for_farm_artifacts(
+        self,
+        build_id: str,
+        timeout: float = 300.0,
+        poll_interval: float = 2.0,
+    ) -> bool:
+        """
+        Wait until the farm has cached all build artifacts locally.
+
+        The client must not download artifacts until the farm reports
+        ``artifacts_ready`` in the build status response.
+        """
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            status = self.get_build_status(build_id)
+            build_status = status.get("status", "unknown")
+
+            if status.get("artifacts_ready"):
+                return True
+
+            if build_status not in ("completed", "failed"):
+                return False
+
+            time.sleep(poll_interval)
+
+        return False
+
     def cancel_build(self, build_id: str) -> bool:
         """
         Cancel a running build.

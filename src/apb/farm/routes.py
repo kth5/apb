@@ -1624,6 +1624,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             "created_at": created_at,
             "packages": [],
             "logs": [],
+            "artifacts_ready": False,
         }
         if format == "json":
             return queued_status
@@ -1952,18 +1953,12 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 else:
                     logger.warning(f"server_arch is None/empty for build {build_id}")
 
-                # Update our cache with the latest status
-                cursor = core.build_database.cursor()
-                cursor.execute('''
-                    UPDATE builds SET
-                        last_known_status = ?,
-                        last_status_update = ?,
-                        server_available = 1,
-                        cached_response = ?
-                    WHERE id = ?
-                ''', (build_status.get('status', 'unknown'), time.time(),
-                     json.dumps(build_status), build_id))
-                core.build_database.commit()
+                core.persist_live_build_status(build_id, build_status)
+                build_status = await core.enrich_build_status_with_artifact_cache(
+                    build_id,
+                    server_url,
+                    build_status,
+                )
 
                 return build_status
 
@@ -2003,18 +1998,12 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 if server_arch:
                     build_status["server_arch"] = server_arch
 
-                # Update our cache with the latest status
-                cursor = core.build_database.cursor()
-                cursor.execute('''
-                    UPDATE builds SET
-                        last_known_status = ?,
-                        last_status_update = ?,
-                        server_available = 1,
-                        cached_response = ?
-                    WHERE id = ?
-                ''', (build_status.get('status', 'unknown'), time.time(),
-                     json.dumps(build_status), build_id))
-                core.build_database.commit()
+                core.persist_live_build_status(build_id, build_status)
+                build_status = await core.enrich_build_status_with_artifact_cache(
+                    build_id,
+                    server_url,
+                    build_status,
+                )
 
                 # Generate HTML response
                 status_class = build_status.get('status', 'unknown')

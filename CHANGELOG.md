@@ -12,6 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Farm now downloads completed build artifacts from the build server with retries and exposes `artifacts_ready` in build status
+- Client downloads wait for `artifacts_ready` instead of hitting the farm before artifact caching finishes
+- Farm download endpoints serve cached artifacts only; a cache miss returns 404 and does not re-fetch from the build server
 - Farm lifespan no longer reloads default config over a `--config` file passed on the CLI, which left integration tests with no reachable build servers
 - Farm routes no longer use aiohttp-style `async with http_session.get()` against httpx, which left status proxy coroutines unawaited
 - Farm no longer warns about architecture mismatch for servers listed under the `any` config group

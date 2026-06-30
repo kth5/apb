@@ -511,9 +511,12 @@ Returns a comprehensive build status page with:
     }
   ],
   "server_unavailable": false,
+  "artifacts_ready": true,
   "last_status_update": 1642694500.0
 }
 ```
+
+The `artifacts_ready` field indicates whether the farm has finished caching all packages and logs locally. Clients must wait for `artifacts_ready: true` before downloading artifacts from the farm.
 
 **Enhanced Error Handling:**
 - **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
@@ -1821,11 +1824,11 @@ Cache settings are configured in `apb.json`:
 
 ### Cache Behavior
 
-1. **Build Completion**: When a build completes successfully, all artifacts are proactively cached
-2. **Download Request**: When a user requests an artifact download
-3. **Cache Check**: Farm first checks if the artifact is cached locally
-4. **Cache Hit**: If cached, artifact is served directly from local storage
-5. **Cache Miss**: If not cached, artifact is downloaded from build server and cached
+1. **Build Completion**: When a build completes, the farm downloads all artifacts from the build server in the background (with retries)
+2. **Status Polling**: Build status responses include `artifacts_ready` while caching is in progress
+3. **Download Request**: When a client requests an artifact download from the farm
+4. **Cache Hit**: If cached locally, the artifact is served directly from farm storage
+5. **Cache Miss**: If not cached yet, the farm returns 404 and does not re-fetch from the build server; clients must wait for `artifacts_ready`
 6. **Cache Storage**: Artifacts are stored in build-specific directories
 7. **Automatic Cleanup**: Background task runs every 4 hours to remove expired artifacts
 
@@ -1843,8 +1846,9 @@ The cache management features are fully integrated into the admin web dashboard:
 
 The farm automatically caches all build artifacts (packages and logs) immediately when a build completes successfully:
 
-- **Triggered**: Automatically when build status changes to "completed"
+- **Triggered**: Automatically when build status changes to "completed" or "failed"
 - **Background Process**: Caching runs asynchronously without blocking status updates
+- **Retries**: Failed server downloads are retried with exponential backoff before giving up
 - **All Artifacts**: Both packages (.pkg.tar.xz files) and build logs are cached
 - **Error Handling**: Individual artifact caching failures don't affect other artifacts
 - **Logging**: Comprehensive logging of caching operations for monitoring
