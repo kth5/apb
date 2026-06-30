@@ -80,19 +80,56 @@ def wait_for_service(
     )
 
 
-def runtime_dependency_skip_reason() -> str | None:
-    """Verify FastAPI form upload dependencies used by server and farm routes."""
-    try:
-        from fastapi.dependencies.utils import ensure_multipart_is_installed
+def _multipart_module_path(module_name: str) -> str | None:
+    import importlib.util
 
-        ensure_multipart_is_installed()
-    except RuntimeError as exc:
-        return (
-            f"{exc}\n"
-            f"Install project dependencies in the same environment as pytest ({sys.executable}): "
-            "pip uninstall multipart && pip install -e '.[dev]'"
+    spec = importlib.util.find_spec(module_name)
+    if spec is None or spec.origin is None:
+        return None
+    return spec.origin
+
+
+def runtime_dependency_skip_reason() -> str | None:
+    """Verify form upload dependencies used by server and farm routes."""
+    try:
+        from python_multipart.multipart import parse_options_header
+
+        assert parse_options_header
+        return None
+    except (ImportError, AssertionError):
+        pass
+
+    try:
+        from multipart.multipart import parse_options_header
+
+        assert parse_options_header
+        return None
+    except ImportError:
+        pass
+
+    lines = [
+        "Form upload support is unavailable in the Python running pytest.",
+        f"Python: {sys.executable}",
+    ]
+    python_multipart_path = _multipart_module_path("python_multipart")
+    multipart_path = _multipart_module_path("multipart")
+    if python_multipart_path:
+        lines.append(f"python_multipart: {python_multipart_path}")
+    else:
+        lines.append("python_multipart: not found")
+    if multipart_path:
+        lines.append(f"multipart: {multipart_path}")
+    if multipart_path and not python_multipart_path:
+        lines.append(
+            'The PyPI package "multipart" (not "python-multipart") may be installed, or '
+            "python-multipart is too old (<0.0.13)."
         )
-    return None
+    lines.append(
+        f"Fix: {sys.executable} -m pip uninstall -y multipart; "
+        f"{sys.executable} -m pip install --force-reinstall 'python-multipart>=0.0.20'"
+    )
+    lines.append(f"Run tests with: {sys.executable} -m pytest")
+    return "\n".join(lines)
 
 
 def integration_skip_reason() -> str | None:
