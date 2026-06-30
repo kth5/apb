@@ -1473,6 +1473,14 @@ async def cleanup_expired_cache():
         logger.info(f"Cleaned up {len(expired_artifacts)} expired cached artifacts")
 
 
+def get_local_artifact_path(build_id: str, filename: str) -> Optional[Path]:
+    """Return local artifact path if the file exists on the FARM."""
+    file_path = get_cache_config()["directory"] / build_id / filename
+    if file_path.is_file():
+        return file_path
+    return None
+
+
 def determine_content_type_and_disposition(filename: str) -> Tuple[str, str]:
     """
     Determine content type and disposition based on filename.

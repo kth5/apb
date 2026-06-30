@@ -151,7 +151,7 @@ async def delete_user(
     # Get user info before deletion for email notification
     user_to_delete = core.auth_manager.get_user_by_id(user_id)
     if not user_to_delete:
-        raise HTTPException(status_code=404, detail="core.User not found")
+        raise HTTPException(status_code=404, detail="User not found")
 
     if core.auth_manager.delete_user(user_id):
         # Send email notification if user has email and SMTP is configured
@@ -166,9 +166,9 @@ async def delete_user(
             except Exception as e:
                 logger.warning(f"Failed to send user deletion email to {user_to_delete.email}: {e}")
 
-        return {"message": f"core.User {user_id} deleted successfully"}
+        return {"message": f"User {user_id} deleted successfully"}
     else:
-        raise HTTPException(status_code=404, detail="core.User not found")
+        raise HTTPException(status_code=404, detail="User not found")
 
 
 @router.put("/auth/users/{user_id}/role")
@@ -185,7 +185,7 @@ async def change_user_role(
         # Get user info before update for email notification
         user_to_update = core.auth_manager.get_user_by_id(user_id)
         if not user_to_update:
-            raise HTTPException(status_code=404, detail="core.User not found")
+            raise HTTPException(status_code=404, detail="User not found")
 
         if core.auth_manager.change_user_role(user_id, new_role):
             # Send email notification if user has email and SMTP is configured
@@ -200,9 +200,9 @@ async def change_user_role(
                 except Exception as e:
                     logger.warning(f"Failed to send user update email to {user_to_update.email}: {e}")
 
-            return {"message": f"core.User role changed to {new_role.value}"}
+            return {"message": f"User role changed to {new_role.value}"}
         else:
-            raise HTTPException(status_code=404, detail="core.User not found")
+            raise HTTPException(status_code=404, detail="User not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -276,7 +276,7 @@ async def update_user_email_notifications_admin(
         if core.auth_manager.update_user_email_notifications(user_id, notification_data.enabled):
             return {"message": f"Email notifications {'enabled' if notification_data.enabled else 'disabled'} for user {user_id}"}
         else:
-            raise HTTPException(status_code=404, detail="core.User not found")
+            raise HTTPException(status_code=404, detail="User not found")
     except Exception as e:
         logger.error(f"Error updating email notifications for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update email notification preference")
@@ -294,7 +294,7 @@ async def update_user_email(
         # Get user info before update for email notification
         user_to_update = core.auth_manager.get_user_by_id(user_id)
         if not user_to_update:
-            raise HTTPException(status_code=404, detail="core.User not found")
+            raise HTTPException(status_code=404, detail="User not found")
 
         if core.auth_manager.update_user_email(user_id, email_data.email):
             # Send email notification to old email if it exists and SMTP is configured
@@ -323,7 +323,7 @@ async def update_user_email(
 
             return {"message": f"Email updated for user {user_id}"}
         else:
-            raise HTTPException(status_code=404, detail="core.User not found")
+            raise HTTPException(status_code=404, detail="User not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -339,7 +339,7 @@ async def update_my_email(
         if core.auth_manager.update_user_email(current_user.id, email_data.email):
             return {"message": "Email updated successfully"}
         else:
-            raise HTTPException(status_code=404, detail="core.User not found")
+            raise HTTPException(status_code=404, detail="User not found")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -355,7 +355,7 @@ async def update_my_email_notifications(
         if core.auth_manager.update_user_email_notifications(current_user.id, notification_data.enabled):
             return {"message": f"Email notifications {'enabled' if notification_data.enabled else 'disabled'} successfully"}
         else:
-            raise HTTPException(status_code=404, detail="core.User not found")
+            raise HTTPException(status_code=404, detail="User not found")
     except Exception as e:
         logger.error(f"Error updating email notifications for user {current_user.id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to update email notification preference")
@@ -620,8 +620,8 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
             "id": build_id,
             "pkgname": pkgname,
             "display_name": display_name,
-            "start_time": safe_timestamp_to_datetime(start_time),
-            "created_at": safe_timestamp_to_datetime(created_at),
+            "start_time": core.safe_timestamp_to_datetime(start_time),
+            "created_at": core.safe_timestamp_to_datetime(created_at),
             "username": username if username else "#anon#"
         })
 
@@ -704,9 +704,9 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
             "pkgname": pkgname,
             "display_name": display_name,
             "status": row[4],
-            "start_time": safe_timestamp_to_datetime(row[5]),
-            "end_time": safe_timestamp_to_datetime(row[6]),
-            "created_at": safe_timestamp_to_datetime(row[7]) or "unknown",
+            "start_time": core.safe_timestamp_to_datetime(row[5]),
+            "end_time": core.safe_timestamp_to_datetime(row[6]),
+            "created_at": core.safe_timestamp_to_datetime(row[7]) or "unknown",
             "username": row[8] if row[8] else "#anon#"
         })
 
@@ -754,7 +754,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
     if current_user:
         admin_link = ""
         if current_user.role == core.UserRole.ADMIN:
-            admin_link = '<a href="/admin" class="admin-link" title="core.User Administration">⚙️ Admin</a>'
+            admin_link = '<a href="/admin" class="admin-link" title="User Administration">⚙️ Admin</a>'
 
         auth_section = f"""
         <div class="auth-section">
@@ -2148,125 +2148,91 @@ async def stream_build_output(build_id: str):
 
 @router.get("/build/{build_id}/download/{filename}")
 async def download_file(build_id: str, filename: str):
-    """Download build artifact (with caching)"""
+    """Download build artifact from local cache"""
 
-    # First, check if we have the artifact in cache
     cached_artifact = await core.get_cached_artifact(build_id, filename)
     if cached_artifact:
-        logger.debug(f"Serving {filename} for build {build_id} from cache")
+        file_path = cached_artifact["file_path"]
+        file_size = cached_artifact["file_size"]
+    else:
+        file_path = core.get_local_artifact_path(build_id, filename)
+        if not file_path:
+            return HTMLResponse(f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>File Not Found</title>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <style>
+                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                    .header {{ text-align: center; margin-bottom: 30px; }}
+                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                    .failed {{ background-color: #f8d7da; }}
+                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                    .build a:hover {{ text-decoration: underline; }}
+                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
+                    .error-detail strong {{ color: #721c24; }}
+                </style>
+            </head>
+            <body>
+                <div class="header">
+                    <h1>APB Farm - Download</h1>
+                </div>
 
-        # Determine content type and disposition for cached files
-        content_type, disposition = core.determine_content_type_and_disposition(filename)
+                <div class="build failed">
+                    <h2>❌ File Not Found</h2>
+                    <div class="error-detail">
+                        <strong>Error:</strong> The requested file is not available on this farm.
+                    </div>
 
-        # Build headers
-        headers = {
-            "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
-            "ETag": f'"{build_id}-{filename}"',
-            "Content-Length": str(cached_artifact["file_size"])
-        }
+                    <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+                    <p><strong>Filename:</strong> <span class="build-id">{filename}</span></p>
 
-        if disposition == "attachment":
-            headers["Content-Disposition"] = f"attachment; filename={filename}"
-        else:
-            headers["Content-Disposition"] = f"inline; filename={filename}"
+                    <h3>Details</h3>
+                    <p>The file has not been cached locally on this farm. Artifacts are cached when builds
+                    complete; if the build is still running or the cache has expired, the file may not
+                    be available for download.</p>
 
-        return FileResponse(
-            path=str(cached_artifact["file_path"]),
-            filename=filename,
-            media_type=content_type,
-            headers=headers
-        )
+                    <h3>Next Steps</h3>
+                    <ul>
+                        <li>Check the build status to see if the build has completed</li>
+                        <li>Verify that you're using the correct build ID and filename</li>
+                        <li>Try again later if the build is still in progress</li>
+                    </ul>
 
-    # Not in cache, need to download from build server
-    server_url = await find_build_server(build_id)
+                    <p>
+                        <a href="/build/{build_id}/status">📋 View Build Status</a> |
+                        <a href="/dashboard">🏠 Back to Dashboard</a>
+                    </p>
+                </div>
+            </body>
+            </html>
+            """, status_code=404)
+        file_size = file_path.stat().st_size
 
-    if not server_url:
-        # Check if we have build information in database
-        cursor = core.build_database.cursor()
-        cursor.execute('''
-            SELECT server_url, server_available, pkgname
-            FROM builds WHERE id = ?
-        ''', (build_id,))
-        result = cursor.fetchone()
+    logger.debug(f"Serving {filename} for build {build_id} from local cache")
 
-        if result:
-            server_url, server_available, pkgname = result
-            if not server_available:
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": "Server unavailable",
-                        "message": f"The server handling build {build_id} is currently unavailable",
-                        "pkgname": pkgname,
-                        "suggestion": "Please try again later when the server recovers"
-                    }
-                )
+    content_type, disposition = core.determine_content_type_and_disposition(filename)
 
-        raise HTTPException(status_code=404, detail="Build not found")
+    headers = {
+        "Cache-Control": "public, max-age=2592000, immutable",
+        "ETag": f'"{build_id}-{filename}"',
+        "Content-Length": str(file_size)
+    }
 
-    # Retry logic for file downloads
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            async with core.http_session.get(f"{server_url}/build/{build_id}/download/{filename}", timeout=300) as response:
-                if response.status == 200:
-                    content = await response.read()
+    if disposition == "attachment":
+        headers["Content-Disposition"] = f"attachment; filename={filename}"
+    else:
+        headers["Content-Disposition"] = f"inline; filename={filename}"
 
-                    # Cache the artifact for future use
-                    await core.cache_artifact(build_id, filename, content)
-
-                    # Determine content type and disposition
-                    content_type, disposition = core.determine_content_type_and_disposition(filename)
-
-                    # Build headers
-                    headers = {
-                        "Cache-Control": "public, max-age=2592000, immutable",  # 30 days
-                        "ETag": f'"{build_id}-{filename}"',
-                        "Content-Length": str(len(content))
-                    }
-
-                    if disposition == "attachment":
-                        headers["Content-Disposition"] = f"attachment; filename={filename}"
-                    else:
-                        headers["Content-Disposition"] = f"inline; filename={filename}"
-
-                    logger.debug(f"Downloaded and cached {filename} for build {build_id} ({len(content)} bytes), serving as {content_type} ({disposition})")
-                    return StreamingResponse(
-                        iter([content]),
-                        media_type=content_type,
-                        headers=headers
-                    )
-                elif response.status == 404:
-                    raise HTTPException(status_code=404, detail="File not found")
-                else:
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(1)
-                        continue
-                    raise HTTPException(status_code=response.status, detail="Download failed")
-        except Exception as e:
-            if "503" in str(e) or "502" in str(e) or "Connection" in str(e):
-                # Server unavailable
-                cursor = core.build_database.cursor()
-                cursor.execute('''
-                    SELECT pkgname FROM builds WHERE id = ?
-                ''', (build_id,))
-                result = cursor.fetchone()
-                pkgname = result[0] if result else "unknown"
-
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": "Server unavailable",
-                        "message": f"The server handling build {build_id} is currently unavailable",
-                        "pkgname": pkgname,
-                        "suggestion": "Please try again later when the server recovers"
-                    }
-                )
-            elif attempt < max_retries - 1:
-                await asyncio.sleep(1)
-                continue
-            else:
-                raise HTTPException(status_code=503, detail=f"Error downloading file: {e}")
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type=content_type,
+        headers=headers
+    )
 
 
 @router.get("/builds/latest")
@@ -2291,9 +2257,9 @@ async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Option
 
     builds = []
     for row in cursor.fetchall():
-        start_time_str = safe_timestamp_to_datetime(row[5])
-        end_time_str = safe_timestamp_to_datetime(row[6])
-        created_at_str = safe_timestamp_to_datetime(row[7])
+        start_time_str = core.safe_timestamp_to_datetime(row[5])
+        end_time_str = core.safe_timestamp_to_datetime(row[6])
+        created_at_str = core.safe_timestamp_to_datetime(row[7])
 
         # Format package name with version
         pkgname = row[3]
@@ -2663,14 +2629,14 @@ async def get_admin_panel(
     <body>
         <div class="modal-overlay" id="modalOverlay" onclick="hideModal()"></div>
         <div class="modal" id="editUserModal">
-            <h3>Edit core.User</h3>
+            <h3>Edit User</h3>
             <form id="editUserForm" onsubmit="submitEditUser(event)">
                 <input type="hidden" id="editUserId">
                 <label>Username:</label>
                 <input type="text" id="editUsername" readonly>
                 <label>Role:</label>
                 <select id="editRole" required>
-                    <option value="user">core.User</option>
+                    <option value="user">User</option>
                     <option value="admin">Admin</option>
                 </select>
                 <label>Email:</label>
@@ -2680,7 +2646,7 @@ async def get_admin_panel(
                 </label>
                 <div class="error-message" id="editError"></div>
                 <div class="success-message" id="editSuccess"></div>
-                <button type="submit" class="submit-button">Update core.User</button>
+                <button type="submit" class="submit-button">Update User</button>
                 <button type="button" class="cancel-button" onclick="hideModal()">Cancel</button>
             </form>
         </div>
@@ -2700,7 +2666,7 @@ async def get_admin_panel(
             <div class="tab-buttons">
                 <div class="tab-button active" onclick="switchTab('smtp-tab')">📧 SMTP Configuration</div>
                 <div class="tab-button" onclick="switchTab('repositories-tab')">📦 Repository Management</div>
-                <div class="tab-button" onclick="switchTab('users-tab')">👥 core.User Management</div>
+                <div class="tab-button" onclick="switchTab('users-tab')">👥 User Management</div>
                 <div class="tab-button" onclick="switchTab('admin-functions-tab')">⚙️ Admin Functions</div>
             </div>
 
@@ -2803,7 +2769,7 @@ async def get_admin_panel(
                 <div class="admin-section">
 
             <div class="add-user-form">
-                <h3>Add New core.User</h3>
+                <h3>Add New User</h3>
                 <form id="addUserForm" onsubmit="submitAddUser(event)">
                     <label>Username:</label>
                     <input type="text" id="newUsername" placeholder="Username (min 3 characters)" required>
@@ -2813,12 +2779,12 @@ async def get_admin_panel(
                     <input type="email" id="newEmail" placeholder="user@example.com (optional)">
                     <label>Role:</label>
                     <select id="newRole" required>
-                        <option value="user">core.User</option>
+                        <option value="user">User</option>
                         <option value="admin">Admin</option>
                     </select>
                     <div class="error-message" id="addError"></div>
                     <div class="success-message" id="addSuccess"></div>
-                    <button type="submit" class="submit-button">Add core.User</button>
+                    <button type="submit" class="submit-button">Add User</button>
                     <button type="button" class="cancel-button" onclick="clearAddForm()">Clear</button>
                 </form>
             </div>
@@ -2937,7 +2903,7 @@ async def get_admin_panel(
 
                     if (response.ok) {{
                         const data = await response.json();
-                        successDiv.textContent = `core.User '${{username}}' created successfully!`;
+                        successDiv.textContent = `User '${{username}}' created successfully!`;
                         clearAddForm();
                         setTimeout(() => window.location.reload(), 2000);
                     }} else {{
@@ -3027,7 +2993,7 @@ async def get_admin_panel(
                     }});
 
                     if (emailResponse.ok) {{
-                        successDiv.textContent = 'core.User updated successfully!';
+                        successDiv.textContent = 'User updated successfully!';
                         setTimeout(() => {{
                             hideModal();
                             window.location.reload();
@@ -3057,7 +3023,7 @@ async def get_admin_panel(
                     }});
 
                     if (response.ok) {{
-                        alert(`core.User '${{username}}' deleted successfully!`);
+                        alert(`User '${{username}}' deleted successfully!`);
                         window.location.reload();
                     }} else {{
                         const errorData = await response.json();
