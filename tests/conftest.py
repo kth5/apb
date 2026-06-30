@@ -52,9 +52,55 @@ def wait_for_health(url: str, timeout: float = 120.0) -> None:
     raise TimeoutError(f"Service at {url} did not become healthy: {last_error}")
 
 
+def wait_for_service(
+    proc: subprocess.Popen,
+    url: str,
+    log_path: Path,
+    service_name: str,
+    timeout: float = 120.0,
+) -> None:
+    """Wait for a spawned service to become healthy or fail fast if it exits."""
+    deadline = time.time() + timeout
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        exit_code = proc.poll()
+        if exit_code is not None:
+            log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else "(no log output)"
+            pytest.fail(f"{service_name} exited with code {exit_code} before becoming healthy:\n{log_text}")
+        try:
+            response = httpx.get(f"{url}/health", timeout=2.0)
+            if response.status_code == 200:
+                return
+        except httpx.HTTPError as exc:
+            last_error = exc
+        time.sleep(0.5)
+    log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else "(no log output)"
+    pytest.fail(
+        f"{service_name} at {url} did not become healthy within {timeout}s: {last_error}\n{log_text}"
+    )
+
+
+def runtime_dependency_skip_reason() -> str | None:
+    """Verify FastAPI form upload dependencies used by server and farm routes."""
+    try:
+        from fastapi.dependencies.utils import ensure_multipart_is_installed
+
+        ensure_multipart_is_installed()
+    except RuntimeError as exc:
+        return (
+            f"{exc}\n"
+            f"Install project dependencies in the same environment as pytest ({sys.executable}): "
+            "pip uninstall multipart && pip install -e '.[dev]'"
+        )
+    return None
+
+
 def integration_skip_reason() -> str | None:
     if sys.platform != "linux":
         return "APB package integration tests require Linux with Arch build tools"
+    runtime_reason = runtime_dependency_skip_reason()
+    if runtime_reason:
+        return runtime_reason
     if shutil.which("makechrootpkg") is None:
         return "makechrootpkg not found"
     if shutil.which("sudo") is None:
@@ -183,8 +229,8 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
     )
 
     try:
-        wait_for_health(server_url, timeout=300.0)
-        wait_for_health(farm_url, timeout=60.0)
+        wait_for_service(server_proc, server_url, server_log, "APB Server", timeout=300.0)
+        wait_for_service(farm_proc, farm_url, farm_log, "APB Farm", timeout=60.0)
         auth_client = login_farm_user(farm_url, auth_path)
         yield ApbIntegrationEnv(
             home=home,
@@ -194,12 +240,6 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
             build_path=build_path,
             auth_client=auth_client,
         )
-    except Exception as exc:
-        details = [str(exc)]
-        for log_path in (server_log, farm_log):
-            if log_path.exists():
-                details.append(f"{log_path.name}:\n{log_path.read_text()}")
-        pytest.fail("\n\n".join(details))
     finally:
         for proc in (farm_proc, server_proc):
             proc.terminate()

@@ -110,7 +110,7 @@ async def create_user(
     """Create a new user (admin only)"""
     global auth_manager
     try:
-        role = UserRole(user_data.role)
+        role = core.UserRole(user_data.role)
         new_user = core.auth_manager.create_user(user_data.username, user_data.password, role, user_data.email)
 
         # Send email notification if user has email and SMTP is configured
@@ -180,7 +180,7 @@ async def change_user_role(
     """Change user role (admin only)"""
     global auth_manager
     try:
-        new_role = UserRole(role_data.role)
+        new_role = core.UserRole(role_data.role)
 
         # Get user info before update for email notification
         user_to_update = core.auth_manager.get_user_by_id(user_id)
@@ -472,7 +472,7 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
             server_info = await get_server_info(server_url)
 
             # Obfuscate URLs for non-admin users
-            display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else core.obfuscate_server_url(server_url)
+            display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
 
             servers.append({
                 "url": display_url,
@@ -486,7 +486,7 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
         for server_url in server_urls:
             # Check if this server is already properly listed
             # For admin users, check against real URL; for non-admin, check against obfuscated URL
-            compare_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else core.obfuscate_server_url(server_url)
+            compare_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
             already_listed = any(
                 server["url"] == compare_url
                 for server in servers
@@ -494,12 +494,12 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
 
             if not already_listed:
                 # Get server status for detailed health information
-                status = server_status_tracker.get(server_url)
+                status = core.server_status_tracker.get(server_url)
 
                 # Only mark as misconfigured if we have strong evidence
                 if status and status.health == core.ServerHealth.MISCONFIGURED:
                     # Obfuscate URLs for non-admin users
-                    display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else core.obfuscate_server_url(server_url)
+                    display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
                     servers.append({
                         "url": display_url,
                         "arch": f"{config_arch} (misconfigured)",
@@ -518,7 +518,7 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
                         # Initial failure - don't immediately mark as misconfigured
                         current_builds = running_builds_by_server.get(server_url, [])
                         # Obfuscate URLs for non-admin users
-                        display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else core.obfuscate_server_url(server_url)
+                        display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
                         servers.append({
                             "url": display_url,
                             "arch": f"{config_arch} (checking...)",
@@ -632,7 +632,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
             # Get running builds for this server
             current_builds = running_builds_by_server.get(server_url, [])
             # Show real URLs to admin users, obfuscated URLs to non-admin users
-            display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else core.obfuscate_server_url(server_url)
+            display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
             servers_by_arch[arch].append({
                 "url": display_url,
                 "status": "online" if server_info else "offline",
@@ -651,7 +651,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
             )
             if not already_listed:
                 # Get server status for health information
-                status = server_status_tracker.get(server_url)
+                status = core.server_status_tracker.get(server_url)
 
                 # Only show as misconfigured if we have strong evidence
                 if status and status.health == core.ServerHealth.MISCONFIGURED:
@@ -660,7 +660,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
                     # Get running builds for misconfigured server too
                     current_builds = running_builds_by_server.get(server_url, [])
                     # Show real URLs to admin users, obfuscated URLs to non-admin users
-                    display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else core.obfuscate_server_url(server_url)
+                    display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
                     servers_by_arch["misconfigured"].append({
                         "url": display_url,
                         "status": f"misconfigured ({status.consecutive_failures} failures)",
@@ -688,7 +688,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
         server_url = row[1]
         display_url = "unknown"
         if server_url:
-            display_url = server_url if (current_user and current_user.role == UserRole.ADMIN) else core.obfuscate_server_url(server_url)
+            display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
 
         # Format package name with version
         pkgname = row[3]
@@ -753,7 +753,7 @@ async def get_dashboard(page: int = Query(1, ge=1), current_user: Optional[core.
     auth_section = ""
     if current_user:
         admin_link = ""
-        if current_user.role == UserRole.ADMIN:
+        if current_user.role == core.UserRole.ADMIN:
             admin_link = '<a href="/admin" class="admin-link" title="core.User Administration">⚙️ Admin</a>'
 
         auth_section = f"""
@@ -1220,7 +1220,7 @@ async def submit_build(
     try:
         # Validate timeout parameter
         if build_timeout is not None:
-            if current_user.role != UserRole.ADMIN:
+            if current_user.role != core.UserRole.ADMIN:
                 raise HTTPException(
                     status_code=403,
                     detail="Only admin users can specify custom build timeouts"
