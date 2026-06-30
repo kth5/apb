@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from apb import VERSION
@@ -591,15 +591,91 @@ async def cancel_build(
         raise HTTPException(status_code=503, detail=f"Error contacting server: {e}")
 
 
-@router.get("/dashboard")
-async def get_dashboard(
-    page: int = Query(1, ge=1),
-    tab: str = Query("servers"),
+VALID_DASHBOARD_TABS = frozenset({"servers", "builds", "statistics"})
+
+
+def dashboard_path(tab: str, page: int = 1) -> str:
+    if tab not in VALID_DASHBOARD_TABS or tab == "servers":
+        return "/dashboard"
+    if tab == "builds":
+        return "/dashboard/builds" if page <= 1 else f"/dashboard/builds/{page}"
+    return f"/dashboard/{tab}"
+
+
+def legacy_dashboard_redirect_path(
+    tab: Optional[str],
+    page: Optional[int],
+    *,
+    current_tab: str,
+    current_page: int,
+) -> Optional[str]:
+    if tab is None and page is None:
+        return None
+    resolved_tab = tab if tab in VALID_DASHBOARD_TABS else current_tab
+    resolved_page = page if page is not None and page >= 1 else current_page
+    canonical_path = dashboard_path(resolved_tab, resolved_page)
+    current_path = dashboard_path(current_tab, current_page)
+    if canonical_path == current_path:
+        return None
+    return canonical_path
+
+
+@router.get("/dashboard/builds/{page}")
+async def get_dashboard_builds_page(
+    page: int,
+    tab: Optional[str] = Query(None),
+    page_legacy: Optional[int] = Query(None, alias="page"),
     current_user: Optional[core.User] = Depends(core.get_current_user_optional),
 ):
-    """Get farm dashboard HTML"""
-    valid_tabs = {"servers", "builds", "statistics"}
-    active_tab = tab if tab in valid_tabs else "servers"
+    """Get farm dashboard on Recent Builds tab with pagination."""
+    if page < 1:
+        raise HTTPException(status_code=404, detail="Page not found")
+    redirect_path = legacy_dashboard_redirect_path(
+        tab, page_legacy, current_tab="builds", current_page=page
+    )
+    if redirect_path:
+        return RedirectResponse(url=redirect_path, status_code=301)
+    return await _render_dashboard("builds", page, current_user)
+
+
+@router.get("/dashboard/{tab}")
+async def get_dashboard_tab(
+    tab: str,
+    tab_legacy: Optional[str] = Query(None, alias="tab"),
+    page_legacy: Optional[int] = Query(None, alias="page"),
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
+    """Get farm dashboard on a specific tab."""
+    if tab not in VALID_DASHBOARD_TABS:
+        raise HTTPException(status_code=404, detail="Unknown dashboard tab")
+    redirect_path = legacy_dashboard_redirect_path(
+        tab_legacy, page_legacy, current_tab=tab, current_page=1
+    )
+    if redirect_path:
+        return RedirectResponse(url=redirect_path, status_code=301)
+    return await _render_dashboard(tab, 1, current_user)
+
+
+@router.get("/dashboard")
+async def get_dashboard(
+    tab: Optional[str] = Query(None),
+    page: Optional[int] = Query(None),
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
+    """Get farm dashboard HTML."""
+    redirect_path = legacy_dashboard_redirect_path(tab, page, current_tab="servers", current_page=1)
+    if redirect_path:
+        return RedirectResponse(url=redirect_path, status_code=301)
+    return await _render_dashboard("servers", 1, current_user)
+
+
+async def _render_dashboard(
+    tab: str,
+    page: int,
+    current_user: Optional[core.User],
+) -> HTMLResponse:
+    """Render farm dashboard HTML."""
+    active_tab = tab if tab in VALID_DASHBOARD_TABS else "servers"
     if active_tab == "statistics" and not current_user:
         active_tab = "servers"
     # Get server status grouped by actual supported architecture
@@ -944,9 +1020,9 @@ async def get_dashboard(
 
     builds_pagination = f"""
                 <div class="pagination">
-                    <a href="/dashboard?page={max(1, page-1)}&tab=builds">&laquo; Previous</a>
+                    <a href="{dashboard_path('builds', max(1, page - 1))}">&laquo; Previous</a>
                     <span>Page {page}</span>
-                    <a href="/dashboard?page={page+1}&tab=builds">Next &raquo;</a>
+                    <a href="{dashboard_path('builds', page + 1)}">Next &raquo;</a>
                 </div>
     """
 
@@ -954,7 +1030,7 @@ async def get_dashboard(
                 </div>
             </div>
 
-            <div id="builds-tab" class="tab-content{' active' if active_tab == 'builds' else ''}">
+            <div id="builds-tab" class="tab-content{' active' if active_tab == 'builds' else ''}" data-page="{page}">
                 {builds_pagination}
                 <div class="builds">
     """
@@ -1011,8 +1087,47 @@ async def get_dashboard(
         </div>
 
         <script>
+            const DASHBOARD_BUILDS_PAGE_KEY = 'dashboardBuildsPage';
+
+            function getBuildsPageFromPath() {{
+                const match = window.location.pathname.match(/^\\/dashboard\\/builds(?:\\/(\\d+))?$/);
+                return match && match[1] ? parseInt(match[1], 10) : null;
+            }}
+
+            function buildsDashboardPath(page) {{
+                return page > 1 ? `/dashboard/builds/${{page}}` : '/dashboard/builds';
+            }}
+
+            function syncDashboardBuildsPage() {{
+                const buildsTab = document.getElementById('builds-tab');
+                const pathPage = getBuildsPageFromPath();
+                const page = pathPage || parseInt(buildsTab.dataset.page || '1', 10);
+                sessionStorage.setItem(DASHBOARD_BUILDS_PAGE_KEY, String(page));
+            }}
+
+            syncDashboardBuildsPage();
+
             // Tab switching function
             function switchTab(tabId, button) {{
+                const buildsTab = document.getElementById('builds-tab');
+                const wasOnBuilds = buildsTab.classList.contains('active');
+
+                if (wasOnBuilds) {{
+                    const savedPage = getBuildsPageFromPath() || parseInt(buildsTab.dataset.page || '1', 10);
+                    sessionStorage.setItem(DASHBOARD_BUILDS_PAGE_KEY, String(savedPage));
+                }}
+
+                const tabName = tabId.replace('-tab', '');
+
+                if (tabName === 'builds') {{
+                    const targetPage = parseInt(sessionStorage.getItem(DASHBOARD_BUILDS_PAGE_KEY) || '1', 10);
+                    const renderedPage = parseInt(buildsTab.dataset.page || '1', 10);
+                    if (targetPage !== renderedPage) {{
+                        window.location.href = buildsDashboardPath(targetPage);
+                        return;
+                    }}
+                }}
+
                 // Hide all tab contents
                 const tabContents = document.querySelectorAll('.tab-content');
                 tabContents.forEach(content => {{
@@ -1031,14 +1146,15 @@ async def get_dashboard(
                 // Add active class to clicked tab button
                 button.classList.add('active');
 
-                // Persist active tab in URL so pagination and reloads keep the selection
-                const tabName = tabId.replace('-tab', '');
-                const url = new URL(window.location);
-                url.searchParams.set('tab', tabName);
-                if (tabName !== 'builds') {{
-                    url.searchParams.delete('page');
+                // Persist active tab in the URL so pagination and reloads keep the selection
+                let path = '/dashboard';
+                if (tabName === 'builds') {{
+                    const targetPage = parseInt(sessionStorage.getItem(DASHBOARD_BUILDS_PAGE_KEY) || '1', 10);
+                    path = buildsDashboardPath(targetPage);
+                }} else if (tabName !== 'servers') {{
+                    path = `/dashboard/${{tabName}}`;
                 }}
-                history.replaceState(null, '', url);
+                history.replaceState(null, '', path);
             }}
 
             function showLoginForm() {{

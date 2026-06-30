@@ -269,9 +269,13 @@ Simple health check endpoint for the farm.
 #### GET /dashboard
 Get the comprehensive farm dashboard (HTML page) showing all servers, their current builds, and recent build history.
 
-**Parameters:**
-- `page` (integer, optional): Page number for build history pagination (default: 1)
-- `tab` (string, optional): Active dashboard tab — `servers`, `builds`, or `statistics` (default: `servers`). Pagination links on Recent Builds include `tab=builds` so the tab stays selected across pages.
+**Routes:**
+- `/dashboard` — Servers by Architecture tab (default)
+- `/dashboard/builds` — Recent Builds tab, page 1
+- `/dashboard/builds/{page}` — Recent Builds tab, paginated (page ≥ 1)
+- `/dashboard/statistics` — Statistics tab (authenticated users only)
+
+Legacy query-string URLs (`?tab=` and `?page=`) redirect to the path-based routes above.
 
 **Response:** Enhanced HTML page with:
 

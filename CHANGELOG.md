@@ -17,14 +17,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Client build tarballs now include source directories (for example `src/`) required by the root `PKGBUILD`
 - PKGBUILD `pkgname` and `pkgver` (and related scalar fields) now resolve bash-style variable substitutions such as `"tde-${_mod}"` and `"14.1.$_minor"` without invoking bash
 - Pytest could not import `apb` when run outside the project venv; `pythonpath` and explicit src-layout packaging are now configured in `pyproject.toml`
-- Farm dashboard and server list endpoints no longer crash with `NameError` for `server_status_tracker` after the farm module refactor
 
 ### Changed
 
 - Farm dashboard pagination on Recent Builds now preserves the active tab across page changes
 - Farm dashboard Recent Builds pagination is shown at the top and bottom of the list
+- Farm dashboard tabs and build pagination now use path-based URLs (for example `/dashboard/builds/2`) instead of query strings
 - `dev` optional dependencies now include full runtime packages needed to spawn server and farm during integration tests
-- Refactored buildroot host config copy in `setup_buildroot()` to loop over config filenames
 
 ## [2026-06-30]
 
