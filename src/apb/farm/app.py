@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    core.config = load_config()
+    if not core.config.get("servers"):
+        core.config = load_config()
     if not core.config.get("servers"):
         logger.error("No servers configured")
         yield

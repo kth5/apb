@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Farm lifespan no longer reloads default config over a `--config` file passed on the CLI, which left integration tests with no reachable build servers
+- Integration tests now start the build server before the farm, wait for buildroot creation, and wait until the farm discovers an online server before submitting builds
+- `arch=(any)` packages fall back to any configured build server when load-based server selection cannot reach server status endpoints
+- Farm build submission no longer returns 500 when uploading a tarball (`Path` was used without import in `/build`)
 - Farm artifact downloads no longer crash with 500 when a file is not cached locally; missing files return a 404 error page instead
 - Integration tests now fail fast when server/farm subprocesses crash (for example missing or wrong `multipart` package) instead of timing out
 - Client build tarballs now include source directories (for example `src/`) required by the root `PKGBUILD`

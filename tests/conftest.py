@@ -52,6 +52,59 @@ def wait_for_health(url: str, timeout: float = 120.0) -> None:
     raise TimeoutError(f"Service at {url} did not become healthy: {last_error}")
 
 
+def wait_for_server_buildroot(server_url: str, buildroot: Path, timeout: float = 600.0) -> None:
+    """Wait until the server is healthy and its buildroot chroot exists."""
+    deadline = time.time() + timeout
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            health = httpx.get(f"{server_url}/health", timeout=5.0)
+            if health.status_code != 200:
+                raise httpx.HTTPError(f"health returned {health.status_code}")
+
+            root_path = buildroot / "root"
+            if not root_path.is_dir():
+                raise FileNotFoundError(f"buildroot not ready: {root_path}")
+
+            info = httpx.get(f"{server_url}/", timeout=5.0)
+            info.raise_for_status()
+            if not info.json().get("supported_architecture"):
+                raise ValueError("server did not report supported_architecture")
+
+            return
+        except (httpx.HTTPError, ValueError, FileNotFoundError) as exc:
+            last_error = exc
+        time.sleep(1.0)
+    raise TimeoutError(f"Server buildroot at {buildroot} was not ready: {last_error}")
+
+
+def wait_for_farm_servers(farm_url: str, timeout: float = 120.0) -> None:
+    """Wait until the farm discovers at least one online build server."""
+    deadline = time.time() + timeout
+    last_payload: dict | None = None
+    while time.time() < deadline:
+        try:
+            response = httpx.get(f"{farm_url}/farm", timeout=5.0)
+            if response.status_code == 200:
+                payload = response.json()
+                last_payload = payload
+                available_architectures = payload.get("available_architectures") or []
+                online_servers = [
+                    server
+                    for server in payload.get("servers", [])
+                    if server.get("status") == "online"
+                ]
+                if available_architectures and online_servers:
+                    return
+        except httpx.HTTPError:
+            pass
+        time.sleep(1.0)
+    pytest.fail(
+        "Farm did not discover any online build servers before build submission. "
+        f"Last /farm response: {last_payload}"
+    )
+
+
 def wait_for_service(
     proc: subprocess.Popen,
     url: str,
@@ -258,16 +311,20 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
         stdout=server_log.open("w"),
         stderr=subprocess.STDOUT,
     )
-    farm_proc = subprocess.Popen(
-        farm_cmd,
-        env=env,
-        stdout=farm_log.open("w"),
-        stderr=subprocess.STDOUT,
-    )
+    farm_proc: subprocess.Popen | None = None
 
     try:
-        wait_for_service(server_proc, server_url, server_log, "APB Server", timeout=300.0)
+        wait_for_service(server_proc, server_url, server_log, "APB Server", timeout=600.0)
+        wait_for_server_buildroot(server_url, buildroot, timeout=600.0)
+
+        farm_proc = subprocess.Popen(
+            farm_cmd,
+            env=env,
+            stdout=farm_log.open("w"),
+            stderr=subprocess.STDOUT,
+        )
         wait_for_service(farm_proc, farm_url, farm_log, "APB Farm", timeout=60.0)
+        wait_for_farm_servers(farm_url, timeout=120.0)
         auth_client = login_farm_user(farm_url, auth_path)
         yield ApbIntegrationEnv(
             home=home,
@@ -279,6 +336,8 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
         )
     finally:
         for proc in (farm_proc, server_proc):
+            if proc is None:
+                continue
             proc.terminate()
             try:
                 proc.wait(timeout=15)

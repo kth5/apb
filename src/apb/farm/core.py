@@ -1898,13 +1898,18 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
 
     for arch in target_archs:
         if arch == "any":
-            # For "any" architecture, select the best available architecture (not all)
+            # arch=(any) packages can run on any build server regardless of native architecture
             if available_archs:
-                # Pick the architecture with the least load
                 best_arch = None
                 best_load = float('inf')
+                fallback_arch = None
 
                 for avail_arch, server_urls in available_archs.items():
+                    if not server_urls:
+                        continue
+                    if fallback_arch is None:
+                        fallback_arch = avail_arch
+
                     total_load = 0
                     available_servers = 0
 
@@ -1917,29 +1922,37 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
                                 queued_builds_count = queue_status.get("queued_builds", 0)
                                 max_concurrent = queue_status.get("max_concurrent_builds", 3)
 
-                                # Skip servers at capacity
                                 if current_builds < max_concurrent:
                                     total_load += current_builds + queued_builds_count
                                     available_servers += 1
                         except Exception:
                             continue
 
-                    # Calculate average load for this architecture
                     if available_servers > 0:
                         avg_load = total_load / available_servers
                         if avg_load < best_load:
                             best_load = avg_load
                             best_arch = avail_arch
 
-                if best_arch:
-                    buildable_archs.append(best_arch)
-                    logger.info(f"Selected architecture '{best_arch}' for 'any' architecture package (lowest load: {best_load:.1f})")
+                selected_arch = best_arch or fallback_arch
+                if selected_arch:
+                    buildable_archs.append(selected_arch)
+                    if best_arch:
+                        logger.info(
+                            f"Selected architecture '{selected_arch}' for 'any' architecture package "
+                            f"(lowest load: {best_load:.1f})"
+                        )
+                    else:
+                        logger.info(
+                            f"Selected architecture '{selected_arch}' for 'any' architecture package "
+                            f"(fallback; {len(available_archs[selected_arch])} configured server(s))"
+                        )
                 else:
                     skipped_archs.append(arch)
-                    logger.warning(f"No available servers for 'any' architecture")
+                    logger.warning("No available servers for 'any' architecture")
             else:
                 skipped_archs.append(arch)
-                logger.warning(f"No server architectures available for 'any' architecture")
+                logger.warning("No server architectures available for 'any' architecture")
         else:
             # Check if this specific architecture has available servers
             if arch in available_archs and available_archs[arch]:
