@@ -3,12 +3,18 @@
 import argparse
 import json
 import logging
+import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urljoin
+
+import httpx
 
 from apb.config import load_config
+from apb.tarball import create_build_tarball
 
 from apb.client.api import APBotClient
 from apb.client.auth import APBAuthClient
@@ -66,18 +72,9 @@ def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[
 
         client = APBotClient(server_url, auth_client)
 
-        # Create a temporary tarball containing all files (excluding subdirectories except keys/)
         with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
             try:
-                with tarfile.open(temp_tarball.name, 'w:gz') as tar:
-                    # Add all files from the build directory, excluding subdirectories except keys/
-                    for item in build_path.iterdir():
-                        if item.is_file():
-                            # Add file with just its name (not full path)
-                            tar.add(item, arcname=item.name)
-                        elif item.is_dir() and item.name == "keys":
-                            # Add keys/ directory and all its contents recursively
-                            tar.add(item, arcname=item.name)
+                create_build_tarball(build_path, Path(temp_tarball.name))
 
                 # Prepare form data
                 form_data = {}
@@ -106,7 +103,7 @@ def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[
                 except OSError:
                     pass
 
-    except requests.RequestException as e:
+    except httpx.HTTPError as e:
         print(f"Error submitting build to farm: {e}")
         if hasattr(e, 'response') and e.response is not None:
             try:

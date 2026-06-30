@@ -2,8 +2,8 @@
 
 import json
 import logging
+import os
 import queue
-import tarfile
 import tempfile
 import threading
 import time
@@ -61,18 +61,9 @@ class APBotClient:
         if not pkgbuild_path.exists():
             raise ValueError(f"PKGBUILD not found in {build_path}")
 
-        # Create a temporary tarball containing all files (excluding subdirectories except keys/)
         with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
             try:
-                with tarfile.open(temp_tarball.name, 'w:gz') as tar:
-                    # Add all files from the build directory, excluding subdirectories except keys/
-                    for item in build_path.iterdir():
-                        if item.is_file():
-                            # Add file with just its name (not full path)
-                            tar.add(item, arcname=item.name)
-                        elif item.is_dir() and item.name == "keys":
-                            # Add keys/ directory and all its contents recursively
-                            tar.add(item, arcname=item.name)
+                create_build_tarball(build_path, Path(temp_tarball.name))
 
                 # Submit the tarball using streaming to avoid memory issues
                 with open(temp_tarball.name, 'rb') as f:
