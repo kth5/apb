@@ -268,7 +268,6 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
             {
                 "servers": {
                     server_arch: [server_url],
-                    "any": [server_url],
                 },
                 "default_server": server_url,
                 "default_arch": server_arch,

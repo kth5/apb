@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - Farm lifespan no longer reloads default config over a `--config` file passed on the CLI, which left integration tests with no reachable build servers
+- Farm routes no longer use aiohttp-style `async with http_session.get()` against httpx, which left status proxy coroutines unawaited
+- Farm no longer warns about architecture mismatch for servers listed under the `any` config group
 - Queued farm builds no longer return 404 from `/build/{build_id}/status` before a build server is assigned
 - Client code no longer references undefined `requests` exceptions after the httpx migration
 - Farm `/farm` endpoint no longer crashes with `NameError` for bare `get_server_info`, `find_build_server`, and `build_queue` references in routes

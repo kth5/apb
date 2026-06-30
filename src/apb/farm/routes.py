@@ -567,26 +567,28 @@ async def cancel_build(
         raise HTTPException(status_code=404, detail="Build not found")
 
     try:
-        async with core.http_session.post(f"{server_url}/build/{build_id}/cancel", timeout=10) as response:
-            if response.status == 200:
-                result = await response.json()
+        response = await core.http_session.post(f"{server_url}/build/{build_id}/cancel", timeout=10)
+        if response.status_code == 200:
+            result = response.json()
 
-                # Update local database
-                cursor = core.build_database.cursor()
-                cursor.execute('''
-                    UPDATE builds SET status = ?, end_time = ?
-                    WHERE id = ?
-                ''', (core.BuildStatus.CANCELLED, time.time(), build_id))
-                core.build_database.commit()
+            # Update local database
+            cursor = core.build_database.cursor()
+            cursor.execute('''
+                UPDATE builds SET status = ?, end_time = ?
+                WHERE id = ?
+            ''', (core.BuildStatus.CANCELLED, time.time(), build_id))
+            core.build_database.commit()
 
-                return {
-                    "success": True,
-                    "message": f"Build {build_id} cancelled successfully",
-                    "server_response": result
-                }
-            else:
-                error_detail = await response.text()
-                raise HTTPException(status_code=response.status, detail=f"Server error: {error_detail}")
+            return {
+                "success": True,
+                "message": f"Build {build_id} cancelled successfully",
+                "server_response": result
+            }
+
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Server error: {response.text}",
+        )
     except Exception as e:
         logger.error(f"Error cancelling build {build_id} on server {server_url}: {e}")
         raise HTTPException(status_code=503, detail=f"Error contacting server: {e}")
@@ -1938,31 +1940,34 @@ async def get_build_status(build_id: str, format: str = Query("html")):
     # Server should be available - try to contact it
     if format == "json":
         try:
-            async with core.http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10) as response:
-                if response.status == 200:
-                    build_status = await response.json()
-                    build_status["server_url"] = core.obfuscate_server_url(server_url)
-                    if server_arch:
-                        build_status["server_arch"] = server_arch  # Add architecture from farm database
-                    else:
-                        logger.warning(f"server_arch is None/empty for build {build_id}")
-
-                    # Update our cache with the latest status
-                    cursor = core.build_database.cursor()
-                    cursor.execute('''
-                        UPDATE builds SET
-                            last_known_status = ?,
-                            last_status_update = ?,
-                            server_available = 1,
-                            cached_response = ?
-                        WHERE id = ?
-                    ''', (build_status.get('status', 'unknown'), time.time(),
-                         json.dumps(build_status), build_id))
-                    core.build_database.commit()
-
-                    return build_status
+            response = await core.http_session.get(
+                f"{server_url}/build/{build_id}/status-api",
+                timeout=10,
+            )
+            if response.status_code == 200:
+                build_status = response.json()
+                build_status["server_url"] = core.obfuscate_server_url(server_url)
+                if server_arch:
+                    build_status["server_arch"] = server_arch  # Add architecture from farm database
                 else:
-                    raise HTTPException(status_code=response.status, detail="Build not found")
+                    logger.warning(f"server_arch is None/empty for build {build_id}")
+
+                # Update our cache with the latest status
+                cursor = core.build_database.cursor()
+                cursor.execute('''
+                    UPDATE builds SET
+                        last_known_status = ?,
+                        last_status_update = ?,
+                        server_available = 1,
+                        cached_response = ?
+                    WHERE id = ?
+                ''', (build_status.get('status', 'unknown'), time.time(),
+                     json.dumps(build_status), build_id))
+                core.build_database.commit()
+
+                return build_status
+
+            raise HTTPException(status_code=response.status_code, detail="Build not found")
         except Exception as e:
             # Server is unavailable, try to return cached response
             cursor = core.build_database.cursor()
@@ -1988,116 +1993,119 @@ async def get_build_status(build_id: str, format: str = Query("html")):
     else:
         # Generate farm's own HTML page instead of forwarding to server
         try:
-            async with core.http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10) as response:
-                if response.status == 200:
-                    build_status = await response.json()
-                    build_status["server_url"] = core.obfuscate_server_url(server_url)
-                    if server_arch:
-                        build_status["server_arch"] = server_arch
+            response = await core.http_session.get(
+                f"{server_url}/build/{build_id}/status-api",
+                timeout=10,
+            )
+            if response.status_code == 200:
+                build_status = response.json()
+                build_status["server_url"] = core.obfuscate_server_url(server_url)
+                if server_arch:
+                    build_status["server_arch"] = server_arch
 
-                    # Update our cache with the latest status
-                    cursor = core.build_database.cursor()
-                    cursor.execute('''
-                        UPDATE builds SET
-                            last_known_status = ?,
-                            last_status_update = ?,
-                            server_available = 1,
-                            cached_response = ?
-                        WHERE id = ?
-                    ''', (build_status.get('status', 'unknown'), time.time(),
-                         json.dumps(build_status), build_id))
-                    core.build_database.commit()
+                # Update our cache with the latest status
+                cursor = core.build_database.cursor()
+                cursor.execute('''
+                    UPDATE builds SET
+                        last_known_status = ?,
+                        last_status_update = ?,
+                        server_available = 1,
+                        cached_response = ?
+                    WHERE id = ?
+                ''', (build_status.get('status', 'unknown'), time.time(),
+                     json.dumps(build_status), build_id))
+                core.build_database.commit()
 
-                    # Generate HTML response
-                    status_class = build_status.get('status', 'unknown')
-                    packages = build_status.get('packages', [])
-                    logs = build_status.get('logs', [])
-                    start_time = build_status.get('start_time')
-                    end_time = build_status.get('end_time')
-                    duration = build_status.get('duration', 0)
+                # Generate HTML response
+                status_class = build_status.get('status', 'unknown')
+                packages = build_status.get('packages', [])
+                logs = build_status.get('logs', [])
+                start_time = build_status.get('start_time')
+                end_time = build_status.get('end_time')
+                duration = build_status.get('duration', 0)
 
-                    # Build packages HTML
-                    packages_html = ""
-                    if packages:
-                        packages_html = "<h3>📦 Available Packages</h3><ul>"
-                        for pkg in packages:
-                            packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
-                        packages_html += "</ul>"
+                # Build packages HTML
+                packages_html = ""
+                if packages:
+                    packages_html = "<h3>📦 Available Packages</h3><ul>"
+                    for pkg in packages:
+                        packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
+                    packages_html += "</ul>"
 
-                    # Build logs HTML
-                    logs_html = ""
-                    if logs:
-                        logs_html = "<h3>📄 Build Logs</h3><ul>"
-                        for log in logs:
-                            logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
-                        logs_html += "</ul>"
+                # Build logs HTML
+                logs_html = ""
+                if logs:
+                    logs_html = "<h3>📄 Build Logs</h3><ul>"
+                    for log in logs:
+                        logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
+                    logs_html += "</ul>"
 
-                    return HTMLResponse(f"""
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>Build Status - {display_name}</title>
-                        <meta charset="utf-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1">
-                        <meta http-equiv="refresh" content="30">
-                        <style>
-                            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                            .header {{ text-align: center; margin-bottom: 30px; }}
-                            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                            .completed {{ background-color: #d4edda; }}
-                            .failed {{ background-color: #f8d7da; }}
-                            .building {{ background-color: #fff3cd; }}
-                            .queued {{ background-color: #d1ecf1; }}
-                            .cancelled {{ background-color: #e2e3e5; }}
-                            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                            .build a:hover {{ text-decoration: underline; }}
-                            .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
-                            .metadata p {{ margin: 5px 0; }}
-                            .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
-                            .status-completed {{ background-color: #d4edda; color: #155724; }}
-                            .status-failed {{ background-color: #f8d7da; color: #721c24; }}
-                            .status-building {{ background-color: #fff3cd; color: #856404; }}
-                            .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
-                            .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
-                        </style>
-                    </head>
-                    <body>
-                        <div class="header">
-                            <h1>APB Farm - Build Status</h1>
-                            <p>Package: <strong>{display_name}</strong></p>
+                return HTMLResponse(f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Build Status - {display_name}</title>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <meta http-equiv="refresh" content="30">
+                    <style>
+                        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                        .header {{ text-align: center; margin-bottom: 30px; }}
+                        .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
+                        .completed {{ background-color: #d4edda; }}
+                        .failed {{ background-color: #f8d7da; }}
+                        .building {{ background-color: #fff3cd; }}
+                        .queued {{ background-color: #d1ecf1; }}
+                        .cancelled {{ background-color: #e2e3e5; }}
+                        .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
+                        .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
+                        .build a:hover {{ text-decoration: underline; }}
+                        .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
+                        .metadata p {{ margin: 5px 0; }}
+                        .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
+                        .status-completed {{ background-color: #d4edda; color: #155724; }}
+                        .status-failed {{ background-color: #f8d7da; color: #721c24; }}
+                        .status-building {{ background-color: #fff3cd; color: #856404; }}
+                        .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
+                        .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
+                    </style>
+                </head>
+                <body>
+                    <div class="header">
+                        <h1>APB Farm - Build Status</h1>
+                        <p>Package: <strong>{display_name}</strong></p>
+                    </div>
+
+                    <div class="build {status_class}">
+                        <h2>📋 Build Status</h2>
+
+                        <div class="metadata">
+                            <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
+                            <p><strong>Package:</strong> {display_name}</p>
+                            <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
+                            <p><strong>Server:</strong> {core.obfuscate_server_url(server_url)}</p>
+                            <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
+                            <p><strong>Triggered by:</strong> {username}</p>
+                            {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
+                            {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
+                            {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
                         </div>
 
-                        <div class="build {status_class}">
-                            <h2>📋 Build Status</h2>
+                        {packages_html}
+                        {logs_html}
 
-                            <div class="metadata">
-                                <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                                <p><strong>Package:</strong> {display_name}</p>
-                                <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
-                                <p><strong>Server:</strong> {core.obfuscate_server_url(server_url)}</p>
-                                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
-                                <p><strong>Triggered by:</strong> {username}</p>
-                                {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
-                                {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
-                                {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
-                            </div>
+                        <h3>Actions</h3>
+                        <p>
+                            <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
+                            <a href="/dashboard">🏠 Back to Dashboard</a> |
+                            <a href="/farm">🌾 View Farm Status</a>
+                        </p>
+                    </div>
+                </body>
+                </html>
+                """)
 
-                            {packages_html}
-                            {logs_html}
-
-                            <h3>Actions</h3>
-                            <p>
-                                <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
-                                <a href="/dashboard">🏠 Back to Dashboard</a> |
-                                <a href="/farm">🌾 View Farm Status</a>
-                            </p>
-                        </div>
-                    </body>
-                    </html>
-                    """)
-                else:
-                    raise HTTPException(status_code=response.status, detail="Build not found")
+            raise HTTPException(status_code=response.status_code, detail="Build not found")
         except Exception as e:
             # Server is unavailable, try to return cached response as HTML
             cursor = core.build_database.cursor()
@@ -2246,11 +2254,15 @@ async def get_build_output(build_id: str, start_index: int = Query(0, ge=0), lim
 
     try:
         params = {"start_index": start_index, "limit": limit}
-        async with core.http_session.get(f"{server_url}/build/{build_id}/output", params=params, timeout=10) as response:
-            if response.status == 200:
-                return await response.json()
-            else:
-                raise HTTPException(status_code=response.status, detail="Build output not found")
+        response = await core.http_session.get(
+            f"{server_url}/build/{build_id}/output",
+            params=params,
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return response.json()
+
+        raise HTTPException(status_code=response.status_code, detail="Build output not found")
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Error contacting server: {e}")
 
@@ -2286,12 +2298,16 @@ async def stream_build_output(build_id: str):
 
     try:
         async def event_generator():
-            async with core.http_session.get(f"{server_url}/build/{build_id}/stream", timeout=None) as response:
-                if response.status == 200:
-                    async for line in response.content:
-                        yield line.decode('utf-8')
+            async with core.http_session.stream(
+                "GET",
+                f"{server_url}/build/{build_id}/stream",
+                timeout=None,
+            ) as response:
+                if response.status_code == 200:
+                    async for line in response.aiter_lines():
+                        yield f"{line}\n"
                 else:
-                    yield f"data: Error: {response.status}\n\n"
+                    yield f"data: Error: {response.status_code}\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     except Exception as e:

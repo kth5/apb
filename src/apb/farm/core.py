@@ -1690,9 +1690,11 @@ async def get_available_architectures() -> Dict[str, List[str]]:
                     logger.debug(f"Using last known architecture {supported_arch} for temporarily unavailable server {server_url}")
 
             if supported_arch:
-                # Log if there's a mismatch between config and actual
-                if config_arch != supported_arch:
-                    logger.warning(f"Server {server_url} configured for {config_arch} but supports {supported_arch}")
+                # "any" is a wildcard config group, not a native server architecture
+                if config_arch != supported_arch and config_arch != "any":
+                    logger.warning(
+                        f"Server {server_url} configured for {config_arch} but supports {supported_arch}"
+                    )
 
                 return {
                     'server_url': server_url,
