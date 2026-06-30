@@ -135,15 +135,15 @@ class APBotClient:
         url = urljoin(self.server_url, f'/build/{build_id}/download/{filename}')
 
         try:
-            response = self.session.get(url, stream=True)
-            response.raise_for_status()
+            with self.session.stream("GET", url) as response:
+                response.raise_for_status()
 
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / filename
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_path = output_dir / filename
 
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                with open(output_path, "wb") as handle:
+                    for chunk in response.iter_bytes(chunk_size=8192):
+                        handle.write(chunk)
 
             return True
         except httpx.HTTPError:
@@ -268,12 +268,12 @@ class APBotClient:
         url = urljoin(self.server_url, f'/build/{build_id}/stream')
 
         try:
-            response = self.session.get(url, stream=True)
-            response.raise_for_status()
+            with self.session.stream("GET", url) as response:
+                response.raise_for_status()
 
-            for line in response.iter_lines():
-                if line:
-                    yield line + '\n'
+                for line in response.iter_lines():
+                    if line:
+                        yield f"{line}\n"
         except httpx.HTTPError:
             pass
 

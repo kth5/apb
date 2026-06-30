@@ -16,7 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Farm routes no longer use aiohttp-style `async with http_session.get()` against httpx, which left status proxy coroutines unawaited
 - Farm no longer warns about architecture mismatch for servers listed under the `any` config group
 - Queued farm builds no longer return 404 from `/build/{build_id}/status` before a build server is assigned
-- Client code no longer references undefined `requests` exceptions after the httpx migration
+- Client artifact downloads and output streaming no longer pass requests-style `stream=True` to httpx
 - Farm `/farm` endpoint no longer crashes with `NameError` for bare `get_server_info`, `find_build_server`, and `build_queue` references in routes
 - Integration test now builds the minimal `test/test-package` fixture instead of the root `apb` PKGBUILD
 - Test package PKGBUILD uses `arch=('any')` so integration builds work on any build server architecture
