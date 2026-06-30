@@ -374,7 +374,16 @@ pip install -e .
 # or: pip install -r requirements.txt && pip install -e .
 ```
 
-For development or testing, see `requirements.txt` and `pyproject.toml`.
+For development and unit tests:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+python -m pytest -v
+```
+
+Use `python -m pytest` so the active virtualenv's interpreter is used. A system-wide `pytest` command may invoke a different Python and fail to import `apb`.
 
 ## Getting Started
 

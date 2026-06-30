@@ -21,17 +21,51 @@ class PkgbuildInfo:
     apb_output_timeout: Optional[int] = None
 
 
+_VAR_REF_PATTERN = re.compile(r"\$\{([^}]+)\}|\$(\w+)")
+
+
 def _strip_value(value: str) -> str:
     return value.strip().strip("'\"")
 
 
-def _parse_array(value: str) -> List[str]:
+def _substitute_variables(text: str, variables: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        return variables.get(name, "")
+
+    return _VAR_REF_PATTERN.sub(replace, text)
+
+
+def _resolve_value(value: str, variables: dict[str, str]) -> str:
+    """Resolve a scalar PKGBUILD assignment value with bash-like variable expansion."""
+    value = value.strip()
+    if not value:
+        return ""
+
+    if value[0] == "'" and value.endswith("'") and len(value) >= 2:
+        return value[1:-1]
+
+    if value[0] == '"' and value.endswith('"') and len(value) >= 2:
+        return _substitute_variables(value[1:-1], variables)
+
+    return _substitute_variables(_strip_value(value), variables)
+
+
+def _parse_array(value: str, variables: Optional[dict[str, str]] = None) -> List[str]:
     value = value.strip()
     if value.startswith("(") and value.endswith(")"):
         value = value[1:-1].strip()
     if not value:
         return []
-    return [_strip_value(item) for item in re.split(r"\s+", value) if item.strip("'\"")]
+
+    if variables is None:
+        return [_strip_value(item) for item in re.split(r"\s+", value) if item.strip("'\"")]
+
+    return [
+        _resolve_value(item, variables)
+        for item in re.split(r"\s+", value)
+        if item.strip("'\"")
+    ]
 
 
 def _extract_assignment(line: str) -> Optional[tuple[str, str]]:
@@ -45,6 +79,7 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
     """Parse PKGBUILD content into structured package information."""
     info = PkgbuildInfo()
     pkgbase: Optional[str] = None
+    variables: dict[str, str] = {}
 
     for raw_line in content.splitlines():
         line = raw_line.strip()
@@ -54,29 +89,34 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
         key, value = assignment
 
         if key == "pkgbase":
-            pkgbase = _strip_value(value)
+            pkgbase = _resolve_value(value, variables)
+            variables[key] = pkgbase
         elif key == "pkgname":
             if value.startswith("("):
-                names = _parse_array(value)
+                names = _parse_array(value, variables)
                 info.pkgname_list = names
                 if names:
                     info.pkgname = names[0]
             else:
-                name = _strip_value(value)
+                name = _resolve_value(value, variables)
                 info.pkgname = name
                 info.pkgname_list = [name]
+                variables[key] = name
         elif key == "pkgver":
-            info.pkgver = _strip_value(value)
+            info.pkgver = _resolve_value(value, variables)
+            variables[key] = info.pkgver
         elif key == "pkgrel":
-            info.pkgrel = _strip_value(value)
+            info.pkgrel = _resolve_value(value, variables)
+            variables[key] = info.pkgrel
         elif key == "epoch":
-            info.epoch = _strip_value(value)
+            info.epoch = _resolve_value(value, variables)
+            variables[key] = info.epoch
         elif key == "arch":
-            info.arch = _parse_array(value) or info.arch
+            info.arch = _parse_array(value, variables) or info.arch
         elif key == "apb_extra_repos":
-            info.extra_repos = _parse_array(value)
+            info.extra_repos = _parse_array(value, variables)
         elif key == "apb_output_timeout":
-            timeout_str = value.split("#", 1)[0].strip().strip("'\"")
+            timeout_str = _resolve_value(value.split("#", 1)[0], variables)
             try:
                 timeout_value = int(timeout_str)
                 if timeout_value < 60:
@@ -87,6 +127,8 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
                     info.apb_output_timeout = timeout_value
             except ValueError:
                 logger.warning("Invalid apb_output_timeout value '%s', ignoring", timeout_str)
+        elif not value.startswith("("):
+            variables[key] = _resolve_value(value, variables)
 
     if pkgbase:
         info.pkgname = pkgbase

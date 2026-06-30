@@ -41,3 +41,55 @@ def test_parse_pkgbuild_file(tmp_path: Path):
     info = parse_pkgbuild_file(pkgbuild)
     assert info.pkgname == "testpkg"
     assert info.arch == ["any"]
+
+
+def test_parse_pkgbuild_variable_substitution():
+    content = """
+_mod=tdeadmin
+_minor=1
+
+pkgname="tde-${_mod}"
+pkgver="14.1.$_minor"
+pkgrel=1
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgname == "tde-tdeadmin"
+    assert info.pkgver == "14.1.1"
+
+
+def test_parse_pkgbuild_variable_substitution_unquoted():
+    content = """
+_minor=2
+pkgver=3.0.$_minor
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgver == "3.0.2"
+
+
+def test_parse_pkgbuild_variable_substitution_single_quoted():
+    content = """
+_minor=2
+pkgver='3.0.$_minor'
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgver == "3.0.$_minor"
+
+
+def test_parse_pkgbuild_variable_substitution_order():
+    content = """
+pkgname="tde-${_mod}"
+_mod=tdeadmin
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgname == "tde-"
+
+
+def test_parse_pkgbuild_variable_substitution_pkgname_array():
+    content = """
+_mod=docs
+pkgname=("foo" "foo-${_mod}")
+pkgver=1.0.0
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgname_list == ["foo", "foo-docs"]
+    assert info.pkgname == "foo"
