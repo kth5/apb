@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from apb.arch import resolve_server_architecture
 from apb.client.auth import APBAuthClient
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -259,16 +260,18 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
     server_url = f"http://127.0.0.1:{server_port}"
     farm_url = f"http://127.0.0.1:{farm_port}"
 
+    server_arch = resolve_server_architecture()
+
     config_path = tmp_path / "apb.json"
     config_path.write_text(
         json.dumps(
             {
                 "servers": {
-                    "x86_64": [server_url],
+                    server_arch: [server_url],
                     "any": [server_url],
                 },
                 "default_server": server_url,
-                "default_arch": "x86_64",
+                "default_arch": server_arch,
                 "output_dir": str(output_dir),
                 "farm_url": farm_url,
             }

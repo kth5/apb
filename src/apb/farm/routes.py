@@ -241,7 +241,7 @@ async def change_password(
     global auth_manager
 
     # Get current user
-    current_user = await get_current_user(credentials, request)
+    current_user = await core.get_current_user(credentials, request)
     if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -470,7 +470,7 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
     # Group servers by their actual supported architecture
     for arch, server_urls in available_archs.items():
         for server_url in server_urls:
-            server_info = await get_server_info(server_url)
+            server_info = await core.get_server_info(server_url)
 
             # Obfuscate URLs for non-admin users
             display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
@@ -514,7 +514,7 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
                     pass
                 else:
                     # Server not in tracking yet - get info to initialize
-                    server_info = await get_server_info(server_url)
+                    server_info = await core.get_server_info(server_url)
                     if not server_info:
                         # Initial failure - don't immediately mark as misconfigured
                         current_builds = running_builds_by_server.get(server_url, [])
@@ -561,7 +561,7 @@ async def cancel_build(
     if not core.auth_manager.can_cancel_build(current_user, build_id):
         raise HTTPException(status_code=403, detail="Not authorized to cancel this build")
 
-    server_url = await find_build_server(build_id)
+    server_url = await core.find_build_server(build_id)
 
     if not server_url:
         raise HTTPException(status_code=404, detail="Build not found")
@@ -713,7 +713,7 @@ async def _render_dashboard(
     for arch, server_urls in available_archs.items():
         servers_by_arch[arch] = []
         for server_url in server_urls:
-            server_info = await get_server_info(server_url)
+            server_info = await core.get_server_info(server_url)
             # Get running builds for this server
             current_builds = running_builds_by_server.get(server_url, [])
             # Show real URLs to admin users, obfuscated URLs to non-admin users
@@ -1508,7 +1508,7 @@ async def submit_build(
             "builds": queued_builds,  # Information about all queued builds
             "submission_group": primary_build["submission_group"],
             "queue_status": {
-                "queue_size": len(build_queue),
+                "queue_size": len(core.build_queue),
                 "builds_queued": len(queued_builds)
             },
             "created_at": time.time()
@@ -2207,7 +2207,7 @@ async def get_build_status_api(build_id: str):
 @router.get("/build/{build_id}/output")
 async def get_build_output(build_id: str, start_index: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=1000)):
     """Get build output/logs"""
-    server_url = await find_build_server(build_id)
+    server_url = await core.find_build_server(build_id)
 
     if not server_url:
         raise HTTPException(status_code=404, detail="Build not found")
@@ -2226,7 +2226,7 @@ async def get_build_output(build_id: str, start_index: int = Query(0, ge=0), lim
 @router.get("/build/{build_id}/stream")
 async def stream_build_output(build_id: str):
     """Stream build output in real-time"""
-    server_url = await find_build_server(build_id)
+    server_url = await core.find_build_server(build_id)
 
     if not server_url:
         # Check if we have build information in database
