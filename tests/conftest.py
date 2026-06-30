@@ -20,17 +20,7 @@ from apb.client.auth import APBAuthClient
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-
-PACKAGE_FILES = (
-    "PKGBUILD",
-    "pyproject.toml",
-    "apb.json.example",
-    "apb.sysusers",
-    "apb.tmpfiles",
-    "apb.sudoers",
-    "apb.install",
-)
-PACKAGE_DIRS = ("src",)
+TEST_PACKAGE_DIR = REPO_ROOT / "test" / "test-package"
 
 
 def find_free_port() -> int:
@@ -204,15 +194,14 @@ def integration_skip_reason() -> str | None:
     return None
 
 
-def stage_apb_package(staging_dir: Path) -> Path:
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    for name in PACKAGE_FILES:
-        shutil.copy2(REPO_ROOT / name, staging_dir / name)
-    for name in PACKAGE_DIRS:
-        destination = staging_dir / name
-        if destination.exists():
-            shutil.rmtree(destination)
-        shutil.copytree(REPO_ROOT / name, destination)
+def stage_test_package(staging_dir: Path) -> Path:
+    """Copy the minimal integration test package into an isolated build directory."""
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    shutil.copytree(TEST_PACKAGE_DIR, staging_dir)
+    test_script = staging_dir / "test-script.sh"
+    if test_script.exists():
+        test_script.chmod(0o755)
     return staging_dir
 
 
@@ -252,7 +241,7 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
     buildroot = tmp_path / "buildroot"
     builds_dir = tmp_path / "builds"
     output_dir = tmp_path / "output"
-    build_path = stage_apb_package(tmp_path / "apb-package")
+    build_path = stage_test_package(tmp_path / "test-package")
     auth_path = home / ".apb" / "auth.json"
 
     server_port = find_free_port()

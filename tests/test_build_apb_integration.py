@@ -1,4 +1,4 @@
-"""Integration test: build the apb package through farm, server, and client."""
+"""Integration test: build the test package through farm, server, and client."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from apb.client.cli import monitor_build, submit_build_to_farm
 from apb.pkgbuild import parse_pkgbuild_file
 
 
-def _find_package_artifact(output_dir: Path, pkgver: str, pkgrel: str) -> Path:
-    pattern = f"apb-{pkgver}-{pkgrel}-any.pkg.tar"
+def _find_package_artifact(output_dir: Path, pkgname: str, pkgver: str, pkgrel: str) -> Path:
+    pattern = f"{pkgname}-{pkgver}-{pkgrel}-any.pkg.tar"
     matches = [
         path
         for path in output_dir.rglob("*.pkg.tar*")
@@ -24,12 +24,10 @@ def _find_package_artifact(output_dir: Path, pkgver: str, pkgrel: str) -> Path:
     return matches[0]
 
 
-def _assert_apb_package_contents(package_path: Path) -> None:
+def _assert_test_package_contents(package_path: Path) -> None:
     expected_paths = (
-        "usr/bin/apb",
-        "usr/bin/apb-server",
-        "usr/bin/apb-farm",
-        "etc/apb/apb.json.example",
+        "usr/bin/apb-test",
+        "usr/share/man/man1/apb-test.1",
     )
     with tarfile.open(package_path, "r:*") as archive:
         members = archive.getnames()
@@ -41,9 +39,9 @@ def _assert_apb_package_contents(package_path: Path) -> None:
 
 
 @pytest.mark.integration
-def test_build_apb_package_via_farm(apb_integration) -> None:
+def test_build_test_package_via_farm(apb_integration) -> None:
     pkgbuild_info = parse_pkgbuild_file(apb_integration.build_path / "PKGBUILD")
-    assert pkgbuild_info.pkgname == "apb"
+    assert pkgbuild_info.pkgname == "apb-test-package"
 
     response = submit_build_to_farm(
         apb_integration.farm_url,
@@ -71,11 +69,12 @@ def test_build_apb_package_via_farm(apb_integration) -> None:
 
     package_path = _find_package_artifact(
         arch_output_dir,
+        pkgbuild_info.pkgname,
         pkgbuild_info.pkgver,
         pkgbuild_info.pkgrel,
     )
     assert package_path.stat().st_size > 0
-    _assert_apb_package_contents(package_path)
+    _assert_test_package_contents(package_path)
 
     log_files = list(arch_output_dir.rglob("build.log"))
     assert log_files, "Expected build.log in output directory"
