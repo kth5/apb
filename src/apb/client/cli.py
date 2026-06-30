@@ -41,7 +41,7 @@ def submit_build(server_url: str, build_path: Path, auth_client: Optional[APBAut
     try:
         client = APBotClient(server_url, auth_client)
         return client.build_package(build_path)
-    except requests.RequestException:
+    except httpx.HTTPError:
         return None
 
 
@@ -264,7 +264,7 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                                     else:
                                         print(f"[{arch}] No files available for download")
 
-                            except requests.RequestException as e:
+                            except httpx.HTTPError as e:
                                 if "503" in str(e) or "502" in str(e):
                                     print(f"[{arch}] Server unavailable - cannot download build artifacts: {e}")
                                     print(f"[{arch}] You may need to download files manually when server recovers")
@@ -281,7 +281,7 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                     # Wait before next status check
                     stop_event.wait(5)
 
-                except requests.RequestException as e:
+                except httpx.HTTPError as e:
                     if "503" in str(e) or "502" in str(e):
                         # Server unavailable - these are expected during outages
                         server_unavailable_count += 1
@@ -470,7 +470,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                 print(f"{arch_prefix}Package: {pkgname}")
                 print(f"{arch_prefix}Initial status: {initial_status['status']}")
             break
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             if "503" in str(e) or "502" in str(e):
                 # Server unavailable - these are expected during outages
                 server_unavailable_count += 1
@@ -552,7 +552,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
 
         # Re-raise the KeyboardInterrupt to allow calling code to handle it
         raise
-    except requests.RequestException as e:
+    except httpx.HTTPError as e:
         if "503" in str(e) or "502" in str(e):
             print(f"{arch_prefix}Server became unavailable during monitoring: {e}")
             # Try to get final status
@@ -565,7 +565,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                 else:
                     last_status = final_status['status']
                     print(f"{arch_prefix}Final status: {last_status}")
-            except requests.RequestException:
+            except httpx.HTTPError:
                 print(f"{arch_prefix}Unable to get final status due to server unavailability")
                 return False
         else:
@@ -575,7 +575,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
                 final_status = client.get_build_status(build_id)
                 last_status = final_status['status']
                 print(f"{arch_prefix}Final status: {last_status}")
-            except requests.RequestException:
+            except httpx.HTTPError:
                 print(f"{arch_prefix}Unable to get final status")
                 return False
 
@@ -614,7 +614,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
             else:
                 print(f"{arch_prefix}No files available for download")
 
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             if "503" in str(e) or "502" in str(e):
                 print(f"{arch_prefix}Server unavailable - cannot download build artifacts: {e}")
                 print(f"{arch_prefix}You may need to download files manually when server recovers")
@@ -1037,7 +1037,7 @@ def main():
                 sys.exit(1)
 
             sys.exit(0)
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             print(f"Error: {e}")
             sys.exit(1)
 
@@ -1050,7 +1050,7 @@ def main():
             if 'duration' in status:
                 print(f"Duration: {status['duration']:.1f}s")
             sys.exit(0)
-        except requests.RequestException as e:
+        except httpx.HTTPError as e:
             print(f"Error: {e}")
             sys.exit(1)
 

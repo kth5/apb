@@ -80,10 +80,10 @@ class APBAuthClient:
     def login(self, username: str, password: str) -> bool:
         """Login with username and password"""
         try:
-            response = requests.post(
+            response = httpx.post(
                 f"{self.farm_url}/auth/login",
                 json={"username": username, "password": password},
-                timeout=30
+                timeout=30,
             )
 
             if response.status_code == 200:
@@ -111,10 +111,10 @@ class APBAuthClient:
             return True
 
         try:
-            response = requests.post(
+            response = httpx.post(
                 f"{self.farm_url}/auth/logout",
                 headers={"Authorization": f"Bearer {self._token}"},
-                timeout=30
+                timeout=30,
             )
 
             # Clear token regardless of response
@@ -148,10 +148,10 @@ class APBAuthClient:
             return None
 
         try:
-            response = requests.get(
+            response = httpx.get(
                 f"{self.farm_url}/auth/me",
                 headers=self.get_auth_headers(),
-                timeout=30
+                timeout=30,
             )
 
             if response.status_code == 200:

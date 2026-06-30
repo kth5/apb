@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - Farm lifespan no longer reloads default config over a `--config` file passed on the CLI, which left integration tests with no reachable build servers
+- Queued farm builds no longer return 404 from `/build/{build_id}/status` before a build server is assigned
+- Client code no longer references undefined `requests` exceptions after the httpx migration
 - Farm `/farm` endpoint no longer crashes with `NameError` for bare `get_server_info`, `find_build_server`, and `build_queue` references in routes
 - Integration test farm config now uses the host's detected architecture instead of hardcoding `x86_64`
 - Integration tests now start the build server before the farm, wait for buildroot creation, and wait until the farm discovers an online server before submitting builds

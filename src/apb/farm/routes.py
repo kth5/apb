@@ -1612,6 +1612,38 @@ async def get_build_status(build_id: str, format: str = Query("html")):
     # Format package name with version for display
     display_name = core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
 
+    # Builds waiting in the farm queue have no server assignment yet
+    if not server_url and status == core.BuildStatus.QUEUED:
+        queued_status = {
+            "build_id": build_id,
+            "pkgname": pkgname,
+            "status": status,
+            "server_arch": server_arch,
+            "created_at": created_at,
+            "packages": [],
+            "logs": [],
+        }
+        if format == "json":
+            return queued_status
+        return HTMLResponse(f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Build Queued - {display_name}</title>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <meta http-equiv="refresh" content="10">
+            </head>
+            <body>
+                <h1>Build Queued: {display_name}</h1>
+                <p><strong>Build ID:</strong> {build_id}</p>
+                <p><strong>Architecture:</strong> {server_arch or 'pending assignment'}</p>
+                <p>Waiting for an available build server.</p>
+                <p><a href="/build/{build_id}/status">Refresh Status</a></p>
+            </body>
+            </html>
+            """)
+
     # If we don't have a server_url, the build failed during submission
     if not server_url:
         error_detail = {

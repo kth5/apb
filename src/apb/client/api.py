@@ -52,8 +52,8 @@ class APBotClient:
             Build UUID provided by APB Farm
 
         Raises:
-            requests.HTTPError: On HTTP errors
-            requests.RequestException: On connection errors
+            httpx.HTTPStatusError: On HTTP error responses
+            httpx.HTTPError: On connection errors
             ValueError: On invalid response or missing PKGBUILD
         """
         # Ensure we have a PKGBUILD
@@ -117,7 +117,7 @@ class APBotClient:
             response = self.session.post(url)
             response.raise_for_status()
             return True
-        except requests.RequestException:
+        except httpx.HTTPError:
             return False
 
     def download_file(self, build_id: str, filename: str, output_dir: Path) -> bool:
@@ -146,7 +146,7 @@ class APBotClient:
                     f.write(chunk)
 
             return True
-        except requests.RequestException:
+        except httpx.HTTPError:
             return False
 
     def download_latest_build_files(self, pkgname: str, output_dir: Path,
@@ -185,7 +185,7 @@ class APBotClient:
                         return False
 
             return True
-        except requests.RequestException:
+        except httpx.HTTPError:
             return False
 
     def get_build_by_id(self, build_id: str) -> Dict:
@@ -274,7 +274,7 @@ class APBotClient:
             for line in response.iter_lines():
                 if line:
                     yield line + '\n'
-        except requests.RequestException:
+        except httpx.HTTPError:
             pass
 
     def stream_build_updates(self, build_id: str) -> Generator[Dict, None, None]:
@@ -300,7 +300,7 @@ class APBotClient:
                     break
 
                 time.sleep(5)
-            except requests.RequestException as e:
+            except httpx.HTTPError as e:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
                     raise e
@@ -333,7 +333,7 @@ class APBotClient:
             response = self.session.post(url)
             response.raise_for_status()
             return True
-        except requests.RequestException:
+        except httpx.HTTPError:
             return False
 
 
