@@ -39,3 +39,6 @@ packages = ["src/apb"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "integration: end-to-end APB build tests (requires Linux, Arch tools, APB_INTEGRATION=1)",
+]

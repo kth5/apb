@@ -6,10 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Integration test that builds the `apb` Arch package via spawned farm and server processes using the APB client (`APB_INTEGRATION=1` on Linux with Arch build tools)
+
 ### Fixed
 
-- PKGBUILD `pkgname` and `pkgver` (and related scalar fields) now resolve bash-style variable substitutions such as `"tde-${_mod}"` and `"14.1.$_minor"` without invoking bash
-- Pytest could not import `apb` when run outside the project venv; `pythonpath` and explicit src-layout packaging are now configured in `pyproject.toml`
+- Client build tarballs now include source directories (for example `src/`) required by the root `PKGBUILD`
 
 ### Changed
 
