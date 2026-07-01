@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Hatchling wheel build no longer fails on duplicate `apb/web/static` and `apb/web/templates` paths from redundant `force-include` entries
 - Farm now downloads completed build artifacts from the build server with retries and exposes `artifacts_ready` in build status
 - Client downloads wait for `artifacts_ready` instead of hitting the farm before artifact caching finishes
 - Farm download endpoints serve cached artifacts only; a cache miss returns 404 and does not re-fetch from the build server
