@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Farm holds builds in queue until a build server with a free `--max-concurrent` slot and matching architecture is available
+- Farm build status and submission responses expose farm queue position and jobs ahead while waiting for server assignment
+- Client displays farm queue status while waiting and removes queued builds from the farm on interrupt or `--cancel`
+- Unit tests for farm queue scheduling, architecture-aware assignment, and cancellation
 - Integration test that builds the `test/test-package` fixture via spawned farm and server processes using the APB client (`APB_INTEGRATION=1` on Linux with Arch build tools)
 
 ### Fixed

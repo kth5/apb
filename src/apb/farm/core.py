@@ -2123,13 +2123,18 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         ))
         build_database.commit()
 
+        queue_position = len(build_queue)
         queued_builds.append({
             "build_id": build_id,
             "arch": arch,
             "status": BuildStatus.QUEUED,
             "pkgname": pkgname,
             "submission_group": submission_group,
-            "created_at": time.time()
+            "created_at": time.time(),
+            "queue_state": "farm",
+            "queue_position": queue_position,
+            "jobs_ahead": queue_position - 1,
+            "farm_queue_size": queue_position,
         })
 
         logger.info(f"Created build {build_id} for architecture '{arch}' (package: {pkgname})")
@@ -2138,94 +2143,149 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
     return queued_builds
 
 
+def get_farm_queue_position(build_id: str) -> Optional[int]:
+    """Return 1-based position in the farm queue, or None if not queued."""
+    for index, build_info in enumerate(build_queue):
+        if build_info["build_id"] == build_id:
+            return index + 1
+    return None
+
+
+def remove_from_build_queue(build_id: str) -> bool:
+    """Remove a build from the in-memory farm queue."""
+    for index, build_info in enumerate(build_queue):
+        if build_info["build_id"] == build_id:
+            build_queue.pop(index)
+            return True
+    return False
+
+
+def get_farm_queue_status_for_build(build_id: str) -> Dict[str, Any]:
+    """Return farm queue metadata for a build waiting on server capacity."""
+    queue_position = get_farm_queue_position(build_id)
+    if queue_position is None:
+        return {}
+    return {
+        "queue_state": "farm",
+        "queue_position": queue_position,
+        "jobs_ahead": queue_position - 1,
+        "farm_queue_size": len(build_queue),
+    }
+
+
+async def is_build_cancelled(build_id: str) -> bool:
+    """Check whether a build was cancelled before server assignment."""
+    cursor = build_database.cursor()
+    cursor.execute("SELECT status FROM builds WHERE id = ?", (build_id,))
+    result = cursor.fetchone()
+    return bool(result and result[0] == BuildStatus.CANCELLED)
+
+
+async def cancel_farm_queued_build(build_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Cancel a build still waiting in the farm queue.
+
+    Returns a response dict when handled here, or None when the build was
+    already assigned to a server and server-side cancellation should be used.
+    """
+    cursor = build_database.cursor()
+    cursor.execute("SELECT status, server_url FROM builds WHERE id = ?", (build_id,))
+    result = cursor.fetchone()
+    if not result:
+        return None
+
+    status, server_url = result
+    if status == BuildStatus.CANCELLED:
+        return {
+            "success": True,
+            "message": f"Build {build_id} is already cancelled",
+        }
+    if server_url:
+        return None
+
+    remove_from_build_queue(build_id)
+    cursor.execute(
+        "UPDATE builds SET status = ?, end_time = ? WHERE id = ?",
+        (BuildStatus.CANCELLED, time.time(), build_id),
+    )
+    build_database.commit()
+    logger.info(f"Build {build_id} removed from farm queue by cancellation request")
+    return {
+        "success": True,
+        "message": f"Build {build_id} removed from farm queue",
+    }
+
+
+async def _mark_build_failed(build_id: str, reason: str) -> None:
+    logger.error(f"{reason}, marking build {build_id} as failed")
+    cursor = build_database.cursor()
+    cursor.execute(
+        "UPDATE builds SET status = ?, end_time = ? WHERE id = ?",
+        (BuildStatus.FAILED, time.time(), build_id),
+    )
+    build_database.commit()
+
+
+async def _requeue_build_after_submission_error(build_info: Dict[str, Any], max_retries: int = 3) -> None:
+    build_id = build_info["build_id"]
+    retry_count = build_info.get("retry_count", 0) + 1
+    if retry_count <= max_retries:
+        build_info["retry_count"] = retry_count
+        delay = min(30 * (2 ** (retry_count - 1)), 300)
+        logger.warning(
+            f"Build {build_id} submission failed (retry {retry_count}/{max_retries}), "
+            f"requeueing with {delay}s delay"
+        )
+        await asyncio.sleep(delay)
+        build_queue.append(build_info)
+        return
+
+    logger.error(f"Build {build_id} failed after {max_retries} retry attempts")
+    await _mark_build_failed(build_id, f"Build {build_id} submission failed after retries")
+
+
 async def process_build_queue():
     """Background task to process build queue"""
     while not shutdown_event.is_set():
         try:
-            if build_queue:
-                build_info = build_queue.pop(0)
+            assigned_any = False
+            index = 0
+            while index < len(build_queue):
+                build_info = build_queue[index]
                 build_id = build_info["build_id"]
-                target_arch = build_info["target_architectures"][0]  # Now each build has exactly one architecture
-                retry_count = build_info.get("retry_count", 0)
-                max_retries = 3
+                target_arch = build_info["target_architectures"][0]
 
-                # Get actual available architectures from servers
-                available_archs = await get_available_architectures()
-
-                # Check if we have servers for this architecture
-                if target_arch not in available_archs or not available_archs[target_arch]:
-                    logger.error(f"No available servers for architecture {target_arch}, build {build_id} failed")
-                    # Mark build as failed
-                    cursor = build_database.cursor()
-                    cursor.execute('''
-                        UPDATE builds SET status = ?, end_time = ?
-                        WHERE id = ?
-                    ''', (BuildStatus.FAILED, time.time(), build_id))
-                    build_database.commit()
+                if await is_build_cancelled(build_id):
+                    build_queue.pop(index)
                     continue
 
-                # Find the best server for this architecture
+                available_archs = await get_available_architectures()
+                if target_arch not in available_archs or not available_archs[target_arch]:
+                    await _mark_build_failed(
+                        build_id,
+                        f"No available servers for architecture {target_arch}, build {build_id}",
+                    )
+                    build_queue.pop(index)
+                    continue
+
                 server_url = await get_best_server_for_arch([target_arch])
+                if not server_url:
+                    index += 1
+                    continue
 
-                if server_url:
-                    # Forward build to server
-                    result = await forward_build_to_server(build_info, server_url)
+                build_queue.pop(index)
+                result = await forward_build_to_server(build_info, server_url)
 
-                    if result is True:
-                        # Successfully submitted
-                        logger.info(f"Build {build_id} successfully queued on {server_url}")
+                if result is True:
+                    logger.info(f"Build {build_id} submitted to {server_url}")
+                    assigned_any = True
+                elif result is False:
+                    logger.error(f"Build {build_id} permanently rejected by {server_url}")
+                elif result is None:
+                    await _requeue_build_after_submission_error(build_info)
+                    assigned_any = True
 
-                    elif result is False:
-                        # Server rejected the build - don't retry, mark as failed
-                        logger.error(f"Build {build_id} permanently rejected by {server_url}")
-
-                    elif result is None:
-                        # Temporary error (timeout, network) - retry with exponential backoff
-                        if retry_count < max_retries:
-                            retry_count += 1
-                            build_info["retry_count"] = retry_count
-                            delay = min(30 * (2 ** (retry_count - 1)), 300)  # Cap at 5 minutes
-
-                            logger.warning(f"Build {build_id} submission failed (retry {retry_count}/{max_retries}), "
-                                         f"requeueing with {delay}s delay")
-
-                            # Wait and requeue
-                            await asyncio.sleep(delay)
-                            build_queue.append(build_info)
-                        else:
-                            # Max retries reached - mark as failed
-                            logger.error(f"Build {build_id} failed after {max_retries} retry attempts")
-                            cursor = build_database.cursor()
-                            cursor.execute('''
-                                UPDATE builds SET status = ?, end_time = ?
-                                WHERE id = ?
-                            ''', (BuildStatus.FAILED, time.time(), build_id))
-                            build_database.commit()
-
-                else:
-                    # No suitable server available
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        build_info["retry_count"] = retry_count
-                        delay = min(30 * retry_count, 180)  # Cap at 3 minutes for server availability
-
-                        logger.warning(f"No available server for architecture {target_arch}, "
-                                     f"requeueing build {build_id} (attempt {retry_count}/{max_retries + 1}) "
-                                     f"with {delay}s delay")
-
-                        await asyncio.sleep(delay)
-                        build_queue.append(build_info)
-                    else:
-                        logger.error(f"No servers available for architecture {target_arch} after {max_retries + 1} attempts, "
-                                   f"marking build {build_id} as failed")
-                        cursor = build_database.cursor()
-                        cursor.execute('''
-                            UPDATE builds SET status = ?, end_time = ?
-                            WHERE id = ?
-                        ''', (BuildStatus.FAILED, time.time(), build_id))
-                        build_database.commit()
-
-            await asyncio.sleep(5)
+            await asyncio.sleep(1 if assigned_any else 5)
         except Exception as e:
             logger.error(f"Error in build queue processing: {e}")
             await asyncio.sleep(10)

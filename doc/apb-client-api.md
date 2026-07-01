@@ -610,9 +610,16 @@ def stream_build_updates(self, build_id: str) -> Generator[Dict, None, None]
 ```python
 for update in client.stream_build_updates("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3"):
     print(f"Status: {update['status']}")
+    if update.get("queue_state") == "farm":
+        print(
+            f"Farm queue position {update['queue_position']}/{update['farm_queue_size']} "
+            f"({update['jobs_ahead']} job(s) ahead)"
+        )
     if update['status'] in ['completed', 'failed', 'cancelled']:
         break
 ```
+
+When a build is waiting in the farm queue, status responses include `queue_state`, `queue_position`, `jobs_ahead`, and `farm_queue_size`. The CLI prints these while monitoring and removes farm-queued builds on interrupt or `--cancel`.
 
 #### get_latest_successful_build_id()
 

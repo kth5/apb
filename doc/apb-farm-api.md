@@ -404,7 +404,10 @@ Submit a build request to the farm (Authentication Required).
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0,
-      "user_id": 2
+      "queue_state": "farm",
+      "queue_position": 1,
+      "jobs_ahead": 0,
+      "farm_queue_size": 2
     },
     {
       "build_id": "7f2a8e9b-1234-5678-9abc-def012345678",
@@ -413,12 +416,18 @@ Submit a build request to the farm (Authentication Required).
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0,
-      "user_id": 2
+      "queue_state": "farm",
+      "queue_position": 2,
+      "jobs_ahead": 1,
+      "farm_queue_size": 2
     }
   ],
   "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
-  "user_id": 2,
-  "created_at": 1642694400.0
+  "queue_status": {
+    "queue_size": 2,
+    "builds_queued": 2,
+    "message": "Build(s) queued on farm; waiting for server capacity (2 job(s) in farm queue)"
+  },
 }
 ```
 
@@ -434,11 +443,12 @@ Submit a build request to the farm (Authentication Required).
 - **Per-Build**: Each build can have a custom timeout
 
 **Enhanced Processing:**
-- **Queue-based**: Builds are queued immediately and processed by background tasks
-- **Background Processing**: Background process redistributes queued builds to available servers
+- **Queue-based**: Builds are queued immediately on the farm and processed by background tasks
+- **Capacity-aware scheduling**: Builds wait in the farm queue until a server with matching architecture has a free `--max-concurrent` slot
+- **Architecture-aware ordering**: When one architecture's servers are full, builds for other architectures can still be assigned
 - **Server Assignment**: Builds assigned to servers based on availability and architecture compatibility
 - **Consistent Tracking**: Farm passes its build ID to the server, ensuring consistent tracking
-- **Retry Logic**: Exponential backoff retry logic for failed submissions
+- **Retry Logic**: Exponential backoff retry logic for transient submission failures (network/timeouts)
 
 **Architecture Filtering:**
 If `architectures` parameter is provided, only those architectures will be built (if they exist in the PKGBUILD and have available servers).
@@ -518,6 +528,30 @@ Returns a comprehensive build status page with:
 
 The `artifacts_ready` field indicates whether the farm has finished caching all packages and logs locally. Clients must wait for `artifacts_ready: true` before downloading artifacts from the farm.
 
+**Farm Queue Response (before server assignment):**
+When a build is waiting in the farm queue for server capacity, status JSON includes:
+```json
+{
+  "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+  "pkgname": "example-package",
+  "status": "queued",
+  "server_arch": "x86_64",
+  "created_at": 1642694300.0,
+  "packages": [],
+  "logs": [],
+  "artifacts_ready": false,
+  "queue_state": "farm",
+  "queue_position": 3,
+  "jobs_ahead": 2,
+  "farm_queue_size": 5
+}
+```
+
+- `queue_state`: `"farm"` while waiting for a server slot; omitted once assigned to a build server
+- `queue_position`: 1-based position in the farm queue
+- `jobs_ahead`: Number of farm-queued builds ahead of this one
+- `farm_queue_size`: Total builds currently waiting on the farm
+
 **Enhanced Error Handling:**
 - **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
 - **Build Not Found**: If build was never submitted through farm, provides detailed error message
@@ -555,7 +589,15 @@ Cancel a build with comprehensive permission checking.
 **Parameters:**
 - `build_id` (string, required): Build ID
 
-**Response:**
+**Response (farm queue):**
+```json
+{
+  "success": true,
+  "message": "Build 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3 removed from farm queue"
+}
+```
+
+**Response (assigned build):**
 ```json
 {
   "success": true,
@@ -566,6 +608,8 @@ Cancel a build with comprehensive permission checking.
   }
 }
 ```
+
+Builds still waiting in the farm queue (not yet assigned to a build server) are removed from the queue and marked cancelled without contacting a server.
 
 **Permission Rules:**
 - **Users**: Can cancel only their own builds
@@ -1429,15 +1473,17 @@ CREATE TABLE smtp_config (
 The farm runs several sophisticated background tasks for maintaining system health:
 
 ### Process Build Queue
-- **Frequency**: Continuous with 5-second intervals when builds are queued
-- **Function**: Processes queued builds and assigns them to available servers
+- **Frequency**: Continuous with 5-second intervals when no server slot is available, 1-second when assigning builds
+- **Function**: Processes queued builds and assigns them to available servers with free capacity
 - **Features**:
-  - **Exponential Backoff**: Retry logic with increasing delays for failed submissions
+  - **Capacity Waiting**: Keeps builds in the farm queue until a matching server has `current_builds < max_concurrent`
+  - **Architecture-aware Scanning**: Skips builds blocked by full servers for their architecture and assigns others
+  - **Exponential Backoff**: Retry logic with increasing delays for transient submission failures
   - **Server Health**: Checks server availability and health before assignment
   - **Load Balancing**: Distributes builds across available servers
   - **Architecture Validation**: Ensures server supports required architecture
   - **Timeout Handling**: Respects custom build timeouts
-  - **Error Recovery**: Handles server failures gracefully
+  - **Cancellation**: Removes cancelled builds from the farm queue without server contact
 
 ### Update Build Status
 - **Frequency**: Every 120 seconds for all active builds

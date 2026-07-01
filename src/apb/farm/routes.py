@@ -561,10 +561,19 @@ async def cancel_build(
     if not core.auth_manager.can_cancel_build(current_user, build_id):
         raise HTTPException(status_code=403, detail="Not authorized to cancel this build")
 
+    farm_cancel_result = await core.cancel_farm_queued_build(build_id)
+    if farm_cancel_result is not None:
+        return farm_cancel_result
+
     server_url = await core.find_build_server(build_id)
 
     if not server_url:
-        raise HTTPException(status_code=404, detail="Build not found")
+        cursor = core.build_database.cursor()
+        cursor.execute("SELECT status FROM builds WHERE id = ?", (build_id,))
+        result = cursor.fetchone()
+        if not result:
+            raise HTTPException(status_code=404, detail="Build not found")
+        raise HTTPException(status_code=404, detail="Build not found on any server")
 
     try:
         response = await core.http_session.post(f"{server_url}/build/{build_id}/cancel", timeout=10)
@@ -1511,7 +1520,11 @@ async def submit_build(
             "submission_group": primary_build["submission_group"],
             "queue_status": {
                 "queue_size": len(core.build_queue),
-                "builds_queued": len(queued_builds)
+                "builds_queued": len(queued_builds),
+                "message": (
+                    f"Build(s) queued on farm; waiting for server capacity "
+                    f"({len(core.build_queue)} job(s) in farm queue)"
+                ),
             },
             "created_at": time.time()
         }
@@ -1625,9 +1638,13 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             "packages": [],
             "logs": [],
             "artifacts_ready": False,
+            **core.get_farm_queue_status_for_build(build_id),
         }
         if format == "json":
             return queued_status
+        jobs_ahead = queued_status.get("jobs_ahead", 0)
+        queue_position = queued_status.get("queue_position", "?")
+        farm_queue_size = queued_status.get("farm_queue_size", "?")
         return HTMLResponse(f"""
             <!DOCTYPE html>
             <html>
@@ -1641,7 +1658,8 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 <h1>Build Queued: {display_name}</h1>
                 <p><strong>Build ID:</strong> {build_id}</p>
                 <p><strong>Architecture:</strong> {server_arch or 'pending assignment'}</p>
-                <p>Waiting for an available build server.</p>
+                <p><strong>Queue position:</strong> {queue_position} of {farm_queue_size} ({jobs_ahead} job(s) ahead)</p>
+                <p>Waiting for an available build server slot.</p>
                 <p><a href="/build/{build_id}/status">Refresh Status</a></p>
             </body>
             </html>

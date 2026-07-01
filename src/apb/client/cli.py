@@ -4,9 +4,12 @@ import argparse
 import json
 import logging
 import os
+import queue
 import sys
 import tempfile
+import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
@@ -25,6 +28,58 @@ from apb.client.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _format_farm_queue_message(status: Dict, *, arch_prefix: str = "") -> Optional[str]:
+    if status.get("status") != "queued" or status.get("queue_state") != "farm":
+        return None
+
+    queue_position = status.get("queue_position")
+    if not queue_position:
+        return None
+
+    jobs_ahead = status.get("jobs_ahead", max(queue_position - 1, 0))
+    farm_queue_size = status.get("farm_queue_size", queue_position)
+    if jobs_ahead == 0:
+        return (
+            f"{arch_prefix}Queued on farm (position {queue_position}/{farm_queue_size}, "
+            f"next when a server slot opens)"
+        )
+    return (
+        f"{arch_prefix}Queued on farm: position {queue_position}/{farm_queue_size}, "
+        f"{jobs_ahead} job(s) ahead"
+    )
+
+
+def _print_submitted_build_queue_info(builds: List[Dict], queue_status: Optional[Dict] = None) -> None:
+    if queue_status and queue_status.get("message"):
+        print(queue_status["message"])
+
+    for build in builds:
+        arch = build.get("arch", "?")
+        build_id = build["build_id"]
+        queue_position = build.get("queue_position")
+        if queue_position is not None:
+            jobs_ahead = build.get("jobs_ahead", max(queue_position - 1, 0))
+            print(
+                f"[{arch}] Build queued at farm position {queue_position} "
+                f"({jobs_ahead} job(s) ahead): {build_id}"
+            )
+        else:
+            print(f"[{arch}] Build ID: {build_id}")
+
+
+def _maybe_print_farm_queue_status(
+    status: Dict,
+    *,
+    arch_prefix: str = "",
+    last_message: Optional[str],
+) -> Optional[str]:
+    message = _format_farm_queue_message(status, arch_prefix=arch_prefix)
+    if message and message != last_message:
+        print(message)
+        return message
+    return last_message
 
 
 def _download_build_artifacts(
@@ -202,8 +257,7 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
 
     # Show summary of submitted builds
     print("\n=== Build Summary ===")
-    for build in builds:
-        print(f"[{build['arch']}] Build ID: {build['build_id']}")
+    _print_submitted_build_queue_info(builds)
     print("====================\n")
 
     # Thread-safe queue for results
@@ -237,6 +291,7 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
 
             # Monitor with enhanced error handling for server unavailability
             last_status = None
+            last_queue_message = None
             consecutive_errors = 0
             max_consecutive_errors = 5
             server_unavailable_count = 0
@@ -279,6 +334,12 @@ def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Pat
                         print(f"[{arch}] Status: {status['status']}")
                         last_status = status['status']
                         arch_build_info[arch]['status'] = status['status']
+
+                    last_queue_message = _maybe_print_farm_queue_status(
+                        status,
+                        arch_prefix=f"[{arch}] ",
+                        last_message=last_queue_message,
+                    )
 
                     if status['status'] in ['completed', 'failed', 'cancelled']:
                         # Download results if output_dir provided
@@ -448,6 +509,7 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
     retry_delay = 1.0
     server_unavailable_count = 0
     max_server_unavailable = 5  # Maximum consecutive server unavailable responses
+    last_queue_message = None
 
     for attempt in range(max_retries):
         try:
@@ -488,6 +550,12 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
             if verbose:
                 print(f"{arch_prefix}Package: {pkgname}")
                 print(f"{arch_prefix}Initial status: {initial_status['status']}")
+
+            last_queue_message = _maybe_print_farm_queue_status(
+                initial_status,
+                arch_prefix=arch_prefix,
+                last_message=None,
+            )
             break
         except httpx.HTTPError as e:
             if "503" in str(e) or "502" in str(e):
@@ -555,6 +623,12 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
 
                 if status_callback:
                     status_callback(update)
+
+            last_queue_message = _maybe_print_farm_queue_status(
+                update,
+                arch_prefix=arch_prefix,
+                last_message=last_queue_message,
+            )
 
             if update['status'] in ['completed', 'failed', 'cancelled']:
                 break
@@ -1142,6 +1216,10 @@ def main():
 
                         if builds:
                             print(f"Monitoring {len(builds)} build(s): {response['message']}")
+                            _print_submitted_build_queue_info(
+                                builds,
+                                response.get("queue_status"),
+                            )
                         else:
                             print("No builds to monitor (all packages already exist)")
                             sys.exit(0)
