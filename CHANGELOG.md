@@ -23,7 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- Integration test fixture PKGBUILD uses local `source` files and `$srcdir` paths so `makechrootpkg` finds files inside the chroot
+- Integration test fixture PKGBUILD uses `$srcdir` for the script source and generates the man page inline so only `test-script.sh` must be present in the build tarball
 - Integration test failures now include `build.log`, `server.log`, and `farm.log` excerpts in the assertion message
 - defnull multipart compatibility now adapts `parse_options_header()` to Starlette's bytes-based Content-Type checks so uploaded files are parsed
 - defnull multipart streaming parser now skips empty ASGI body chunks instead of treating them as end-of-stream
