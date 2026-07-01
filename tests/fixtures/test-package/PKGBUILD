@@ -8,21 +8,8 @@ url="https://example.com"
 license=('MIT')
 depends=()
 makedepends=()
-source=("test-script.sh")
-sha256sums=('SKIP')
 
 package() {
-    install -Dm755 "$srcdir/test-script.sh" "$pkgdir/usr/bin/apb-test"
-
-    install -Dm644 /dev/stdin "$pkgdir/usr/share/man/man1/apb-test.1" <<EOF
-.TH APB-TEST 1 "$(date +%Y-%m-%d)" "apb-test-package $pkgver" "User Commands"
-.SH NAME
-apb-test \- A simple test command for APB
-.SH SYNOPSIS
-.B apb-test
-.SH DESCRIPTION
-This is a simple test command created for APB testing purposes.
-.SH AUTHOR
-Test User <test@example.com>
-EOF
+    install -Dm755 "$srctdir/test-script.sh" "$pkgdir/usr/bin/apb-test"
+    install -Dm644 "$srcdir/apb-test.1" "$pkgdir/usr/share/man/man1/apb-test.1"
 }
