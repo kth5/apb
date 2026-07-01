@@ -138,6 +138,30 @@ def _load_defnull_multipart():
     return defnull_multipart
 
 
+def _starlette_parse_options_header(
+    header: str | bytes | None,
+    options: dict | None = None,
+    unquote=None,
+) -> tuple[bytes, dict[bytes, bytes]]:
+    """Adapt defnull header parsing to the bytes API Starlette expects."""
+    defnull_multipart = _load_defnull_multipart()
+    if header is None:
+        return b"", {}
+    if isinstance(header, bytes):
+        header = header.decode("latin-1")
+
+    primary, params = defnull_multipart.parse_options_header(header, options, unquote)
+    primary_bytes = primary.encode("latin-1") if isinstance(primary, str) else primary
+    byte_params: dict[bytes, bytes] = {}
+    for key, value in params.items():
+        key_bytes = key.encode("latin-1") if isinstance(key, str) else key
+        if isinstance(value, str):
+            byte_params[key_bytes] = value.encode("latin-1")
+        else:
+            byte_params[key_bytes] = value
+    return primary_bytes, byte_params
+
+
 def _patch_starlette_formparsers() -> None:
     defnull_multipart = _load_defnull_multipart()
     import starlette.formparsers as formparsers
@@ -304,12 +328,12 @@ def _patch_starlette_formparsers() -> None:
             return FormData(items)
 
     formparsers.multipart = defnull_multipart
-    formparsers.parse_options_header = defnull_multipart.parse_options_header
+    formparsers.parse_options_header = _starlette_parse_options_header
     formparsers.FormParser = FormParser
     formparsers.MultiPartParser = MultiPartParser
 
     import starlette.requests as requests_module
 
-    requests_module.parse_options_header = defnull_multipart.parse_options_header
+    requests_module.parse_options_header = _starlette_parse_options_header
     requests_module.FormParser = FormParser
     requests_module.MultiPartParser = MultiPartParser
