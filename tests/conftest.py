@@ -257,6 +257,8 @@ class ApbIntegrationEnv:
     output_dir: Path
     build_path: Path
     auth_client: APBAuthClient
+    server_log: Path
+    farm_log: Path
 
 
 @pytest.fixture(scope="session")
@@ -356,6 +358,8 @@ def apb_integration(tmp_path: Path, integration_available: None) -> ApbIntegrati
             output_dir=output_dir,
             build_path=build_path,
             auth_client=auth_client,
+            server_log=server_log,
+            farm_log=farm_log,
         )
     finally:
         for proc in (farm_proc, server_proc):

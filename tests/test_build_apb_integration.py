@@ -24,6 +24,32 @@ def _find_package_artifact(output_dir: Path, pkgname: str, pkgver: str, pkgrel: 
     return matches[0]
 
 
+def _read_log_excerpt(log_path: Path, *, max_chars: int = 8000) -> str:
+    if not log_path.is_file():
+        return f"(missing: {log_path})"
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}\n... truncated ({len(text) - max_chars} more chars) ..."
+
+
+def _format_build_failure(
+    build_id: str,
+    *,
+    arch_output_dir: Path,
+    server_log: Path,
+    farm_log: Path,
+) -> str:
+    log_files = list(arch_output_dir.rglob("build.log"))
+    build_log_excerpt = _read_log_excerpt(log_files[0]) if log_files else "(build.log not downloaded)"
+    return (
+        f"Build {build_id} did not complete successfully.\n\n"
+        f"--- build.log ---\n{build_log_excerpt}\n\n"
+        f"--- server.log ---\n{_read_log_excerpt(server_log)}\n\n"
+        f"--- farm.log ---\n{_read_log_excerpt(farm_log)}"
+    )
+
+
 def _assert_test_package_contents(package_path: Path) -> None:
     expected_paths = (
         "usr/bin/apb-test",
@@ -70,7 +96,12 @@ def test_build_test_package_via_farm(apb_integration) -> None:
         arch="any",
         pkgname=pkgbuild_info.pkgname,
     )
-    assert success, f"Build {build_id} did not complete successfully"
+    assert success, _format_build_failure(
+        build_id,
+        arch_output_dir=arch_output_dir,
+        server_log=apb_integration.server_log,
+        farm_log=apb_integration.farm_log,
+    )
 
     package_path = _find_package_artifact(
         arch_output_dir,
