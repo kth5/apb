@@ -8,8 +8,10 @@ url="https://example.com"
 license=('MIT')
 depends=()
 makedepends=()
+source=("test-script.sh" "apb-test.1")
+sha256sums=('SKIP' 'SKIP')
 
 package() {
-    install -Dm755 "$srctdir/test-script.sh" "$pkgdir/usr/bin/apb-test"
+    install -Dm755 "$srcdir/test-script.sh" "$pkgdir/usr/bin/apb-test"
     install -Dm644 "$srcdir/apb-test.1" "$pkgdir/usr/share/man/man1/apb-test.1"
 }
