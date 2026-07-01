@@ -150,7 +150,11 @@ def _starlette_parse_options_header(
     if isinstance(header, bytes):
         header = header.decode("latin-1")
 
-    primary, params = defnull_multipart.parse_options_header(header, options, unquote)
+    primary, params = (
+        defnull_multipart.parse_options_header(header, options)
+        if unquote is None
+        else defnull_multipart.parse_options_header(header, options, unquote)
+    )
     primary_bytes = primary.encode("latin-1") if isinstance(primary, str) else primary
     byte_params: dict[bytes, bytes] = {}
     for key, value in params.items():
@@ -245,11 +249,13 @@ def _patch_starlette_formparsers() -> None:
             chunk_iter = self.stream.__aiter__()
 
             async def read(chunk_size: int) -> bytes:
-                try:
-                    chunk = await chunk_iter.__anext__()
-                except StopAsyncIteration:
-                    return b""
-                return chunk or b""
+                while True:
+                    try:
+                        chunk = await chunk_iter.__anext__()
+                    except StopAsyncIteration:
+                        return b""
+                    if chunk:
+                        return chunk
 
             def finalize_segment() -> None:
                 nonlocal current_segment, current_file, current_data, file_count, field_count

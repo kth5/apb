@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - defnull multipart compatibility now adapts `parse_options_header()` to Starlette's bytes-based Content-Type checks so uploaded files are parsed
+- defnull multipart streaming parser now skips empty ASGI body chunks instead of treating them as end-of-stream
 - Integration test package fixture restored under `tests/fixtures/test-package` after the legacy `test/` tree was removed
 - Compatibility layer so FastAPI/Starlette form uploads work with defnull `multipart>=1.3` shipped by Arch
 - Hatchling wheel build no longer fails on duplicate `apb/web/static` and `apb/web/templates` paths from redundant `force-include` entries
