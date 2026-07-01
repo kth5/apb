@@ -138,7 +138,7 @@ Components look for `apb.json` in the following locations (in order):
 
 ## Authentication System
 
-APB Farm includes a comprehensive authentication and authorization system.
+APB Farm includes a authentication and authorization system.
 
 ### User Roles
 
@@ -189,7 +189,13 @@ python -m pytest -v
 
 Use `python -m pytest` so the active virtualenv's interpreter is used. A system-wide `pytest` command may invoke a different Python and fail to import `apb`.
 
-Integration tests (`pytest -m integration`) spawn farm and server processes and require Linux, Arch build tools, and `APB_INTEGRATION=1`.
+Integration tests spawn farm and server processes and require Linux, Arch build tools, `multipart>=1.3`, and `APB_INTEGRATION=1`:
+
+```bash
+./test/run-integration.sh
+```
+
+On Arch Linux, install the distribution package with `pacman -S python-multipart` (PyPI name `multipart`, not Kludex `python-multipart`).
 
 ## Getting Started
 

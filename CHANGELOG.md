@@ -8,14 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `test/run-integration.sh` prepares a project virtualenv with `multipart>=1.3` and runs integration tests
+- Unit tests for runtime dependency detection for `multipart>=1.3`
 - Farm holds builds in queue until a build server with a free `--max-concurrent` slot and matching architecture is available
 - Farm build status and submission responses expose farm queue position and jobs ahead while waiting for server assignment
 - Client displays farm queue status while waiting and removes queued builds from the farm on interrupt or `--cancel`
 - Unit tests for farm queue scheduling, architecture-aware assignment, and cancellation
 - Integration test that builds the `test/test-package` fixture via spawned farm and server processes using the APB client (`APB_INTEGRATION=1` on Linux with Arch build tools)
 
+### Changed
+
+- Project dependencies now require PyPI `multipart>=1.3` instead of Kludex `python-multipart`
+
 ### Fixed
 
+- Integration test dependency checks now require `multipart>=1.3` instead of Kludex `python-multipart`
 - Hatchling wheel build no longer fails on duplicate `apb/web/static` and `apb/web/templates` paths from redundant `force-include` entries
 - Farm now downloads completed build artifacts from the build server with retries and exposes `artifacts_ready` in build status
 - Client downloads wait for `artifacts_ready` instead of hitting the farm before artifact caching finishes

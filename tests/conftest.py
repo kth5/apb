@@ -133,45 +133,82 @@ def _multipart_module_path(module_name: str) -> str | None:
     return spec.origin
 
 
-def runtime_dependency_skip_reason() -> str | None:
-    """Verify form upload dependencies used by server and farm routes."""
-    try:
-        from python_multipart.multipart import parse_options_header
+MIN_MULTIPART_VERSION = (1, 3)
 
-        assert parse_options_header
-        return None
-    except (ImportError, AssertionError):
+
+def _parse_release_version(raw_version: str) -> tuple[int, ...] | None:
+    parts: list[int] = []
+    for segment in raw_version.split("."):
+        digits = ""
+        for char in segment:
+            if char.isdigit():
+                digits += char
+            elif digits:
+                break
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def _multipart_release_version() -> tuple[int, ...] | None:
+    import importlib.metadata as metadata
+
+    try:
+        return _parse_release_version(metadata.version("multipart"))
+    except metadata.PackageNotFoundError:
         pass
 
     try:
-        from multipart.multipart import parse_options_header
+        import multipart
 
-        assert parse_options_header
-        return None
+        raw_version = getattr(multipart, "__version__", None)
+        if isinstance(raw_version, str):
+            return _parse_release_version(raw_version)
     except ImportError:
         pass
 
+    return None
+
+
+def has_form_upload_support() -> bool:
+    """Return True when multipart>=1.3 is importable in the active interpreter."""
+    version = _multipart_release_version()
+    if version is None or version < MIN_MULTIPART_VERSION:
+        return False
+
+    try:
+        import multipart
+
+        return bool(getattr(multipart, "MultipartParser", None))
+    except ImportError:
+        return False
+
+
+def runtime_dependency_skip_reason() -> str | None:
+    """Verify form upload dependencies used by server and farm routes."""
+    if has_form_upload_support():
+        return None
+
     lines = [
-        "Form upload support is unavailable in the Python running pytest.",
+        "Form upload support requires multipart>=1.3 in the Python running pytest.",
         f"Python: {sys.executable}",
     ]
-    python_multipart_path = _multipart_module_path("python_multipart")
     multipart_path = _multipart_module_path("multipart")
-    if python_multipart_path:
-        lines.append(f"python_multipart: {python_multipart_path}")
-    else:
-        lines.append("python_multipart: not found")
+    version = _multipart_release_version()
     if multipart_path:
         lines.append(f"multipart: {multipart_path}")
-    if multipart_path and not python_multipart_path:
-        lines.append(
-            'The PyPI package "multipart" (not "python-multipart") may be installed, or '
-            "python-multipart is too old (<0.0.13)."
-        )
-    lines.append(
-        f"Fix: {sys.executable} -m pip uninstall -y multipart; "
-        f"{sys.executable} -m pip install --force-reinstall 'python-multipart>=0.0.20'"
-    )
+    else:
+        lines.append("multipart: not found")
+    if version is not None:
+        version_text = ".".join(str(part) for part in version)
+        lines.append(f"multipart version: {version_text}")
+        if version < MIN_MULTIPART_VERSION:
+            lines.append(f"Installed multipart {version_text} is older than 1.3.")
+    lines.append(f"Fix: {sys.executable} -m pip install 'multipart>=1.3'")
+    lines.append("On Arch Linux: pacman -S python-multipart")
     lines.append(f"Run tests with: {sys.executable} -m pytest")
     return "\n".join(lines)
 
