@@ -192,7 +192,7 @@ Use `python -m pytest` so the active virtualenv's interpreter is used. A system-
 Integration tests spawn farm and server processes and require Linux, Arch build tools, `multipart>=1.3`, and `APB_INTEGRATION=1`:
 
 ```bash
-./test/run-integration.sh
+./tests/run-integration.sh
 ```
 
 On Arch Linux, install the distribution package with `pacman -S python-multipart` (PyPI name `multipart`, not Kludex `python-multipart`).

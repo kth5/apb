@@ -8,13 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- `test/run-integration.sh` prepares a project virtualenv with `multipart>=1.3` and runs integration tests
+- Integration test fixture package at `tests/fixtures/test-package`
+- `tests/run-integration.sh` prepares a project virtualenv with `multipart>=1.3` and runs integration tests
 - Unit tests for runtime dependency detection for `multipart>=1.3`
 - Farm holds builds in queue until a build server with a free `--max-concurrent` slot and matching architecture is available
 - Farm build status and submission responses expose farm queue position and jobs ahead while waiting for server assignment
 - Client displays farm queue status while waiting and removes queued builds from the farm on interrupt or `--cancel`
 - Unit tests for farm queue scheduling, architecture-aware assignment, and cancellation
-- Integration test that builds the `test/test-package` fixture via spawned farm and server processes using the APB client (`APB_INTEGRATION=1` on Linux with Arch build tools)
+- Integration test that builds the `tests/fixtures/test-package` fixture via spawned farm and server processes using the APB client (`APB_INTEGRATION=1` on Linux with Arch build tools)
 
 ### Changed
 
@@ -22,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Integration test package fixture restored under `tests/fixtures/test-package` after the legacy `test/` tree was removed
 - Integration test dependency checks now require `multipart>=1.3` instead of Kludex `python-multipart`
 - Hatchling wheel build no longer fails on duplicate `apb/web/static` and `apb/web/templates` paths from redundant `force-include` entries
 - Farm now downloads completed build artifacts from the build server with retries and exposes `artifacts_ready` in build status
@@ -33,7 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Queued farm builds no longer return 404 from `/build/{build_id}/status` before a build server is assigned
 - Client artifact downloads and output streaming no longer pass requests-style `stream=True` to httpx
 - Farm `/farm` endpoint no longer crashes with `NameError` for bare `get_server_info`, `find_build_server`, and `build_queue` references in routes
-- Integration test now builds the minimal `test/test-package` fixture instead of the root `apb` PKGBUILD
+- Integration test now builds the minimal `tests/fixtures/test-package` fixture instead of the root `apb` PKGBUILD
 - Test package PKGBUILD uses `arch=('any')` so integration builds work on any build server architecture
 - Integration tests now start the build server before the farm, wait for buildroot creation, and wait until the farm discovers an online server before submitting builds
 - `arch=(any)` packages fall back to any configured build server when load-based server selection cannot reach server status endpoints

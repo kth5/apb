@@ -20,7 +20,7 @@ from apb.client.auth import APBAuthClient
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
-TEST_PACKAGE_DIR = REPO_ROOT / "test" / "test-package"
+TEST_PACKAGE_DIR = REPO_ROOT / "tests" / "fixtures" / "test-package"
 
 
 def find_free_port() -> int:
@@ -225,6 +225,8 @@ def integration_skip_reason() -> str | None:
         return "sudo not found"
     if os.environ.get("APB_INTEGRATION") != "1":
         return "set APB_INTEGRATION=1 to run APB package integration tests"
+    if not TEST_PACKAGE_DIR.is_dir():
+        return f"Integration test package fixture not found at {TEST_PACKAGE_DIR}"
     sudo_check = subprocess.run(["sudo", "-n", "true"], capture_output=True)
     if sudo_check.returncode != 0:
         return "passwordless sudo is required (configure NOPASSWD or run interactively with APB_INTEGRATION=1)"
