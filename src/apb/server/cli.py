@@ -9,7 +9,11 @@ import sys
 import uvicorn
 
 from apb import VERSION
+from apb.multipart_compat import install_multipart_compat
 from apb.server import engine
+
+install_multipart_compat()
+
 from apb.server.app import create_app
 
 logger = logging.getLogger(__name__)

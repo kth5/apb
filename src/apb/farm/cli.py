@@ -9,6 +9,10 @@ import uvicorn
 from apb import VERSION
 from apb.config import load_config
 from apb.farm import core
+from apb.multipart_compat import install_multipart_compat
+
+install_multipart_compat()
+
 from apb.farm.app import create_app
 
 

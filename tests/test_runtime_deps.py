@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import sys
-
 from tests.conftest import (
     _parse_release_version,
     has_form_upload_support,
@@ -17,12 +15,11 @@ def test_parse_release_version() -> None:
     assert _parse_release_version("invalid") is None
 
 
-def test_has_form_upload_support_requires_multipart_1_3(monkeypatch) -> None:
-    monkeypatch.setattr("tests.conftest._multipart_release_version", lambda: (1, 3, 1))
-    monkeypatch.setitem(sys.modules, "multipart", type("multipart", (), {"MultipartParser": object()})())
+def test_has_form_upload_support_delegates_to_runtime_check(monkeypatch) -> None:
+    monkeypatch.setattr("apb.multipart_compat.form_upload_runtime_ready", lambda: True)
     assert has_form_upload_support() is True
 
-    monkeypatch.setattr("tests.conftest._multipart_release_version", lambda: (1, 2, 2))
+    monkeypatch.setattr("apb.multipart_compat.form_upload_runtime_ready", lambda: False)
     assert has_form_upload_support() is False
 
 

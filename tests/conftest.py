@@ -174,17 +174,10 @@ def _multipart_release_version() -> tuple[int, ...] | None:
 
 
 def has_form_upload_support() -> bool:
-    """Return True when multipart>=1.3 is importable in the active interpreter."""
-    version = _multipart_release_version()
-    if version is None or version < MIN_MULTIPART_VERSION:
-        return False
+    """Return True when multipart>=1.3 can satisfy FastAPI form uploads."""
+    from apb.multipart_compat import form_upload_runtime_ready
 
-    try:
-        import multipart
-
-        return bool(getattr(multipart, "MultipartParser", None))
-    except ImportError:
-        return False
+    return form_upload_runtime_ready()
 
 
 def runtime_dependency_skip_reason() -> str | None:
