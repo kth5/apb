@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Build servers write the full `build.log` to disk as output is produced (no longer limited by in-memory truncation)
+- Farm serves the last 100 lines of `build.log` to unauthenticated users; authenticated dashboard and APB client users get the full log
+- Unit tests for full on-disk `build.log` writes and guest vs authenticated farm log downloads
 - Integration test fixture package at `tests/fixtures/test-package`
 - `tests/run-integration.sh` prepares a project virtualenv with `multipart>=1.3` and runs integration tests
 - Unit tests for runtime dependency detection for `multipart>=1.3`
@@ -19,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- In-memory build output truncation (10,000 lines) no longer affects the on-disk `build.log`; live `/output` and SSE remain memory-limited
 - `nginx-apb-farm.conf` now allowlists all current farm endpoints (email notifications, cache, repositories) with matching method restrictions
 - Project dependencies now require PyPI `multipart>=1.3` instead of Kludex `python-multipart`
 

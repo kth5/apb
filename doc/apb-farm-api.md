@@ -23,6 +23,8 @@ The APB Farm implements a comprehensive token-based authentication system with r
 #### Guest (Unauthenticated Users)
 - View dashboard and farm status
 - View public build information (with obfuscated server URLs)
+- Download package artifacts
+- Download a truncated `build.log` (last 100 lines only)
 - No build submission capabilities
 
 #### User (Regular Users)
@@ -30,6 +32,7 @@ The APB Farm implements a comprehensive token-based authentication system with r
 - Submit builds to the farm
 - Cancel own builds
 - View own build history via `/my/builds`
+- Download the full `build.log`
 - Access authenticated endpoints
 - Update own email address
 
@@ -675,24 +678,27 @@ Stream build output in real-time by forwarding to the appropriate server.
 ### File Downloads
 
 #### GET /build/{build_id}/download/{filename}
-Download a build artifact by forwarding to the appropriate server.
+Download a build artifact from the farm's local artifact cache.
 
 **Parameters:**
 - `build_id` (string, required): Build UUID
 - `filename` (string, required): The filename to download
 
+**Authentication:**
+- Optional. Bearer token (APB client) or dashboard `authToken` cookie.
+- For `build.log`:
+  - **Unauthenticated**: response body is truncated to the last 100 lines, with a short notice header. Headers include `X-APB-Log-Truncated: true` and `X-APB-Log-Tail-Lines: 100`. `Cache-Control: private, no-store`.
+  - **Authenticated** (farm user or admin): full `build.log` is returned. `Cache-Control: private, no-store`.
+- Other artifact types are unchanged and do not require authentication.
+
 **Response:** Binary file content with appropriate headers.
 
 **Enhanced Error Handling:**
-- **Automatic Retry**: Up to 3 retry attempts on connection errors
-- **Server Discovery**: Attempts to find build on alternative servers if needed
-- **Cache Headers**: Proper caching headers for static content
-- **Range Support**: Passes through range requests for large files
-- **Permission Checking**: Respects build visibility permissions
+- **Cache Headers**: Proper caching headers for static package content; build logs are not publicly cached
+- **Permission Checking**: Full build logs require authentication
 
 **Error Responses:**
-- **404 Not Found**: File not found on any server
-- **503 Service Unavailable**: All servers unavailable
+- **404 Not Found**: File not found in the farm cache
 - **403 Forbidden**: Insufficient permissions to access build
 
 ---

@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from apb import VERSION
+from apb.constants import GUEST_BUILD_LOG_TAIL_LINES
 from apb.farm import core
 
 logger = logging.getLogger(__name__)
@@ -2341,8 +2342,16 @@ async def stream_build_output(build_id: str):
 
 
 @router.get("/build/{build_id}/download/{filename}")
-async def download_file(build_id: str, filename: str):
-    """Download build artifact from local cache"""
+async def download_file(
+    build_id: str,
+    filename: str,
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
+    """Download build artifact from local cache.
+
+    build.log is truncated to the last GUEST_BUILD_LOG_TAIL_LINES for unauthenticated
+    callers; authenticated dashboard and APB client users receive the full log.
+    """
 
     cached_artifact = await core.get_cached_artifact(build_id, filename)
     if cached_artifact:
@@ -2410,11 +2419,32 @@ async def download_file(build_id: str, filename: str):
 
     content_type, disposition = core.determine_content_type_and_disposition(filename)
 
+    # Guests only get a truncated build.log; authenticated users get the full file
+    if filename == "build.log" and current_user is None:
+        body = core.format_guest_build_log_tail(file_path, GUEST_BUILD_LOG_TAIL_LINES).encode("utf-8")
+        headers = {
+            "Cache-Control": "private, no-store",
+            "ETag": f'"{build_id}-{filename}-guest-tail"',
+            "Content-Length": str(len(body)),
+            "X-APB-Log-Truncated": "true",
+            "X-APB-Log-Tail-Lines": str(GUEST_BUILD_LOG_TAIL_LINES),
+        }
+        if disposition == "attachment":
+            headers["Content-Disposition"] = f"attachment; filename={filename}"
+        else:
+            headers["Content-Disposition"] = f"inline; filename={filename}"
+        return Response(content=body, media_type="text/plain; charset=utf-8", headers=headers)
+
     headers = {
-        "Cache-Control": "public, max-age=2592000, immutable",
-        "ETag": f'"{build_id}-{filename}"',
-        "Content-Length": str(file_size)
+        "Content-Length": str(file_size),
     }
+    if filename == "build.log":
+        # Avoid caching full vs truncated variants interchangeably
+        headers["Cache-Control"] = "private, no-store"
+        headers["ETag"] = f'"{build_id}-{filename}-full"'
+    else:
+        headers["Cache-Control"] = "public, max-age=2592000, immutable"
+        headers["ETag"] = f'"{build_id}-{filename}"'
 
     if disposition == "attachment":
         headers["Content-Disposition"] = f"attachment; filename={filename}"

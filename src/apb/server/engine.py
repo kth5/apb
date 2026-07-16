@@ -54,11 +54,67 @@ build_history: Dict[str, Dict] = {}
 build_executor = ThreadPoolExecutor(max_workers=DEFAULT_MAX_CONCURRENT)
 build_outputs: Dict[str, List[str]] = {}
 build_streams: Dict[str, List] = {}
+build_log_handles: Dict[str, Any] = {}  # build_id -> open file handle for build.log
 server_config = {}
 shutdown_event = threading.Event()
 build_counter = 0  # Counter for buildroot recreation
 running_processes: Dict[str, subprocess.Popen] = {}  # Track running build processes
 buildroot_recreation_builds: Dict[str, bool] = {}  # Track builds doing buildroot recreation
+
+
+def open_build_log(build_id: str, build_dir: Path):
+    """Open build.log for writing; truncates any existing file."""
+    close_build_log(build_id)
+    log_path = build_dir / "build.log"
+    handle = open(log_path, "w", encoding="utf-8", buffering=1)
+    build_log_handles[build_id] = handle
+    return log_path
+
+
+def append_build_log(build_id: str, message: str, build_dir: Optional[Path] = None) -> None:
+    """Append a line to the on-disk build.log (full log, independent of memory truncation)."""
+    handle = build_log_handles.get(build_id)
+    if handle is not None:
+        try:
+            handle.write(message + "\n")
+            handle.flush()
+            return
+        except Exception as e:
+            logger.warning(f"Failed writing to build.log handle for {build_id}: {e}")
+
+    if build_dir is not None:
+        try:
+            with open(build_dir / "build.log", "a", encoding="utf-8") as log_file:
+                log_file.write(message + "\n")
+        except Exception as e:
+            logger.warning(f"Failed appending to build.log for {build_id}: {e}")
+
+
+def close_build_log(build_id: str) -> Optional[Path]:
+    """Close the build.log handle if open. Returns the log path when known."""
+    handle = build_log_handles.pop(build_id, None)
+    if handle is None:
+        return None
+    log_path = Path(handle.name)
+    try:
+        handle.close()
+    except Exception as e:
+        logger.warning(f"Failed closing build.log for {build_id}: {e}")
+    return log_path
+
+
+def register_build_log_artifact(build_id: str, build_dir: Path) -> Path:
+    """Attach build.log metadata to the active build record."""
+    close_build_log(build_id)
+    log_file = build_dir / "build.log"
+    if not log_file.exists():
+        log_file.write_text("", encoding="utf-8")
+    active_builds[build_id]["logs"] = [{
+        "filename": "build.log",
+        "size": log_file.stat().st_size,
+        "download_url": f"/build/{build_id}/download/build.log"
+    }]
+    return log_file
 
 # Resource monitoring
 resource_monitor_thread = None
@@ -140,10 +196,10 @@ def cleanup_build_data():
             for build_id, build_info in sorted_builds[:50]:
                 build_history[build_id] = build_info
 
-        # Limit output lines for active builds
+        # Limit in-memory output lines for live /output and SSE (build.log on disk stays complete)
         for build_id in list(build_outputs.keys()):
             if len(build_outputs[build_id]) > MAX_BUILD_OUTPUTS:
-                # Keep only the last 5000 lines
+                # Keep only the last 5000 lines in memory
                 build_outputs[build_id] = build_outputs[build_id][-5000:]
 
         # Force garbage collection
@@ -744,21 +800,13 @@ def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code
         active_builds[build_id]["end_time"] = time.time()
         active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
 
-        # Add failure reason to build outputs
+        error_message = f"ERROR: {reason}"
         if build_id in build_outputs:
-            build_outputs[build_id].append(f"ERROR: {reason}")
-
-        # Create build log file
-        log_file = build_dir / "build.log"
-        with open(log_file, 'w') as f:
-            f.write('\n'.join(build_outputs.get(build_id, [f"ERROR: {reason}"])))
-
-        # Add log to build record
-        active_builds[build_id]["logs"] = [{
-            "filename": "build.log",
-            "size": log_file.stat().st_size,
-            "download_url": f"/build/{build_id}/download/build.log"
-        }]
+            build_outputs[build_id].append(error_message)
+        else:
+            build_outputs[build_id] = [error_message]
+        append_build_log(build_id, error_message, build_dir)
+        register_build_log_artifact(build_id, build_dir)
 
         # Send completion event to streams
         for stream_queue in build_streams.get(build_id, []):
@@ -779,6 +827,7 @@ def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code
 
     except Exception as e:
         logger.error(f"Error finalizing failed build {build_id}: {e}")
+        close_build_log(build_id)
 
 
 def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any], build_timeout: int = BUILD_TIMEOUT, extra_repos: List[Dict] = None):
@@ -792,11 +841,13 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         active_builds[build_id]["status"] = BuildStatus.BUILDING
         active_builds[build_id]["start_time"] = time.time()
 
-        # Add to build outputs
+        # Add to build outputs and open full on-disk log
         build_outputs[build_id] = []
+        open_build_log(build_id, build_dir)
 
         def log_output(message: str):
             build_outputs[build_id].append(message)
+            append_build_log(build_id, message, build_dir)
             # Send to streams asynchronously
             for stream_queue in build_streams.get(build_id, []):
                 try:
@@ -1042,16 +1093,8 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         active_builds[build_id]["end_time"] = time.time()
         active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
 
-        # Add logs
-        log_file = build_dir / "build.log"
-        with open(log_file, 'w') as f:
-            f.write('\n'.join(build_outputs[build_id]))
-
-        active_builds[build_id]["logs"] = [{
-            "filename": "build.log",
-            "size": log_file.stat().st_size,
-            "download_url": f"/build/{build_id}/download/build.log"
-        }]
+        log_output(f"Build {build_id} finished")
+        register_build_log_artifact(build_id, build_dir)
 
         # Send completion event to streams
         for stream_queue in build_streams.get(build_id, []):
@@ -1068,8 +1111,6 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
 
-        log_output(f"Build {build_id} finished")
-
     except Exception as e:
         logger.error(f"Build error: {e}")
         # Release SRCDEST lock if it was acquired
@@ -1080,11 +1121,19 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]
         active_builds[build_id]["exit_code"] = 1
 
+        error_message = f"Build failed: {str(e)}"
         if build_id in build_outputs:
-            build_outputs[build_id].append(f"Build failed: {str(e)}")
+            build_outputs[build_id].append(error_message)
+        else:
+            build_outputs[build_id] = [error_message]
+        append_build_log(build_id, error_message, build_dir)
+        register_build_log_artifact(build_id, build_dir)
 
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
+
+    finally:
+        close_build_log(build_id)
 
 
 def process_build_queue():

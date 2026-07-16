@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 from apb import VERSION
 from apb.config import load_config
-from apb.constants import ADMIN_ROLE, TOKEN_EXPIRY_DAYS, USER_ROLE, BuildStatus
+from apb.constants import ADMIN_ROLE, GUEST_BUILD_LOG_TAIL_LINES, TOKEN_EXPIRY_DAYS, USER_ROLE, BuildStatus
 from apb.pkgbuild import parse_pkgbuild
 
 logger = logging.getLogger(__name__)
@@ -1626,6 +1626,42 @@ def determine_content_type_and_disposition(filename: str) -> Tuple[str, str]:
         disposition = "attachment"
 
     return content_type, disposition
+
+
+def read_text_file_tail(file_path: Path, max_lines: int = GUEST_BUILD_LOG_TAIL_LINES) -> str:
+    """Return the last max_lines of a text file without loading the whole file into memory."""
+    if max_lines <= 0:
+        return ""
+
+    file_size = file_path.stat().st_size
+    if file_size == 0:
+        return ""
+
+    chunk_size = 8192
+    data = b""
+    position = file_size
+
+    with open(file_path, "rb") as log_file:
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            log_file.seek(position)
+            data = log_file.read(read_size) + data
+            if data.count(b"\n") >= max_lines:
+                break
+
+    selected = data.decode("utf-8", errors="replace").splitlines()[-max_lines:]
+    return "\n".join(selected) + ("\n" if selected else "")
+
+
+def format_guest_build_log_tail(file_path: Path, max_lines: int = GUEST_BUILD_LOG_TAIL_LINES) -> str:
+    """Build a guest-facing truncated build.log with a short notice header."""
+    tail = read_text_file_tail(file_path, max_lines)
+    notice = (
+        f"# APB: showing last {max_lines} lines. "
+        f"Log in to the farm or use the APB client to download the full build.log.\n\n"
+    )
+    return notice + tail
 
 
 def format_package_name_with_version(pkgname: str, epoch: str = None, pkgver: str = None, pkgrel: str = None) -> str:
