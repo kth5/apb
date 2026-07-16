@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `nginx-apb-farm.conf` now allowlists all current farm endpoints (email notifications, cache, repositories) with matching method restrictions
 - Project dependencies now require PyPI `multipart>=1.3` instead of Kludex `python-multipart`
 
 ### Fixed
