@@ -1,6 +1,7 @@
 """APB client CLI and orchestration functions."""
 
 import argparse
+import getpass
 import json
 import logging
 import os
