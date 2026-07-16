@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -28,6 +29,11 @@ from apb.client.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+_BUILD_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 def _format_farm_queue_message(status: Dict, *, arch_prefix: str = "") -> Optional[str]:
@@ -129,6 +135,89 @@ def _download_build_artifacts(
 
     print(f"{arch_prefix}No files available for download")
     return False
+
+
+def _is_build_id(value: str) -> bool:
+    return bool(_BUILD_ID_RE.match(value.strip()))
+
+
+def _resolve_pkgbuild_dir(path: Optional[Path]) -> Path:
+    """Resolve a PKGBUILD file or package directory to its containing directory."""
+    if path is None:
+        path = Path(".")
+    path = path.resolve()
+    if path.is_file() and path.name == "PKGBUILD":
+        return path.parent
+    if path.is_dir() and (path / "PKGBUILD").exists():
+        return path
+    raise ValueError(f"PKGBUILD not found at {path}")
+
+
+def download_latest_from_pkgbuild(
+    client: APBotClient,
+    pkgbuild_dir: Path,
+    output_dir: Path,
+    arch_filter: Optional[List[str]] = None,
+) -> bool:
+    """
+    Download the latest successful farm build for each PKGBUILD architecture.
+
+    Uses the pkgname/pkgbase the farm stores, and downloads into output_dir/<arch>/.
+    For arch=('any'), artifacts go under output_dir/any/.
+    """
+    pkgbuild_path = pkgbuild_dir / "PKGBUILD"
+    pkg_info = parse_pkgbuild_info(pkgbuild_path)
+    pkgname = pkg_info.get("pkgname", "unknown")
+    pkgbuild_archs = pkg_info.get("arch") or []
+
+    if not pkgbuild_archs:
+        print(f"Error: No architectures found in {pkgbuild_path}")
+        return False
+
+    if pkgname == "unknown":
+        print(f"Error: Could not determine pkgname from {pkgbuild_path}")
+        return False
+
+    target_archs = list(pkgbuild_archs)
+    if arch_filter:
+        requested = set(arch_filter)
+        target_archs = [arch for arch in pkgbuild_archs if arch in requested]
+        missing = requested - set(pkgbuild_archs)
+        if missing:
+            print(f"Warning: architectures not in PKGBUILD arch=(): {', '.join(sorted(missing))}")
+        if not target_archs:
+            print("Error: No matching architectures between --arch and PKGBUILD arch=()")
+            return False
+
+    print(f"Package: {pkgname}")
+    print(f"Architectures: {', '.join(target_archs)}")
+
+    results = []
+    for arch in target_archs:
+        arch_prefix = f"[{arch}] "
+        latest = client.get_latest_build_by_pkgname(pkgname, successful_only=True, arch=arch)
+        if not latest:
+            print(f"{arch_prefix}No successful build found on farm")
+            results.append(False)
+            continue
+
+        build_id = latest.get("build_id") or latest.get("id")
+        if not build_id:
+            print(f"{arch_prefix}Latest build response missing build id")
+            results.append(False)
+            continue
+
+        display_name = latest.get("display_name") or pkgname
+        server_arch = latest.get("server_arch") or arch
+        print(f"{arch_prefix}Latest build: {build_id} ({display_name}, server_arch={server_arch})")
+
+        arch_output_dir = output_dir / ("any" if arch == "any" else arch)
+        success = _download_build_artifacts(client, build_id, arch_output_dir, arch_prefix=arch_prefix)
+        results.append(success)
+
+    if not results:
+        return False
+    return all(results)
 
 
 def submit_build(server_url: str, build_path: Path, auth_client: Optional[APBAuthClient] = None) -> Optional[str]:
@@ -948,7 +1037,8 @@ def main():
 
     # Monitoring options
     parser.add_argument("--monitor", type=str, help="Monitor existing build")
-    parser.add_argument("--download", type=str, help="Download build results")
+    parser.add_argument("--download", nargs="?", const="__PKGBUILD__", metavar="BUILD_ID_OR_PATH",
+                       help="Download build results by build ID, or latest builds from PKGBUILD (with --farm)")
     parser.add_argument("--status", type=str, help="Check build status")
     parser.add_argument("--cancel", type=str, help="Cancel running build")
 
@@ -1060,9 +1150,39 @@ def main():
             print("\nBuild monitoring interrupted by user")
             sys.exit(1)
 
-    if args.download:
+    if args.download is not None:
+        download_target = args.download
+        is_pkgbuild_download = (
+            download_target == "__PKGBUILD__"
+            or (download_target and not _is_build_id(download_target))
+        )
+
+        if is_pkgbuild_download:
+            if not args.farm and server_url != config.get("farm_url"):
+                print("Error: PKGBUILD-based download requires --farm (or farm_url as the active server)")
+                sys.exit(1)
+
+            try:
+                if download_target == "__PKGBUILD__":
+                    pkgbuild_dir = _resolve_pkgbuild_dir(args.pkgbuild_path)
+                else:
+                    pkgbuild_dir = _resolve_pkgbuild_dir(Path(download_target))
+            except ValueError as exc:
+                print(f"Error: {exc}")
+                sys.exit(1)
+
+            arch_filter = [a.strip() for a in args.arch.split(",") if a.strip()] if args.arch else None
+            try:
+                success = download_latest_from_pkgbuild(
+                    client, pkgbuild_dir, args.output_dir, arch_filter=arch_filter
+                )
+                sys.exit(0 if success else 1)
+            except httpx.HTTPError as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+
         try:
-            status = client.get_build_status(args.download)
+            status = client.get_build_status(download_target)
 
             # Determine architecture for output directory
             status_arch = status.get('server_arch') or status.get('arch')
@@ -1072,7 +1192,7 @@ def main():
             build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch")
             arch_output_dir = args.output_dir / build_arch
 
-            if not _download_build_artifacts(client, args.download, arch_output_dir):
+            if not _download_build_artifacts(client, download_target, arch_output_dir):
                 sys.exit(1)
 
             sys.exit(0)

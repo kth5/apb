@@ -2459,6 +2459,59 @@ async def download_file(
     )
 
 
+@router.get("/builds/pkgname/{pkgname}")
+async def get_builds_for_package(
+    pkgname: str,
+    limit: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+):
+    """Get recent builds for a specific package name known to the farm."""
+    builds = core.get_builds_for_pkgname(pkgname, limit=limit, status=status)
+    return {"pkgname": pkgname, "builds": builds, "total": len(builds)}
+
+
+@router.get("/builds/pkgname/{pkgname}/latest")
+async def get_latest_build_for_package(
+    pkgname: str,
+    successful_only: bool = Query(True),
+):
+    """Get the latest build for a package across all architectures."""
+    build = core.get_latest_build_for_pkgname(pkgname, successful_only=successful_only)
+    if not build:
+        raise HTTPException(status_code=404, detail=f"No builds found for package '{pkgname}'")
+    return build
+
+
+@router.get("/builds/pkgname/{pkgname}/arch/{arch}/latest")
+async def get_latest_build_for_package_arch(
+    pkgname: str,
+    arch: str,
+    successful_only: bool = Query(True),
+):
+    """Get the latest build for a package on a specific architecture.
+
+    Use arch `any` to match the latest successful build regardless of server_arch
+    (for PKGBUILD `arch=('any')` packages).
+    """
+    build = core.get_latest_build_for_pkgname(pkgname, arch=arch, successful_only=successful_only)
+    if not build:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No builds found for package '{pkgname}' (arch={arch})",
+        )
+    return build
+
+
+@router.get("/builds/pkgname/{pkgname}/latest-by-arch")
+async def get_latest_builds_by_arch_for_package(
+    pkgname: str,
+    successful_only: bool = Query(True),
+):
+    """Get the latest build for each architecture of a package."""
+    builds = core.get_latest_builds_by_arch_for_pkgname(pkgname, successful_only=successful_only)
+    return {"pkgname": pkgname, "builds": builds, "total": len(builds)}
+
+
 @router.get("/builds/latest")
 async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Optional[str] = Query(None)):
     """Get latest builds across all servers"""

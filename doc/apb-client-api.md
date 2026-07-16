@@ -85,6 +85,11 @@ python apb.py --monitor 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 # Download build results
 python apb.py --download 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3 --output-dir ./downloads/
 
+# Download latest successful farm builds for every arch=() from PKGBUILD
+python apb.py --farm --download
+python apb.py --farm --download /path/to/package/
+python apb.py --farm --download --arch x86_64,aarch64 /path/to/package/
+
 # Check build status
 python apb.py --status 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 
@@ -149,7 +154,7 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 ### Monitoring Options
 
 - `--monitor BUILD_ID`: Monitor existing build with real-time output
-- `--download BUILD_ID`: Download build results only
+- `--download [BUILD_ID|PATH]`: Download by build ID, or (with `--farm`) latest successful builds for each `arch=()` from a PKGBUILD path / current directory
 - `--status BUILD_ID`: Check build status
 - `--cancel BUILD_ID`: Cancel running build
 
@@ -553,7 +558,25 @@ def get_builds_by_pkgname(self, pkgname: str, limit: int = 5) -> Dict
 Get the latest build for a specific package.
 
 ```python
-def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True) -> Dict
+def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True,
+                                arch: Optional[str] = None) -> Dict
+```
+
+**Parameters:**
+- `pkgname` (str): Package name
+- `successful_only` (bool): Only consider successful builds
+- `arch` (str, optional): Architecture filter. Use `'any'` for `arch=('any')` packages
+
+**Returns:**
+- `Dict`: Latest build information (empty dict if none found)
+
+#### get_latest_builds_by_pkgname_per_arch()
+
+Get the latest successful build for each architecture of a package.
+
+```python
+def get_latest_builds_by_pkgname_per_arch(self, pkgname: str,
+                                          successful_only: bool = True) -> Dict[str, Dict]
 ```
 
 **Parameters:**
@@ -561,7 +584,7 @@ def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True
 - `successful_only` (bool): Only consider successful builds
 
 **Returns:**
-- `Dict`: Latest build information
+- `Dict[str, Dict]`: Mapping of `server_arch` to build information
 
 #### download_latest_build_files()
 

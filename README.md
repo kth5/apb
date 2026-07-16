@@ -381,8 +381,13 @@ apb --farm --detach /path/to/package/
 # Monitor existing build
 apb --farm --monitor 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 
-# Download build results
+# Download build results by ID
 apb --farm --download 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
+
+# Download latest successful builds for every arch=() from PKGBUILD
+apb --farm --download
+apb --farm --download /path/to/package/
+apb --farm --arch x86_64,aarch64 --download /path/to/package/
 
 # Check build status
 apb --farm --status 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
@@ -428,7 +433,7 @@ apb --farm --cancel 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 | Option | Description |
 |--------|-------------|
 | `--monitor BUILD_ID` | Monitor existing build |
-| `--download BUILD_ID` | Download build results |
+| `--download [BUILD_ID\|PATH]` | Download by build ID, or latest farm builds per PKGBUILD `arch=()` |
 | `--status BUILD_ID` | Check build status |
 | `--cancel BUILD_ID` | Cancel running build |
 

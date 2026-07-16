@@ -244,26 +244,97 @@ class APBotClient:
         response.raise_for_status()
         return response.json()
 
-    def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True) -> Dict:
+    def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True,
+                                    arch: Optional[str] = None) -> Dict:
         """
         Get the latest build for a specific package.
 
         Args:
             pkgname: Package name
             successful_only: Only consider successful builds
+            arch: Optional architecture. Use 'any' for arch=('any') packages
+                  (matches latest build regardless of server_arch).
 
         Returns:
-            Latest build information
+            Latest build information, or empty dict if none found
         """
-        builds = self.get_builds_by_pkgname(pkgname, limit=10)
+        def _normalize_build(build: Dict) -> Dict:
+            if build and 'build_id' not in build and 'id' in build:
+                build['build_id'] = build['id']
+            return build
+
+        if arch:
+            url = urljoin(self.server_url, f'/builds/pkgname/{pkgname}/arch/{arch}/latest')
+        else:
+            url = urljoin(self.server_url, f'/builds/pkgname/{pkgname}/latest')
+
+        try:
+            response = self.session.get(url, params={'successful_only': successful_only})
+            if response.status_code == 200:
+                return _normalize_build(response.json())
+        except httpx.HTTPError:
+            pass
+
+        # Fall back to list endpoint for older servers or empty results
+        try:
+            builds = self.get_builds_by_pkgname(pkgname, limit=50)
+        except httpx.HTTPError:
+            return {}
+
         if not builds.get('builds'):
             return {}
 
         for build in builds['builds']:
-            if not successful_only or build['status'] == 'completed':
-                return build
-
+            if successful_only and build.get('status') != 'completed':
+                continue
+            if arch and arch != 'any' and build.get('server_arch') != arch:
+                continue
+            return _normalize_build(build)
         return {}
+
+    def get_latest_builds_by_pkgname_per_arch(self, pkgname: str,
+                                              successful_only: bool = True) -> Dict[str, Dict]:
+        """
+        Get the latest build for each architecture of a package.
+
+        Returns:
+            Mapping of server_arch -> build info
+        """
+        def _normalize_build(build: Dict) -> Dict:
+            if build and 'build_id' not in build and 'id' in build:
+                build['build_id'] = build['id']
+            return build
+
+        builds: List[Dict] = []
+        url = urljoin(self.server_url, f'/builds/pkgname/{pkgname}/latest-by-arch')
+        try:
+            response = self.session.get(url, params={'successful_only': successful_only})
+            if response.status_code == 200:
+                builds = response.json().get('builds', [])
+        except httpx.HTTPError:
+            builds = []
+
+        if not builds:
+            try:
+                listed = self.get_builds_by_pkgname(pkgname, limit=100).get('builds', [])
+            except httpx.HTTPError:
+                return {}
+            latest: Dict[str, Dict] = {}
+            for build in listed:
+                if successful_only and build.get('status') != 'completed':
+                    continue
+                arch = build.get('server_arch')
+                if arch and arch not in latest:
+                    latest[arch] = build
+            builds = list(latest.values())
+
+        result: Dict[str, Dict] = {}
+        for build in builds:
+            build = _normalize_build(build)
+            arch = build.get('server_arch')
+            if arch:
+                result[arch] = build
+        return result
 
     def get_build_output(self, build_id: str, start_index: int = 0, limit: int = 50) -> Dict:
         """

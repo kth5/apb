@@ -827,6 +827,87 @@ Get the latest builds across all managed servers.
 - **Submission Grouping**: Groups related builds from same submission
 - **Status Filtering**: Filter by build status (queued, building, completed, failed, cancelled)
 
+#### GET /builds/pkgname/{pkgname}
+Get recent builds for a specific package name as stored by the farm (`pkgbase` when present, otherwise `pkgname`).
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `limit` (integer, optional): Maximum builds to return (default: 20, max: 100)
+- `status` (string, optional): Filter by status
+
+**Response:**
+```json
+{
+  "pkgname": "example-package",
+  "builds": [
+    {
+      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "server_url": "ser---1",
+      "server_arch": "x86_64",
+      "pkgname": "example-package",
+      "display_name": "example-package (1.0.0-1)",
+      "status": "completed",
+      "start_time": "2024-01-20T10:00:00 UTC",
+      "end_time": "2024-01-20T10:05:00 UTC",
+      "created_at": "2024-01-20T10:00:00 UTC",
+      "username": "builder"
+    }
+  ],
+  "total": 1
+}
+```
+
+#### GET /builds/pkgname/{pkgname}/latest
+Get the latest build for a package across all architectures.
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `successful_only` (boolean, optional): Only completed builds (default: true)
+
+**Response:** Single build object (same fields as above). Returns 404 when none found.
+
+#### GET /builds/pkgname/{pkgname}/arch/{arch}/latest
+Get the latest build for a package on a specific architecture.
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `arch` (string, required): Target architecture. Use `any` to match the latest completed build regardless of `server_arch` (for `arch=('any')` packages)
+- `successful_only` (boolean, optional): Only completed builds (default: true)
+
+**Response:** Single build object. Returns 404 when none found.
+
+#### GET /builds/pkgname/{pkgname}/latest-by-arch
+Get the latest build for each `server_arch` of a package.
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `successful_only` (boolean, optional): Only completed builds (default: true)
+
+**Response:**
+```json
+{
+  "pkgname": "example-package",
+  "builds": [
+    {
+      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "server_arch": "aarch64",
+      "pkgname": "example-package",
+      "status": "completed"
+    },
+    {
+      "id": "59fb2ef6-g8g4-588f-b8b8-47f637fb8de4",
+      "build_id": "59fb2ef6-g8g4-588f-b8b8-47f637fb8de4",
+      "server_arch": "x86_64",
+      "pkgname": "example-package",
+      "status": "completed"
+    }
+  ],
+  "total": 2
+}
+```
+
 #### GET /my/builds
 Get builds submitted by the current authenticated user.
 

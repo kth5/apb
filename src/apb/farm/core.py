@@ -1677,6 +1677,115 @@ def format_package_name_with_version(pkgname: str, epoch: str = None, pkgver: st
     return f"{pkgname} ({version_str})"
 
 
+def _build_row_to_pkgname_dict(row, *, obfuscate: bool = True) -> Dict:
+    """Convert a builds JOIN users row into a public build summary dict."""
+    build_id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, username, epoch, pkgver, pkgrel = row
+    display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
+    start_time_str = safe_timestamp_to_datetime(start_time)
+    end_time_str = safe_timestamp_to_datetime(end_time)
+    created_at_str = safe_timestamp_to_datetime(created_at)
+
+    display_server = "unknown"
+    if server_url:
+        display_server = obfuscate_server_url(server_url) if obfuscate else server_url
+
+    return {
+        "id": build_id,
+        "build_id": build_id,
+        "server_url": display_server,
+        "server_arch": server_arch,
+        "pkgname": pkgname,
+        "display_name": display_name,
+        "status": status,
+        "start_time": f"{start_time_str} UTC" if start_time_str else None,
+        "end_time": f"{end_time_str} UTC" if end_time_str else None,
+        "created_at": f"{created_at_str} UTC" if created_at_str else "unknown",
+        "username": username if username else "#anon#",
+        "epoch": epoch,
+        "pkgver": pkgver,
+        "pkgrel": pkgrel,
+    }
+
+
+_PKGNAME_BUILD_SELECT = '''
+    SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time,
+           b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
+    FROM builds b
+    LEFT JOIN users u ON b.user_id = u.id
+'''
+
+
+def get_builds_for_pkgname(pkgname: str, limit: int = 20, status: Optional[str] = None) -> List[Dict]:
+    """Return recent builds for a package name, newest first."""
+    cursor = build_database.cursor()
+    if status:
+        cursor.execute(
+            _PKGNAME_BUILD_SELECT + '''
+            WHERE b.pkgname = ? AND b.status = ?
+            ORDER BY b.created_at DESC LIMIT ?
+            ''',
+            (pkgname, status, limit),
+        )
+    else:
+        cursor.execute(
+            _PKGNAME_BUILD_SELECT + '''
+            WHERE b.pkgname = ?
+            ORDER BY b.created_at DESC LIMIT ?
+            ''',
+            (pkgname, limit),
+        )
+    return [_build_row_to_pkgname_dict(row) for row in cursor.fetchall()]
+
+
+def get_latest_build_for_pkgname(
+    pkgname: str,
+    *,
+    arch: Optional[str] = None,
+    successful_only: bool = True,
+) -> Optional[Dict]:
+    """
+    Return the latest build for a package.
+
+    When arch is 'any' or None, match any server_arch. Otherwise require an exact
+    server_arch match (arch=(any) packages are stored under the build server arch).
+    """
+    cursor = build_database.cursor()
+    params: List = [pkgname]
+    where = ["b.pkgname = ?"]
+
+    if successful_only:
+        where.append("b.status = ?")
+        params.append(BuildStatus.COMPLETED)
+
+    if arch and arch != "any":
+        where.append("b.server_arch = ?")
+        params.append(arch)
+
+    cursor.execute(
+        _PKGNAME_BUILD_SELECT + f'''
+        WHERE {' AND '.join(where)}
+        ORDER BY b.created_at DESC LIMIT 1
+        ''',
+        params,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return _build_row_to_pkgname_dict(row)
+
+
+def get_latest_builds_by_arch_for_pkgname(pkgname: str, *, successful_only: bool = True) -> List[Dict]:
+    """Return the latest build per server_arch for a package name."""
+    status = BuildStatus.COMPLETED if successful_only else None
+    builds = get_builds_for_pkgname(pkgname, limit=500, status=status)
+    latest_by_arch: Dict[str, Dict] = {}
+    for build in builds:
+        arch = build.get("server_arch")
+        if arch and arch not in latest_by_arch:
+            latest_by_arch[arch] = build
+    return [latest_by_arch[arch] for arch in sorted(latest_by_arch)]
+
+
 async def get_server_info(server_url: str) -> Optional[Dict]:
     """Get server information with enhanced resilient caching and health tracking"""
     global server_status_tracker
