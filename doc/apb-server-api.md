@@ -118,6 +118,7 @@ The server includes comprehensive resource monitoring capabilities:
 - **Build Process Management**: Tracks running processes with timeout detection
 - **Garbage Collection**: Automatic memory cleanup during resource pressure
 - **Hung Process Detection**: Identifies and terminates processes exceeding timeouts
+- **Output Draining**: Reads build stdout in large non-blocking binary chunks (no per-line sleep) so verbose builds do not stall on a full pipe buffer
 
 ### Build Data Cleanup
 - **Memory Management**: Limits in-memory build outputs to 10,000 lines per build (for live `/output` and SSE); the on-disk `build.log` is always written in full as output is produced

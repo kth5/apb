@@ -32,6 +32,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Build servers drain makechrootpkg stdout in large binary chunks without a per-line sleep, and flush `build.log` periodically, so high-volume builds no longer stall on a full pipe buffer
+- Unit tests for process stdout draining under high output volume
 - Integration test fixture PKGBUILD uses `$srcdir` for the script source and generates the man page inline so only `test-script.sh` must be present in the build tarball
 - Integration test failures now include `build.log`, `server.log`, and `farm.log` excerpts in the assertion message
 - defnull multipart compatibility now adapts `parse_options_header()` to Starlette's bytes-based Content-Type checks so uploaded files are parsed

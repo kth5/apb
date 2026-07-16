@@ -2,6 +2,7 @@
 
 import asyncio
 import configparser
+import errno
 import fcntl
 import gc
 import glob
@@ -61,12 +62,16 @@ build_counter = 0  # Counter for buildroot recreation
 running_processes: Dict[str, subprocess.Popen] = {}  # Track running build processes
 buildroot_recreation_builds: Dict[str, bool] = {}  # Track builds doing buildroot recreation
 
+OUTPUT_READ_CHUNK = 65536
+LOG_FLUSH_INTERVAL_SECONDS = 0.5
+
 
 def open_build_log(build_id: str, build_dir: Path):
     """Open build.log for writing; truncates any existing file."""
     close_build_log(build_id)
     log_path = build_dir / "build.log"
-    handle = open(log_path, "w", encoding="utf-8", buffering=1)
+    # Block-buffered; callers flush periodically so high-volume builds are not I/O-bound
+    handle = open(log_path, "w", encoding="utf-8", buffering=8192)
     build_log_handles[build_id] = handle
     return log_path
 
@@ -77,7 +82,6 @@ def append_build_log(build_id: str, message: str, build_dir: Optional[Path] = No
     if handle is not None:
         try:
             handle.write(message + "\n")
-            handle.flush()
             return
         except Exception as e:
             logger.warning(f"Failed writing to build.log handle for {build_id}: {e}")
@@ -90,6 +94,17 @@ def append_build_log(build_id: str, message: str, build_dir: Optional[Path] = No
             logger.warning(f"Failed appending to build.log for {build_id}: {e}")
 
 
+def flush_build_log(build_id: str) -> None:
+    """Flush the on-disk build.log handle if open."""
+    handle = build_log_handles.get(build_id)
+    if handle is None:
+        return
+    try:
+        handle.flush()
+    except Exception as e:
+        logger.warning(f"Failed flushing build.log for {build_id}: {e}")
+
+
 def close_build_log(build_id: str) -> Optional[Path]:
     """Close the build.log handle if open. Returns the log path when known."""
     handle = build_log_handles.pop(build_id, None)
@@ -97,6 +112,7 @@ def close_build_log(build_id: str) -> Optional[Path]:
         return None
     log_path = Path(handle.name)
     try:
+        handle.flush()
         handle.close()
     except Exception as e:
         logger.warning(f"Failed closing build.log for {build_id}: {e}")
@@ -115,6 +131,58 @@ def register_build_log_artifact(build_id: str, build_dir: Path) -> Path:
         "download_url": f"/build/{build_id}/download/build.log"
     }]
     return log_file
+
+
+def consume_process_output_chunk(chunk: bytes, partial: bytearray, on_line) -> None:
+    """Decode a stdout chunk into complete lines, retaining any trailing partial line."""
+    if not chunk:
+        return
+    partial.extend(chunk)
+    while True:
+        newline_at = partial.find(b"\n")
+        if newline_at < 0:
+            break
+        line = bytes(partial[:newline_at]).decode("utf-8", errors="replace").rstrip("\r")
+        del partial[:newline_at + 1]
+        on_line(line)
+
+
+def flush_partial_process_output(partial: bytearray, on_line) -> None:
+    """Emit any remaining partial line after EOF."""
+    if not partial:
+        return
+    line = bytes(partial).decode("utf-8", errors="replace").rstrip("\r")
+    partial.clear()
+    if line:
+        on_line(line)
+
+
+def set_fd_nonblocking(fd: int) -> None:
+    """Set a file descriptor to non-blocking mode."""
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+
+def drain_process_stdout(stdout_fd: int, partial: bytearray, on_line) -> bool:
+    """
+    Non-blocking drain of all currently available stdout bytes.
+
+    Returns False when EOF is reached, True otherwise.
+    """
+    while True:
+        try:
+            chunk = os.read(stdout_fd, OUTPUT_READ_CHUNK)
+        except BlockingIOError:
+            return True
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return True
+            logger.error(f"Error reading process stdout: {e}")
+            return False
+        if not chunk:
+            flush_partial_process_output(partial, on_line)
+            return False
+        consume_process_output_chunk(chunk, partial, on_line)
 
 # Resource monitoring
 resource_monitor_thread = None
@@ -979,17 +1047,25 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
             log_output(f"Running: {' '.join(cmd)}")
 
-            # Execute build with timeout management
+            # Execute build with timeout management (binary stdout so select/os.read drain the pipe fast)
             process = subprocess.Popen(
                 cmd,
                 cwd=build_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
                 bufsize=0,
                 preexec_fn=os.setsid  # Create new process group for better cleanup
             )
             running_processes[build_id] = process  # Track the process
+            stdout_fd = process.stdout.fileno()
+            set_fd_nonblocking(stdout_fd)
+            partial_output = bytearray()
+            last_flush_time = time.time()
+
+            def emit_output_line(line: str):
+                nonlocal last_output_time
+                log_output(line)
+                last_output_time = time.time()
 
             # Stream output with timeout management
             start_time = time.time()
@@ -1019,36 +1095,37 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                         process.terminate()
                         break
 
-                    # Read output with timeout
                     try:
-                        # Use poll() to check if process is still running
-                        if process.poll() is not None:
-                            # Process finished, read remaining output
-                            remaining_output = process.stdout.read()
-                            if remaining_output:
-                                for line in remaining_output.split('\n'):
-                                    if line.strip():
-                                        log_output(line.rstrip())
+                        process_done = process.poll() is not None
+                        # Wait briefly for data when the process is still running
+                        wait_timeout = 0.0 if process_done else 1.0
+                        if select.select([stdout_fd], [], [], wait_timeout)[0]:
+                            if not drain_process_stdout(stdout_fd, partial_output, emit_output_line):
+                                flush_build_log(build_id)
+                                break
+                        elif process_done:
+                            # Process exited and pipe is idle: final non-blocking drain/EOF check
+                            if not drain_process_stdout(stdout_fd, partial_output, emit_output_line):
+                                flush_build_log(build_id)
+                                break
+                            flush_partial_process_output(partial_output, emit_output_line)
+                            flush_build_log(build_id)
                             break
 
-                        # Read line with timeout simulation using select
-                        if select.select([process.stdout], [], [], 1.0)[0]:
-                            line = process.stdout.readline()
-                            if line:
-                                log_output(line.rstrip())
-                                last_output_time = current_time
+                        if time.time() - last_flush_time >= LOG_FLUSH_INTERVAL_SECONDS:
+                            flush_build_log(build_id)
+                            last_flush_time = time.time()
 
                     except Exception as e:
                         logger.error(f"Error reading process output: {e}")
                         break
 
-                    # Small sleep to prevent busy waiting
-                    time.sleep(0.1)
-
                 except KeyboardInterrupt:
                     log_output("Build interrupted")
                     process.terminate()
                     break
+
+            flush_build_log(build_id)
 
             # Wait for process to finish with timeout
             try:
