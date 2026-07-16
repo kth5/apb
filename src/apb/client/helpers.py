@@ -113,7 +113,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
         return False, f"Missing {len(missing_packages)} packages for any architecture"
     else:
         # Get the actual suffix used in package filenames
-        package_arch_suffix = package_arch_suffix(arch)
+        arch_suffix = package_arch_suffix(arch)
 
         found_packages = []
         missing_packages = []
@@ -121,7 +121,7 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
         # Check each package name in the list
         for pkgname in pkgname_list:
             # Standard Arch Linux package filename format
-            package_filename = f"{pkgname}-{version_string}-{package_arch_suffix}.pkg.tar.zst"
+            package_filename = f"{pkgname}-{version_string}-{arch_suffix}.pkg.tar.zst"
 
             # Check in architecture-specific output directory first
             arch_output_dir = output_dir / arch

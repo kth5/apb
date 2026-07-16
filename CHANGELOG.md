@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Client no longer raises `UnboundLocalError` in `check_package_exists` when the output directory is missing (local variable shadowed the `package_arch_suffix` import)
 - Build servers drain makechrootpkg stdout in large binary chunks without a per-line sleep, and flush `build.log` periodically, so high-volume builds no longer stall on a full pipe buffer
 - Unit tests for process stdout draining under high output volume
 - Integration test fixture PKGBUILD uses `$srcdir` for the script source and generates the man page inline so only `test-script.sh` must be present in the build tarball
