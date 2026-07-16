@@ -27,7 +27,6 @@ htmlcov/
 
 # Type checkers & linters
 .mypy_cache/
-.ruff_cache/
 .pytype/
 
 # Local configuration (use apb.json.example as template)

@@ -26,7 +26,6 @@ apb-server = "apb.server.cli:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
-    "ruff>=0.9.0",
     "fastapi>=0.116.0",
     "uvicorn>=0.35.0",
     "psutil>=7.0.0",
