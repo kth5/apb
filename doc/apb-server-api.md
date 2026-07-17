@@ -118,9 +118,10 @@ The server includes comprehensive resource monitoring capabilities:
 - **Build Process Management**: Tracks running processes with timeout detection
 - **Garbage Collection**: Automatic memory cleanup during resource pressure
 - **Hung Process Detection**: Identifies and terminates processes exceeding timeouts
+- **Output Draining**: Reads build stdout in large non-blocking binary chunks (no per-line sleep) so verbose builds do not stall on a full pipe buffer
 
 ### Build Data Cleanup
-- **Memory Management**: Limits build outputs to 10,000 lines per build
+- **Memory Management**: Limits in-memory build outputs to 10,000 lines per build (for live `/output` and SSE); the on-disk `build.log` is always written in full as output is produced
 - **History Cleanup**: Maintains only 100 most recent builds in memory
 - **Old Build Removal**: Automatically removes builds older than 1 hour from memory
 - **Disk Cleanup**: Removes build directories older than 7 days
@@ -226,7 +227,7 @@ Get comprehensive server information and status.
 ```json
 {
   "status": "running",
-  "version": "2025-07-28",
+  "version": "2026-06-30",
   "supported_architecture": "x86_64",
   "system_info": {
     "architecture": "x86_64",
@@ -283,7 +284,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-28",
+  "version": "2026-06-30",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 45.2,
   "checks": {
@@ -318,7 +319,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "degraded",
-  "version": "2025-07-28",
+  "version": "2026-06-30",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 2500.1,
   "warning": "High response time",
@@ -525,8 +526,8 @@ Get build output/logs with pagination support.
 
 **Enhanced Output Features:**
 - **Streaming Support**: Real-time output as builds progress
-- **Pagination**: Efficient handling of large build logs (up to 10,000 lines)
-- **Memory Management**: Automatic truncation of very large outputs
+- **Pagination**: Efficient handling of large build logs (up to 10,000 lines in memory)
+- **Memory Management**: Automatic truncation of very large in-memory outputs; on-disk `build.log` remains complete
 - **Real-time Updates**: Output updates as build progresses
 
 #### GET /build/{build_id}/stream
@@ -1102,5 +1103,5 @@ The server automatically configures system resource limits:
 #### Monitoring and Cleanup
 - **Memory Monitoring**: Triggers cleanup at 90% memory usage
 - **Disk Monitoring**: Triggers cleanup at 95% disk usage
-- **Build Output Limits**: Maximum 10,000 lines per build output
+- **Build Output Limits**: Maximum 10,000 lines in memory per build (on-disk `build.log` is always complete)
 - **History Limits**: Maximum 100 builds in memory history

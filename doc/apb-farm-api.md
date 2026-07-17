@@ -23,6 +23,8 @@ The APB Farm implements a comprehensive token-based authentication system with r
 #### Guest (Unauthenticated Users)
 - View dashboard and farm status
 - View public build information (with obfuscated server URLs)
+- Download package artifacts
+- Download a truncated `build.log` (last 100 lines only)
 - No build submission capabilities
 
 #### User (Regular Users)
@@ -30,6 +32,7 @@ The APB Farm implements a comprehensive token-based authentication system with r
 - Submit builds to the farm
 - Cancel own builds
 - View own build history via `/my/builds`
+- Download the full `build.log`
 - Access authenticated endpoints
 - Update own email address
 
@@ -210,7 +213,7 @@ Get farm information and status of all managed servers.
 ```json
 {
   "status": "running",
-  "version": "2025-07-28",
+  "version": "2026-06-30",
   "servers": [
     {
       "url": "http://server1.example.com:8000",
@@ -218,7 +221,7 @@ Get farm information and status of all managed servers.
       "status": "online",
       "health": "healthy",
       "info": {
-        "version": "2025-07-28",
+        "version": "2026-06-30",
         "supported_architecture": "x86_64",
         "system_info": {
           "architecture": "x86_64",
@@ -262,15 +265,20 @@ Simple health check endpoint for the farm.
 ```json
 {
   "status": "healthy",
-  "version": "2025-07-28"
+  "version": "2026-06-30"
 }
 ```
 
 #### GET /dashboard
 Get the comprehensive farm dashboard (HTML page) showing all servers, their current builds, and recent build history.
 
-**Parameters:**
-- `page` (integer, optional): Page number for build history pagination (default: 1)
+**Routes:**
+- `/dashboard` — Servers by Architecture tab (default)
+- `/dashboard/builds` — Recent Builds tab, page 1
+- `/dashboard/builds/{page}` — Recent Builds tab, paginated (page ≥ 1)
+- `/dashboard/statistics` — Statistics tab (authenticated users only)
+
+Legacy query-string URLs (`?tab=` and `?page=`) redirect to the path-based routes above.
 
 **Response:** Enhanced HTML page with:
 
@@ -399,7 +407,10 @@ Submit a build request to the farm (Authentication Required).
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0,
-      "user_id": 2
+      "queue_state": "farm",
+      "queue_position": 1,
+      "jobs_ahead": 0,
+      "farm_queue_size": 2
     },
     {
       "build_id": "7f2a8e9b-1234-5678-9abc-def012345678",
@@ -408,12 +419,18 @@ Submit a build request to the farm (Authentication Required).
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0,
-      "user_id": 2
+      "queue_state": "farm",
+      "queue_position": 2,
+      "jobs_ahead": 1,
+      "farm_queue_size": 2
     }
   ],
   "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
-  "user_id": 2,
-  "created_at": 1642694400.0
+  "queue_status": {
+    "queue_size": 2,
+    "builds_queued": 2,
+    "message": "Build(s) queued on farm; waiting for server capacity (2 job(s) in farm queue)"
+  },
 }
 ```
 
@@ -429,11 +446,12 @@ Submit a build request to the farm (Authentication Required).
 - **Per-Build**: Each build can have a custom timeout
 
 **Enhanced Processing:**
-- **Queue-based**: Builds are queued immediately and processed by background tasks
-- **Background Processing**: Background process redistributes queued builds to available servers
+- **Queue-based**: Builds are queued immediately on the farm and processed by background tasks
+- **Capacity-aware scheduling**: Builds wait in the farm queue until a server with matching architecture has a free `--max-concurrent` slot
+- **Architecture-aware ordering**: When one architecture's servers are full, builds for other architectures can still be assigned
 - **Server Assignment**: Builds assigned to servers based on availability and architecture compatibility
 - **Consistent Tracking**: Farm passes its build ID to the server, ensuring consistent tracking
-- **Retry Logic**: Exponential backoff retry logic for failed submissions
+- **Retry Logic**: Exponential backoff retry logic for transient submission failures (network/timeouts)
 
 **Architecture Filtering:**
 If `architectures` parameter is provided, only those architectures will be built (if they exist in the PKGBUILD and have available servers).
@@ -506,9 +524,36 @@ Returns a comprehensive build status page with:
     }
   ],
   "server_unavailable": false,
+  "artifacts_ready": true,
   "last_status_update": 1642694500.0
 }
 ```
+
+The `artifacts_ready` field indicates whether the farm has finished caching all packages and logs locally. Clients must wait for `artifacts_ready: true` before downloading artifacts from the farm.
+
+**Farm Queue Response (before server assignment):**
+When a build is waiting in the farm queue for server capacity, status JSON includes:
+```json
+{
+  "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+  "pkgname": "example-package",
+  "status": "queued",
+  "server_arch": "x86_64",
+  "created_at": 1642694300.0,
+  "packages": [],
+  "logs": [],
+  "artifacts_ready": false,
+  "queue_state": "farm",
+  "queue_position": 3,
+  "jobs_ahead": 2,
+  "farm_queue_size": 5
+}
+```
+
+- `queue_state`: `"farm"` while waiting for a server slot; omitted once assigned to a build server
+- `queue_position`: 1-based position in the farm queue
+- `jobs_ahead`: Number of farm-queued builds ahead of this one
+- `farm_queue_size`: Total builds currently waiting on the farm
 
 **Enhanced Error Handling:**
 - **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
@@ -547,7 +592,15 @@ Cancel a build with comprehensive permission checking.
 **Parameters:**
 - `build_id` (string, required): Build ID
 
-**Response:**
+**Response (farm queue):**
+```json
+{
+  "success": true,
+  "message": "Build 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3 removed from farm queue"
+}
+```
+
+**Response (assigned build):**
 ```json
 {
   "success": true,
@@ -558,6 +611,8 @@ Cancel a build with comprehensive permission checking.
   }
 }
 ```
+
+Builds still waiting in the farm queue (not yet assigned to a build server) are removed from the queue and marked cancelled without contacting a server.
 
 **Permission Rules:**
 - **Users**: Can cancel only their own builds
@@ -623,24 +678,27 @@ Stream build output in real-time by forwarding to the appropriate server.
 ### File Downloads
 
 #### GET /build/{build_id}/download/{filename}
-Download a build artifact by forwarding to the appropriate server.
+Download a build artifact from the farm's local artifact cache.
 
 **Parameters:**
 - `build_id` (string, required): Build UUID
 - `filename` (string, required): The filename to download
 
+**Authentication:**
+- Optional. Bearer token (APB client) or dashboard `authToken` cookie.
+- For `build.log`:
+  - **Unauthenticated**: response body is truncated to the last 100 lines, with a short notice header. Headers include `X-APB-Log-Truncated: true` and `X-APB-Log-Tail-Lines: 100`. `Cache-Control: private, no-store`.
+  - **Authenticated** (farm user or admin): full `build.log` is returned. `Cache-Control: private, no-store`.
+- Other artifact types are unchanged and do not require authentication.
+
 **Response:** Binary file content with appropriate headers.
 
 **Enhanced Error Handling:**
-- **Automatic Retry**: Up to 3 retry attempts on connection errors
-- **Server Discovery**: Attempts to find build on alternative servers if needed
-- **Cache Headers**: Proper caching headers for static content
-- **Range Support**: Passes through range requests for large files
-- **Permission Checking**: Respects build visibility permissions
+- **Cache Headers**: Proper caching headers for static package content; build logs are not publicly cached
+- **Permission Checking**: Full build logs require authentication
 
 **Error Responses:**
-- **404 Not Found**: File not found on any server
-- **503 Service Unavailable**: All servers unavailable
+- **404 Not Found**: File not found in the farm cache
 - **403 Forbidden**: Insufficient permissions to access build
 
 ---
@@ -768,6 +826,87 @@ Get the latest builds across all managed servers.
 - **User Context**: Shows user information where appropriate
 - **Submission Grouping**: Groups related builds from same submission
 - **Status Filtering**: Filter by build status (queued, building, completed, failed, cancelled)
+
+#### GET /builds/pkgname/{pkgname}
+Get recent builds for a specific package name as stored by the farm (`pkgbase` when present, otherwise `pkgname`).
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `limit` (integer, optional): Maximum builds to return (default: 20, max: 100)
+- `status` (string, optional): Filter by status
+
+**Response:**
+```json
+{
+  "pkgname": "example-package",
+  "builds": [
+    {
+      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "server_url": "ser---1",
+      "server_arch": "x86_64",
+      "pkgname": "example-package",
+      "display_name": "example-package (1.0.0-1)",
+      "status": "completed",
+      "start_time": "2024-01-20T10:00:00 UTC",
+      "end_time": "2024-01-20T10:05:00 UTC",
+      "created_at": "2024-01-20T10:00:00 UTC",
+      "username": "builder"
+    }
+  ],
+  "total": 1
+}
+```
+
+#### GET /builds/pkgname/{pkgname}/latest
+Get the latest build for a package across all architectures.
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `successful_only` (boolean, optional): Only completed builds (default: true)
+
+**Response:** Single build object (same fields as above). Returns 404 when none found.
+
+#### GET /builds/pkgname/{pkgname}/arch/{arch}/latest
+Get the latest build for a package on a specific architecture.
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `arch` (string, required): Target architecture. Use `any` to match the latest completed build regardless of `server_arch` (for `arch=('any')` packages)
+- `successful_only` (boolean, optional): Only completed builds (default: true)
+
+**Response:** Single build object. Returns 404 when none found.
+
+#### GET /builds/pkgname/{pkgname}/latest-by-arch
+Get the latest build for each `server_arch` of a package.
+
+**Parameters:**
+- `pkgname` (string, required): Package name
+- `successful_only` (boolean, optional): Only completed builds (default: true)
+
+**Response:**
+```json
+{
+  "pkgname": "example-package",
+  "builds": [
+    {
+      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "server_arch": "aarch64",
+      "pkgname": "example-package",
+      "status": "completed"
+    },
+    {
+      "id": "59fb2ef6-g8g4-588f-b8b8-47f637fb8de4",
+      "build_id": "59fb2ef6-g8g4-588f-b8b8-47f637fb8de4",
+      "server_arch": "x86_64",
+      "pkgname": "example-package",
+      "status": "completed"
+    }
+  ],
+  "total": 2
+}
+```
 
 #### GET /my/builds
 Get builds submitted by the current authenticated user.
@@ -1421,15 +1560,17 @@ CREATE TABLE smtp_config (
 The farm runs several sophisticated background tasks for maintaining system health:
 
 ### Process Build Queue
-- **Frequency**: Continuous with 5-second intervals when builds are queued
-- **Function**: Processes queued builds and assigns them to available servers
+- **Frequency**: Continuous with 5-second intervals when no server slot is available, 1-second when assigning builds
+- **Function**: Processes queued builds and assigns them to available servers with free capacity
 - **Features**:
-  - **Exponential Backoff**: Retry logic with increasing delays for failed submissions
+  - **Capacity Waiting**: Keeps builds in the farm queue until a matching server has `current_builds < max_concurrent`
+  - **Architecture-aware Scanning**: Skips builds blocked by full servers for their architecture and assigns others
+  - **Exponential Backoff**: Retry logic with increasing delays for transient submission failures
   - **Server Health**: Checks server availability and health before assignment
   - **Load Balancing**: Distributes builds across available servers
   - **Architecture Validation**: Ensures server supports required architecture
   - **Timeout Handling**: Respects custom build timeouts
-  - **Error Recovery**: Handles server failures gracefully
+  - **Cancellation**: Removes cancelled builds from the farm queue without server contact
 
 ### Update Build Status
 - **Frequency**: Every 120 seconds for all active builds
@@ -1816,11 +1957,11 @@ Cache settings are configured in `apb.json`:
 
 ### Cache Behavior
 
-1. **Build Completion**: When a build completes successfully, all artifacts are proactively cached
-2. **Download Request**: When a user requests an artifact download
-3. **Cache Check**: Farm first checks if the artifact is cached locally
-4. **Cache Hit**: If cached, artifact is served directly from local storage
-5. **Cache Miss**: If not cached, artifact is downloaded from build server and cached
+1. **Build Completion**: When a build completes, the farm downloads all artifacts from the build server in the background (with retries)
+2. **Status Polling**: Build status responses include `artifacts_ready` while caching is in progress
+3. **Download Request**: When a client requests an artifact download from the farm
+4. **Cache Hit**: If cached locally, the artifact is served directly from farm storage
+5. **Cache Miss**: If not cached yet, the farm returns 404 and does not re-fetch from the build server; clients must wait for `artifacts_ready`
 6. **Cache Storage**: Artifacts are stored in build-specific directories
 7. **Automatic Cleanup**: Background task runs every 4 hours to remove expired artifacts
 
@@ -1838,8 +1979,9 @@ The cache management features are fully integrated into the admin web dashboard:
 
 The farm automatically caches all build artifacts (packages and logs) immediately when a build completes successfully:
 
-- **Triggered**: Automatically when build status changes to "completed"
+- **Triggered**: Automatically when build status changes to "completed" or "failed"
 - **Background Process**: Caching runs asynchronously without blocking status updates
+- **Retries**: Failed server downloads are retried with exponential backoff before giving up
 - **All Artifacts**: Both packages (.pkg.tar.xz files) and build logs are cached
 - **Error Handling**: Individual artifact caching failures don't affect other artifacts
 - **Logging**: Comprehensive logging of caching operations for monitoring
