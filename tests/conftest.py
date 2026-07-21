@@ -124,94 +124,9 @@ def wait_for_service(
     )
 
 
-def _multipart_module_path(module_name: str) -> str | None:
-    import importlib.util
-
-    spec = importlib.util.find_spec(module_name)
-    if spec is None or spec.origin is None:
-        return None
-    return spec.origin
-
-
-MIN_MULTIPART_VERSION = (1, 3)
-
-
-def _parse_release_version(raw_version: str) -> tuple[int, ...] | None:
-    parts: list[int] = []
-    for segment in raw_version.split("."):
-        digits = ""
-        for char in segment:
-            if char.isdigit():
-                digits += char
-            elif digits:
-                break
-            else:
-                break
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts) if parts else None
-
-
-def _multipart_release_version() -> tuple[int, ...] | None:
-    import importlib.metadata as metadata
-
-    try:
-        return _parse_release_version(metadata.version("multipart"))
-    except metadata.PackageNotFoundError:
-        pass
-
-    try:
-        import multipart
-
-        raw_version = getattr(multipart, "__version__", None)
-        if isinstance(raw_version, str):
-            return _parse_release_version(raw_version)
-    except ImportError:
-        pass
-
-    return None
-
-
-def has_form_upload_support() -> bool:
-    """Return True when multipart>=1.3 can satisfy FastAPI form uploads."""
-    from apb.multipart_compat import form_upload_runtime_ready
-
-    return form_upload_runtime_ready()
-
-
-def runtime_dependency_skip_reason() -> str | None:
-    """Verify form upload dependencies used by server and farm routes."""
-    if has_form_upload_support():
-        return None
-
-    lines = [
-        "Form upload support requires multipart>=1.3 in the Python running pytest.",
-        f"Python: {sys.executable}",
-    ]
-    multipart_path = _multipart_module_path("multipart")
-    version = _multipart_release_version()
-    if multipart_path:
-        lines.append(f"multipart: {multipart_path}")
-    else:
-        lines.append("multipart: not found")
-    if version is not None:
-        version_text = ".".join(str(part) for part in version)
-        lines.append(f"multipart version: {version_text}")
-        if version < MIN_MULTIPART_VERSION:
-            lines.append(f"Installed multipart {version_text} is older than 1.3.")
-    lines.append(f"Fix: {sys.executable} -m pip install 'multipart>=1.3'")
-    lines.append("On Arch Linux: pacman -S python-multipart")
-    lines.append(f"Run tests with: {sys.executable} -m pytest")
-    return "\n".join(lines)
-
-
 def integration_skip_reason() -> str | None:
     if sys.platform != "linux":
         return "APB package integration tests require Linux with Arch build tools"
-    runtime_reason = runtime_dependency_skip_reason()
-    if runtime_reason:
-        return runtime_reason
     if shutil.which("makechrootpkg") is None:
         return "makechrootpkg not found"
     if shutil.which("sudo") is None:
