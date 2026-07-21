@@ -181,7 +181,7 @@ class SMTPTestRequest(BaseModel):
 # Global state
 config: Dict[str, Any] = {}
 server_info_cache: Dict[str, Dict] = {}
-build_queue: List[Dict] = []
+build_queues: Dict[str, List[Dict]] = {}  # architecture -> FIFO of pending builds
 build_database: sqlite3.Connection = None
 http_session: httpx.AsyncClient = None
 shutdown_event = asyncio.Event()
@@ -189,6 +189,50 @@ background_tasks: List[asyncio.Task] = []
 artifact_cache_tasks: Dict[str, asyncio.Task] = {}
 server_status_tracker: Dict[str, ServerStatus] = {}
 auth_manager = None
+
+
+def _build_target_arch(build_info: Dict[str, Any]) -> str:
+    """Resolve the architecture key used for a queued build."""
+    arch = build_info.get("arch")
+    if arch:
+        return arch
+    target_architectures = build_info.get("target_architectures") or []
+    if target_architectures:
+        return target_architectures[0]
+    return "unknown"
+
+
+def enqueue_build(build_info: Dict[str, Any]) -> int:
+    """
+    Append a build to its architecture's farm queue.
+
+    Returns:
+        1-based position within that architecture's queue.
+    """
+    arch = _build_target_arch(build_info)
+    build_info["arch"] = arch
+    if arch not in build_queues:
+        build_queues[arch] = []
+    build_queues[arch].append(build_info)
+    return len(build_queues[arch])
+
+
+def total_farm_queue_size() -> int:
+    """Return the total number of builds waiting across all architectures."""
+    return sum(len(queue) for queue in build_queues.values())
+
+
+def iter_queued_builds() -> List[Dict[str, Any]]:
+    """Return a flat snapshot of all queued builds (order not meaningful across arches)."""
+    builds: List[Dict[str, Any]] = []
+    for queue in build_queues.values():
+        builds.extend(queue)
+    return builds
+
+
+def clear_build_queues() -> None:
+    """Clear all per-architecture farm queues (tests / shutdown helpers)."""
+    build_queues.clear()
 
 
 class AuthManager:
@@ -2100,17 +2144,19 @@ async def get_best_server_for_arch(target_archs: List[str]) -> Optional[str]:
 
 async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None):
     """Queue a build for processing"""
+    arch = target_archs[0] if target_archs else "unknown"
     build_info = {
         "build_id": build_id,
         "pkgbuild_content": pkgbuild_content,
         "pkgname": pkgname,
-        "target_architectures": target_archs,
+        "target_architectures": target_archs or [arch],
         "source_files": source_files or [],
         "created_at": time.time(),
-        "status": BuildStatus.QUEUED
+        "status": BuildStatus.QUEUED,
+        "arch": arch,
     }
 
-    build_queue.append(build_info)
+    queue_position = enqueue_build(build_info)
 
     # Parse version information from PKGBUILD
     version_info = parse_pkgbuild_version(pkgbuild_content)
@@ -2125,8 +2171,8 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
         (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id, epoch, pkgver, pkgrel)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        build_id, None, None, pkgname, BuildStatus.QUEUED,
-        None, None, time.time(), len(build_queue), None, user_id, epoch, pkgver, pkgrel
+        build_id, None, arch, pkgname, BuildStatus.QUEUED,
+        None, None, time.time(), queue_position, None, user_id, epoch, pkgver, pkgrel
     ))
     build_database.commit()
 
@@ -2254,7 +2300,7 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             "extra_repos": extra_repos or []
         }
 
-        build_queue.append(build_info)
+        queue_position = enqueue_build(build_info)
 
         # Store in database
         cursor = build_database.cursor()
@@ -2264,11 +2310,10 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             build_id, None, arch, pkgname, BuildStatus.QUEUED,
-            None, None, time.time(), len(build_queue), submission_group, user_id, build_timeout, epoch, pkgver, pkgrel
+            None, None, time.time(), queue_position, submission_group, user_id, build_timeout, epoch, pkgver, pkgrel
         ))
         build_database.commit()
 
-        queue_position = len(build_queue)
         queued_builds.append({
             "build_id": build_id,
             "arch": arch,
@@ -2289,33 +2334,40 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
 
 
 def get_farm_queue_position(build_id: str) -> Optional[int]:
-    """Return 1-based position in the farm queue, or None if not queued."""
-    for index, build_info in enumerate(build_queue):
-        if build_info["build_id"] == build_id:
-            return index + 1
+    """Return 1-based position in this build's architecture queue, or None if not queued."""
+    for queue in build_queues.values():
+        for index, build_info in enumerate(queue):
+            if build_info["build_id"] == build_id:
+                return index + 1
     return None
 
 
 def remove_from_build_queue(build_id: str) -> bool:
-    """Remove a build from the in-memory farm queue."""
-    for index, build_info in enumerate(build_queue):
-        if build_info["build_id"] == build_id:
-            build_queue.pop(index)
-            return True
+    """Remove a build from its architecture's in-memory farm queue."""
+    for arch, queue in list(build_queues.items()):
+        for index, build_info in enumerate(queue):
+            if build_info["build_id"] == build_id:
+                queue.pop(index)
+                if not queue:
+                    del build_queues[arch]
+                return True
     return False
 
 
 def get_farm_queue_status_for_build(build_id: str) -> Dict[str, Any]:
-    """Return farm queue metadata for a build waiting on server capacity."""
-    queue_position = get_farm_queue_position(build_id)
-    if queue_position is None:
-        return {}
-    return {
-        "queue_state": "farm",
-        "queue_position": queue_position,
-        "jobs_ahead": queue_position - 1,
-        "farm_queue_size": len(build_queue),
-    }
+    """Return per-architecture farm queue metadata for a build waiting on server capacity."""
+    for arch, queue in build_queues.items():
+        for index, build_info in enumerate(queue):
+            if build_info["build_id"] == build_id:
+                queue_position = index + 1
+                return {
+                    "queue_state": "farm",
+                    "queue_position": queue_position,
+                    "jobs_ahead": queue_position - 1,
+                    "farm_queue_size": len(queue),
+                    "arch": arch,
+                }
+    return {}
 
 
 async def is_build_cancelled(build_id: str) -> bool:
@@ -2382,7 +2434,7 @@ async def _requeue_build_after_submission_error(build_info: Dict[str, Any], max_
             f"requeueing with {delay}s delay"
         )
         await asyncio.sleep(delay)
-        build_queue.append(build_info)
+        enqueue_build(build_info)
         return
 
     logger.error(f"Build {build_id} failed after {max_retries} retry attempts")
@@ -2390,45 +2442,54 @@ async def _requeue_build_after_submission_error(build_info: Dict[str, Any], max_
 
 
 async def process_build_queue():
-    """Background task to process build queue"""
+    """Background task to process per-architecture build queues"""
     while not shutdown_event.is_set():
         try:
             assigned_any = False
-            index = 0
-            while index < len(build_queue):
-                build_info = build_queue[index]
-                build_id = build_info["build_id"]
-                target_arch = build_info["target_architectures"][0]
+            available_archs = await get_available_architectures()
 
-                if await is_build_cancelled(build_id):
-                    build_queue.pop(index)
+            for arch in list(build_queues.keys()):
+                queue = build_queues.get(arch)
+                if not queue:
                     continue
 
-                available_archs = await get_available_architectures()
-                if target_arch not in available_archs or not available_archs[target_arch]:
-                    await _mark_build_failed(
-                        build_id,
-                        f"No available servers for architecture {target_arch}, build {build_id}",
-                    )
-                    build_queue.pop(index)
-                    continue
+                index = 0
+                while index < len(queue):
+                    build_info = queue[index]
+                    build_id = build_info["build_id"]
+                    target_arch = _build_target_arch(build_info)
 
-                server_url = await get_best_server_for_arch([target_arch])
-                if not server_url:
-                    index += 1
-                    continue
+                    if await is_build_cancelled(build_id):
+                        queue.pop(index)
+                        continue
 
-                build_queue.pop(index)
-                result = await forward_build_to_server(build_info, server_url)
+                    if target_arch not in available_archs or not available_archs[target_arch]:
+                        await _mark_build_failed(
+                            build_id,
+                            f"No available servers for architecture {target_arch}, build {build_id}",
+                        )
+                        queue.pop(index)
+                        continue
 
-                if result is True:
-                    logger.info(f"Build {build_id} submitted to {server_url}")
-                    assigned_any = True
-                elif result is False:
-                    logger.error(f"Build {build_id} permanently rejected by {server_url}")
-                elif result is None:
-                    await _requeue_build_after_submission_error(build_info)
-                    assigned_any = True
+                    server_url = await get_best_server_for_arch([target_arch])
+                    if not server_url:
+                        # No free slot for this architecture; leave remaining jobs waiting
+                        break
+
+                    queue.pop(index)
+                    result = await forward_build_to_server(build_info, server_url)
+
+                    if result is True:
+                        logger.info(f"Build {build_id} submitted to {server_url}")
+                        assigned_any = True
+                    elif result is False:
+                        logger.error(f"Build {build_id} permanently rejected by {server_url}")
+                    elif result is None:
+                        await _requeue_build_after_submission_error(build_info)
+                        assigned_any = True
+
+                if arch in build_queues and not build_queues[arch]:
+                    del build_queues[arch]
 
             await asyncio.sleep(1 if assigned_any else 5)
         except Exception as e:

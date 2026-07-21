@@ -76,18 +76,19 @@ def _make_build_info(build_id: str, arch: str = "x86_64") -> dict[str, Any]:
 def farm_queue_state(monkeypatch: pytest.MonkeyPatch):
     db = _init_test_database()
     monkeypatch.setattr(core, "build_database", db)
-    monkeypatch.setattr(core, "build_queue", [])
+    monkeypatch.setattr(core, "build_queues", {})
     monkeypatch.setattr(core, "shutdown_event", asyncio.Event())
     yield db
     core.shutdown_event.set()
-    core.build_queue.clear()
+    core.clear_build_queues()
 
 
 def test_get_farm_queue_position_and_removal(farm_queue_state: sqlite3.Connection) -> None:
     first = _make_build_info("build-1")
     second = _make_build_info("build-2")
 
-    core.build_queue.extend([first, second])
+    assert core.enqueue_build(first) == 1
+    assert core.enqueue_build(second) == 2
 
     assert core.get_farm_queue_position("build-1") == 1
     assert core.get_farm_queue_position("build-2") == 2
@@ -96,6 +97,7 @@ def test_get_farm_queue_position_and_removal(farm_queue_state: sqlite3.Connectio
         "queue_position": 2,
         "jobs_ahead": 1,
         "farm_queue_size": 2,
+        "arch": "x86_64",
     }
 
     assert core.remove_from_build_queue("build-1") is True
@@ -104,10 +106,37 @@ def test_get_farm_queue_position_and_removal(farm_queue_state: sqlite3.Connectio
     assert core.remove_from_build_queue("missing") is False
 
 
+def test_mixed_architecture_queue_positions(farm_queue_state: sqlite3.Connection) -> None:
+    """Queue position is per architecture, not global across arches."""
+    x86_a = _make_build_info("x86-a", arch="x86_64")
+    aarch64_b = _make_build_info("aarch64-b", arch="aarch64")
+    x86_c = _make_build_info("x86-c", arch="x86_64")
+
+    assert core.enqueue_build(x86_a) == 1
+    assert core.enqueue_build(aarch64_b) == 1
+    assert core.enqueue_build(x86_c) == 2
+
+    assert core.total_farm_queue_size() == 3
+    assert core.get_farm_queue_status_for_build("x86-c") == {
+        "queue_state": "farm",
+        "queue_position": 2,
+        "jobs_ahead": 1,
+        "farm_queue_size": 2,
+        "arch": "x86_64",
+    }
+    assert core.get_farm_queue_status_for_build("aarch64-b") == {
+        "queue_state": "farm",
+        "queue_position": 1,
+        "jobs_ahead": 0,
+        "farm_queue_size": 1,
+        "arch": "aarch64",
+    }
+
+
 async def test_cancel_farm_queued_build(farm_queue_state: sqlite3.Connection) -> None:
     build_id = "cancel-me"
     _insert_build(farm_queue_state, build_id)
-    core.build_queue.append(_make_build_info(build_id))
+    core.enqueue_build(_make_build_info(build_id))
 
     result = await core.cancel_farm_queued_build(build_id)
 
@@ -115,7 +144,7 @@ async def test_cancel_farm_queued_build(farm_queue_state: sqlite3.Connection) ->
         "success": True,
         "message": f"Build {build_id} removed from farm queue",
     }
-    assert core.build_queue == []
+    assert core.build_queues == {}
     cursor = farm_queue_state.cursor()
     cursor.execute("SELECT status FROM builds WHERE id = ?", (build_id,))
     assert cursor.fetchone()[0] == BuildStatus.CANCELLED
@@ -140,7 +169,7 @@ async def test_process_build_queue_waits_for_server_capacity(
 ) -> None:
     build_id = "waiting-build"
     _insert_build(farm_queue_state, build_id)
-    core.build_queue.append(_make_build_info(build_id))
+    core.enqueue_build(_make_build_info(build_id))
 
     with patch.object(core, "get_available_architectures", AsyncMock(return_value={"x86_64": ["http://server"]})), \
          patch.object(core, "get_best_server_for_arch", AsyncMock(return_value=None)) as mock_best_server, \
@@ -153,8 +182,8 @@ async def test_process_build_queue_waits_for_server_capacity(
 
     mock_best_server.assert_awaited()
     mock_forward.assert_not_awaited()
-    assert len(core.build_queue) == 1
-    assert core.build_queue[0]["build_id"] == build_id
+    assert core.total_farm_queue_size() == 1
+    assert core.build_queues["x86_64"][0]["build_id"] == build_id
 
 
 async def test_process_build_queue_assigns_when_capacity_opens(
@@ -162,7 +191,7 @@ async def test_process_build_queue_assigns_when_capacity_opens(
 ) -> None:
     build_id = "ready-build"
     _insert_build(farm_queue_state, build_id)
-    core.build_queue.append(_make_build_info(build_id))
+    core.enqueue_build(_make_build_info(build_id))
 
     with patch.object(core, "get_available_architectures", AsyncMock(return_value={"x86_64": ["http://server"]})), \
          patch.object(core, "get_best_server_for_arch", AsyncMock(return_value="http://server")), \
@@ -174,7 +203,7 @@ async def test_process_build_queue_assigns_when_capacity_opens(
         await task
 
     mock_forward.assert_awaited_once()
-    assert core.build_queue == []
+    assert core.build_queues == {}
 
 
 async def test_process_build_queue_skips_blocked_architecture(
@@ -184,7 +213,8 @@ async def test_process_build_queue_skips_blocked_architecture(
     ready = _make_build_info("ready-aarch64", arch="aarch64")
     _insert_build(farm_queue_state, "blocked-x86", server_arch="x86_64")
     _insert_build(farm_queue_state, "ready-aarch64", server_arch="aarch64")
-    core.build_queue.extend([blocked, ready])
+    core.enqueue_build(blocked)
+    core.enqueue_build(ready)
 
     async def pick_server(architectures: list[str]) -> str | None:
         if architectures == ["x86_64"]:
@@ -208,7 +238,8 @@ async def test_process_build_queue_skips_blocked_architecture(
     mock_forward.assert_awaited_once()
     forwarded_build_id = mock_forward.await_args.args[0]["build_id"]
     assert forwarded_build_id == "ready-aarch64"
-    assert [build["build_id"] for build in core.build_queue] == ["blocked-x86"]
+    assert [build["build_id"] for build in core.build_queues.get("x86_64", [])] == ["blocked-x86"]
+    assert "aarch64" not in core.build_queues
 
 
 async def test_process_build_queue_drops_cancelled_build(
@@ -216,7 +247,7 @@ async def test_process_build_queue_drops_cancelled_build(
 ) -> None:
     build_id = "cancelled-build"
     _insert_build(farm_queue_state, build_id, status=BuildStatus.CANCELLED)
-    core.build_queue.append(_make_build_info(build_id))
+    core.enqueue_build(_make_build_info(build_id))
 
     with patch.object(core, "get_available_architectures", AsyncMock()) as mock_archs, \
          patch.object(core, "get_best_server_for_arch", AsyncMock()) as mock_best_server, \
@@ -227,7 +258,7 @@ async def test_process_build_queue_drops_cancelled_build(
         core.shutdown_event.set()
         await task
 
-    mock_archs.assert_not_awaited()
+    mock_archs.assert_awaited()
     mock_best_server.assert_not_awaited()
     mock_forward.assert_not_awaited()
-    assert core.build_queue == []
+    assert core.build_queues == {}

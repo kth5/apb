@@ -1520,11 +1520,11 @@ async def submit_build(
             "builds": queued_builds,  # Information about all queued builds
             "submission_group": primary_build["submission_group"],
             "queue_status": {
-                "queue_size": len(core.build_queue),
+                "queue_size": core.total_farm_queue_size(),
                 "builds_queued": len(queued_builds),
                 "message": (
                     f"Build(s) queued on farm; waiting for server capacity "
-                    f"({len(core.build_queue)} job(s) in farm queue)"
+                    f"({core.total_farm_queue_size()} job(s) in farm queue)"
                 ),
             },
             "created_at": time.time()
@@ -1646,6 +1646,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
         jobs_ahead = queued_status.get("jobs_ahead", 0)
         queue_position = queued_status.get("queue_position", "?")
         farm_queue_size = queued_status.get("farm_queue_size", "?")
+        queue_arch = queued_status.get("arch") or server_arch or "pending"
         return HTMLResponse(f"""
             <!DOCTYPE html>
             <html>
@@ -1658,8 +1659,8 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             <body>
                 <h1>Build Queued: {display_name}</h1>
                 <p><strong>Build ID:</strong> {build_id}</p>
-                <p><strong>Architecture:</strong> {server_arch or 'pending assignment'}</p>
-                <p><strong>Queue position:</strong> {queue_position} of {farm_queue_size} ({jobs_ahead} job(s) ahead)</p>
+                <p><strong>Architecture:</strong> {queue_arch}</p>
+                <p><strong>Queue position:</strong> {queue_position} of {farm_queue_size} for {queue_arch} ({jobs_ahead} job(s) ahead)</p>
                 <p>Waiting for an available build server slot.</p>
                 <p><a href="/build/{build_id}/status">Refresh Status</a></p>
             </body>

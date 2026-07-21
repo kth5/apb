@@ -43,7 +43,7 @@ class APBotClient:
 
     def build_package(self, build_path: Path) -> str:
         """
-        Submit a build request to the server using a tarball of all files in the build directory.
+        Submit a build request using a tarball of PKGBUILD, local sources, install scripts, and keys/.
 
         Args:
             build_path: Path to directory containing PKGBUILD and source files

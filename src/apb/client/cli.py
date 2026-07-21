@@ -19,6 +19,7 @@ from urllib.parse import urljoin
 import httpx
 
 from apb.config import load_config
+from apb.srcinfo import SrcinfoError
 from apb.tarball import create_build_tarball
 
 from apb.client.api import APBotClient
@@ -47,13 +48,15 @@ def _format_farm_queue_message(status: Dict, *, arch_prefix: str = "") -> Option
 
     jobs_ahead = status.get("jobs_ahead", max(queue_position - 1, 0))
     farm_queue_size = status.get("farm_queue_size", queue_position)
+    arch = status.get("arch")
+    arch_note = f" for {arch}" if arch else ""
     if jobs_ahead == 0:
         return (
-            f"{arch_prefix}Queued on farm (position {queue_position}/{farm_queue_size}, "
+            f"{arch_prefix}Queued on farm (position {queue_position}/{farm_queue_size}{arch_note}, "
             f"next when a server slot opens)"
         )
     return (
-        f"{arch_prefix}Queued on farm: position {queue_position}/{farm_queue_size}, "
+        f"{arch_prefix}Queued on farm: position {queue_position}/{farm_queue_size}{arch_note}, "
         f"{jobs_ahead} job(s) ahead"
     )
 
@@ -68,9 +71,10 @@ def _print_submitted_build_queue_info(builds: List[Dict], queue_status: Optional
         queue_position = build.get("queue_position")
         if queue_position is not None:
             jobs_ahead = build.get("jobs_ahead", max(queue_position - 1, 0))
+            farm_queue_size = build.get("farm_queue_size", queue_position)
             print(
-                f"[{arch}] Build queued at farm position {queue_position} "
-                f"({jobs_ahead} job(s) ahead): {build_id}"
+                f"[{arch}] Build queued at farm position {queue_position}/{farm_queue_size} "
+                f"({jobs_ahead} job(s) ahead for {arch}): {build_id}"
             )
         else:
             print(f"[{arch}] Build ID: {build_id}")
@@ -236,6 +240,9 @@ def submit_build(server_url: str, build_path: Path, auth_client: Optional[APBAut
     try:
         client = APBotClient(server_url, auth_client)
         return client.build_package(build_path)
+    except (FileNotFoundError, SrcinfoError) as e:
+        print(f"Error preparing build tarball: {e}")
+        return None
     except httpx.HTTPError:
         return None
 
@@ -298,6 +305,9 @@ def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[
                 except OSError:
                     pass
 
+    except (FileNotFoundError, SrcinfoError) as e:
+        print(f"Error preparing build tarball: {e}")
+        return None
     except httpx.HTTPError as e:
         print(f"Error submitting build to farm: {e}")
         if hasattr(e, 'response') and e.response is not None:

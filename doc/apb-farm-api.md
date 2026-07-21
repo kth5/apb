@@ -410,7 +410,7 @@ Submit a build request to the farm (Authentication Required).
       "queue_state": "farm",
       "queue_position": 1,
       "jobs_ahead": 0,
-      "farm_queue_size": 2
+      "farm_queue_size": 1
     },
     {
       "build_id": "7f2a8e9b-1234-5678-9abc-def012345678",
@@ -420,9 +420,9 @@ Submit a build request to the farm (Authentication Required).
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0,
       "queue_state": "farm",
-      "queue_position": 2,
-      "jobs_ahead": 1,
-      "farm_queue_size": 2
+      "queue_position": 1,
+      "jobs_ahead": 0,
+      "farm_queue_size": 1
     }
   ],
   "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
@@ -447,8 +447,9 @@ Submit a build request to the farm (Authentication Required).
 
 **Enhanced Processing:**
 - **Queue-based**: Builds are queued immediately on the farm and processed by background tasks
-- **Capacity-aware scheduling**: Builds wait in the farm queue until a server with matching architecture has a free `--max-concurrent` slot
-- **Architecture-aware ordering**: When one architecture's servers are full, builds for other architectures can still be assigned
+- **Per-architecture queues**: Each target architecture has its own FIFO; queue position is scoped to that architecture
+- **Capacity-aware scheduling**: Builds wait in their architecture's farm queue until a server with matching architecture has a free `--max-concurrent` slot
+- **Independent arch assignment**: When one architecture's servers are full, builds for other architectures can still be assigned
 - **Server Assignment**: Builds assigned to servers based on availability and architecture compatibility
 - **Consistent Tracking**: Farm passes its build ID to the server, ensuring consistent tracking
 - **Retry Logic**: Exponential backoff retry logic for transient submission failures (network/timeouts)
@@ -546,14 +547,18 @@ When a build is waiting in the farm queue for server capacity, status JSON inclu
   "queue_state": "farm",
   "queue_position": 3,
   "jobs_ahead": 2,
-  "farm_queue_size": 5
+  "farm_queue_size": 5,
+  "arch": "x86_64"
 }
 ```
 
 - `queue_state`: `"farm"` while waiting for a server slot; omitted once assigned to a build server
-- `queue_position`: 1-based position in the farm queue
-- `jobs_ahead`: Number of farm-queued builds ahead of this one
-- `farm_queue_size`: Total builds currently waiting on the farm
+- `queue_position`: 1-based position in this architecture's farm queue
+- `jobs_ahead`: Number of same-architecture farm-queued builds ahead of this one
+- `farm_queue_size`: Total builds currently waiting on the farm for this architecture
+- `arch`: Target architecture for this queued build
+
+Top-level submission `queue_status.queue_size` remains the total across all architectures.
 
 **Enhanced Error Handling:**
 - **Server Unavailable**: If the assigned server is unavailable, returns cached status with warning
@@ -1561,10 +1566,11 @@ The farm runs several sophisticated background tasks for maintaining system heal
 
 ### Process Build Queue
 - **Frequency**: Continuous with 5-second intervals when no server slot is available, 1-second when assigning builds
-- **Function**: Processes queued builds and assigns them to available servers with free capacity
+- **Function**: Processes per-architecture queued builds and assigns them to available servers with free capacity
 - **Features**:
-  - **Capacity Waiting**: Keeps builds in the farm queue until a matching server has `current_builds < max_concurrent`
-  - **Architecture-aware Scanning**: Skips builds blocked by full servers for their architecture and assigns others
+  - **Per-architecture FIFOs**: Each target architecture has an independent farm queue
+  - **Capacity Waiting**: Keeps builds in their architecture queue until a matching server has `current_builds < max_concurrent`
+  - **Independent arch scheduling**: Full x86_64 servers do not block aarch64 (or other) queue assignment
   - **Exponential Backoff**: Retry logic with increasing delays for transient submission failures
   - **Server Health**: Checks server availability and health before assignment
   - **Load Balancing**: Distributes builds across available servers

@@ -642,7 +642,7 @@ for update in client.stream_build_updates("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3"
         break
 ```
 
-When a build is waiting in the farm queue, status responses include `queue_state`, `queue_position`, `jobs_ahead`, and `farm_queue_size`. The CLI prints these while monitoring and removes farm-queued builds on interrupt or `--cancel`.
+When a build is waiting in the farm queue, status responses include `queue_state`, `queue_position`, `jobs_ahead`, `farm_queue_size`, and `arch`. Queue fields are scoped to the build's target architecture. The CLI prints these while monitoring and removes farm-queued builds on interrupt or `--cancel`.
 
 #### get_latest_successful_build_id()
 

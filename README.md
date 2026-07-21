@@ -10,7 +10,7 @@ APB (Arch Package Builder) is designed to solve the challenges of building Arch 
 - **Multi-Architecture Support**: Build packages for x86_64, aarch64, powerpc64le, riscv64, and other architectures
 - **Architecture-Independent Packages**: `arch=('any')` packages can be routed to any available build server
 - **Automated Buildroot Management**: Handles chroot creation, maintenance, and cleanup using `mkarchroot` and `makechrootpkg`
-- **Source Management**: Automatic GPG key validation, source dependency handling, and tarball uploads that include source directories
+- **Source Management**: Automatic GPG key validation, source dependency handling, and tarball uploads of PKGBUILD, local sources, install scripts, and keys/
 - **Build Monitoring**: Real-time build status tracking and log streaming
 - **Artifact Caching**: The farm caches completed build artifacts locally so clients download from the farm without re-fetching from build servers
 - **Resource Management**: Intelligent load balancing and concurrent build limiting
@@ -48,7 +48,7 @@ APB follows a three-tier architecture:
 
 The command-line interface and Python library (`apb.client`) for interacting with the build system. It handles:
 
-- Submitting build requests as tarballs of the package directory (PKGBUILD plus sources)
+- Submitting build requests as tarballs of PKGBUILD, local sources and install scripts from `.SRCINFO` (or `makepkg --printsrcinfo`), plus `keys/` when present
 - Monitoring build progress with real-time output streaming
 - Waiting for farm artifact caching (`artifacts_ready`) before downloading results
 - Downloading completed packages and build artifacts
@@ -91,7 +91,8 @@ APB is installed as a Python package under `src/apb/`:
 | `apb.farm` | Farm application, routing, and core logic |
 | `apb.server` | Server application and build engine |
 | `apb.pkgbuild` | PKGBUILD parsing (including bash-style variable substitution) |
-| `apb.tarball` | Build directory tarball creation |
+| `apb.srcinfo` | `.SRCINFO` parsing for local source selection |
+| `apb.tarball` | Build submission tarball creation |
 | `apb.config` | Shared configuration loading |
 | `apb.web` | Jinja2 HTML templates and static assets |
 
