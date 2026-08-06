@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Build server periodic SRCDEST cleanup: orphaned lock removal and age-based pruning of cached source files when `SRCDEST` is set in `/etc/makepkg.conf`, configurable via `--srcdest-cleanup-interval` and `--srcdest-retention-days`
 - Build servers remove failed build directories from `BUILDS_DIR` immediately after finalizing the build log and status
 - Unit tests for immediate failed build directory cleanup on the build server
 - Unit tests for build server admin in-memory cleanup endpoint

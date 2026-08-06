@@ -46,6 +46,8 @@ DEFAULT_PORT = 8000
 DEFAULT_BUILDROOT = Path.home() / ".apb" / "buildroot"
 DEFAULT_BUILDS_DIR = Path.home() / ".apb" / "builds"
 DEFAULT_MAX_CONCURRENT = 3
+DEFAULT_SRCDEST_CLEANUP_INTERVAL = 86400
+DEFAULT_SRCDEST_RETENTION_DAYS = 30
 BUILD_TIMEOUT = BUILD_TIMEOUT_DEFAULT
 
 # Global state
@@ -831,6 +833,92 @@ def cleanup_orphaned_srcdest_locks():
 
     except Exception as e:
         logger.error(f"Error during SRCDEST lock cleanup: {e}")
+
+
+def _has_active_builds() -> bool:
+    return any(
+        build_info.get("status") == BuildStatus.BUILDING
+        for build_info in active_builds.values()
+    )
+
+
+def cleanup_srcdest_sources(srcdest_path: Path, retention_days: int) -> Dict[str, int]:
+    """Remove top-level SRCDEST entries older than the retention period."""
+    cutoff = time.time() - retention_days * 86400
+    stats = {"removed_files": 0, "removed_dirs": 0, "freed_bytes": 0}
+
+    for entry in os.scandir(srcdest_path):
+        if entry.name.startswith(".apb-") and entry.name.endswith(".lock"):
+            continue
+
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+            if entry_stat.st_mtime >= cutoff:
+                continue
+
+            if entry.is_file(follow_symlinks=False):
+                stats["freed_bytes"] += entry_stat.st_size
+                os.unlink(entry.path)
+                stats["removed_files"] += 1
+            elif entry.is_dir(follow_symlinks=False):
+                dir_size = 0
+                for root, _dirs, files in os.walk(entry.path):
+                    for filename in files:
+                        try:
+                            dir_size += os.stat(
+                                os.path.join(root, filename),
+                                follow_symlinks=False,
+                            ).st_size
+                        except OSError:
+                            pass
+                shutil.rmtree(entry.path)
+                stats["removed_dirs"] += 1
+                stats["freed_bytes"] += dir_size
+        except OSError as exc:
+            logger.warning("Failed to remove SRCDEST entry %s: %s", entry.path, exc)
+
+    return stats
+
+
+def cleanup_srcdest() -> None:
+    """Clean orphaned SRCDEST locks and prune old cached source files."""
+    config = get_makepkg_config()
+    if "SRCDEST" not in config:
+        return
+
+    srcdest = Path(config["SRCDEST"])
+    if not srcdest.is_dir():
+        logger.warning("SRCDEST %s is not a directory, skipping cleanup", srcdest)
+        return
+
+    cleanup_orphaned_srcdest_locks()
+
+    if _has_active_builds():
+        logger.info("Skipping SRCDEST source cleanup while builds are active")
+        return
+
+    retention = server_config.get("srcdest_retention_days", DEFAULT_SRCDEST_RETENTION_DAYS)
+    stats = cleanup_srcdest_sources(srcdest, retention)
+    logger.info(
+        "SRCDEST source cleanup: removed %s files, %s dirs, freed ~%s bytes",
+        stats["removed_files"],
+        stats["removed_dirs"],
+        stats["freed_bytes"],
+    )
+
+
+def monitor_srcdest_cleanup() -> None:
+    """Periodically clean SRCDEST when configured."""
+    interval = server_config.get("srcdest_cleanup_interval", DEFAULT_SRCDEST_CLEANUP_INTERVAL)
+    if interval <= 0:
+        return
+
+    while not shutdown_event.is_set():
+        try:
+            cleanup_srcdest()
+        except Exception as exc:
+            logger.error("SRCDEST cleanup failed: %s", exc)
+        shutdown_event.wait(interval)
 
 
 def unlock_srcdest(lock_fd: int):

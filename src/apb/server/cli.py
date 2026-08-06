@@ -37,6 +37,18 @@ def main() -> None:
     parser.add_argument("--max-file-size", type=int, default=100 * 1024 * 1024, help="Maximum file size in bytes")
     parser.add_argument("--max-request-size", type=int, default=500 * 1024 * 1024, help="Maximum total request size")
     parser.add_argument("--build-timeout", type=int, default=engine.BUILD_TIMEOUT_DEFAULT, help="Maximum build time")
+    parser.add_argument(
+        "--srcdest-cleanup-interval",
+        type=int,
+        default=engine.DEFAULT_SRCDEST_CLEANUP_INTERVAL,
+        help="Seconds between SRCDEST cleanups (0 disables periodic cleanup)",
+    )
+    parser.add_argument(
+        "--srcdest-retention-days",
+        type=int,
+        default=engine.DEFAULT_SRCDEST_RETENTION_DAYS,
+        help="Delete SRCDEST source files and directories older than this many days",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -63,6 +75,8 @@ def main() -> None:
         "max_file_size": args.max_file_size,
         "max_request_size": args.max_request_size,
         "build_timeout": args.build_timeout,
+        "srcdest_cleanup_interval": args.srcdest_cleanup_interval,
+        "srcdest_retention_days": args.srcdest_retention_days,
     }
 
     args.buildroot.mkdir(parents=True, exist_ok=True)

@@ -869,9 +869,21 @@ The server implements sophisticated SRCDEST directory locking for concurrent bui
 
 #### Orphan Lock Cleanup
 - **Startup Cleanup**: Removes orphaned locks from previous server sessions
+- **Periodic Cleanup**: Re-runs orphan lock cleanup on the configured interval when `SRCDEST` is set
 - **Process Detection**: Uses `lsof` to verify if locks are actually held
 - **Age-based Cleanup**: Removes locks older than 5 minutes if lsof unavailable
 - **Graceful Degradation**: Continues build even if locking fails
+
+#### Periodic Source Cleanup
+When `SRCDEST` is defined in `/etc/makepkg.conf`, the server can periodically prune cached source files and directories:
+
+- **CLI Configuration**:
+  - `--srcdest-cleanup-interval SECONDS` (default: `86400`, `0` disables the background task)
+  - `--srcdest-retention-days DAYS` (default: `30`)
+- **Retention Semantics**: Deletes top-level SRCDEST entries whose modification time is older than the retention period
+- **Lock Files**: `.apb-*.lock` files are never removed by source pruning; they are handled by lock cleanup
+- **Active Builds**: Source pruning is skipped while any build is in `BUILDING` status; lock cleanup still runs
+- **No SRCDEST**: When `SRCDEST` is not configured, periodic cleanup is a no-op
 
 #### SRCDEST Configuration
 ```bash

@@ -36,6 +36,15 @@ async def lifespan(app: FastAPI):
     queue_thread = threading.Thread(target=engine.process_build_queue, daemon=True)
     queue_thread.start()
     logger.info("Queue processor thread started: %s", queue_thread.is_alive())
+
+    if engine.server_config.get("srcdest_cleanup_interval", 0) > 0:
+        srcdest_cleanup_thread = threading.Thread(
+            target=engine.monitor_srcdest_cleanup,
+            daemon=True,
+        )
+        srcdest_cleanup_thread.start()
+        logger.info("SRCDEST cleanup thread started")
+
     logger.info("APB Server background tasks started")
 
     yield

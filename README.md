@@ -308,6 +308,8 @@ apb-server --debug
 | `--max-file-size` | `100MB` | Maximum individual upload file size |
 | `--max-request-size` | `500MB` | Maximum total request size |
 | `--build-timeout` | `7200` | Maximum build time in seconds |
+| `--srcdest-cleanup-interval` | `86400` | Seconds between SRCDEST cleanups (`0` disables) |
+| `--srcdest-retention-days` | `30` | Delete cached SRCDEST sources older than this many days |
 | `--debug` | `false` | Enable debug logging |
 
 ### Architecture Detection
