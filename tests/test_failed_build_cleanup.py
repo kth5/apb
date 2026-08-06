@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,10 +16,12 @@ def reset_engine_build_state():
     saved_active = engine.active_builds.copy()
     saved_history = engine.build_history.copy()
     saved_outputs = engine.build_outputs.copy()
+    saved_processes = engine.running_processes.copy()
     try:
         engine.active_builds.clear()
         engine.build_history.clear()
         engine.build_outputs.clear()
+        engine.running_processes.clear()
         yield
     finally:
         engine.active_builds.clear()
@@ -27,6 +30,8 @@ def reset_engine_build_state():
         engine.build_history.update(saved_history)
         engine.build_outputs.clear()
         engine.build_outputs.update(saved_outputs)
+        engine.running_processes.clear()
+        engine.running_processes.update(saved_processes)
         engine.close_build_log("cleanup-test-build")
 
 
@@ -56,25 +61,41 @@ def test_cleanup_failed_build_dir_removes_directory(builds_dir: Path):
     build_dir = builds_dir / build_id
     build_dir.mkdir()
     (build_dir / "build.log").write_text("ERROR\n", encoding="utf-8")
+    engine.build_history[build_id] = {"build_id": build_id, "status": BuildStatus.FAILED}
 
     engine.cleanup_failed_build_dir(build_id, build_dir)
 
     assert not build_dir.exists()
 
 
-def test_finalize_failed_build_cleans_up_directory(builds_dir: Path):
+def test_cleanup_failed_build_dir_skips_while_process_is_tracked(builds_dir: Path):
     build_id = "failed-build-2"
+    build_dir = builds_dir / build_id
+    build_dir.mkdir()
+    engine.active_builds[build_id] = {"build_id": build_id, "status": BuildStatus.FAILED}
+    engine.running_processes[build_id] = MagicMock()
+
+    engine.cleanup_failed_build_dir(build_id, build_dir)
+
+    assert build_dir.exists()
+
+
+def test_finalize_failed_build_defers_directory_cleanup(builds_dir: Path):
+    build_id = "failed-build-3"
     build_dir = _seed_active_failed_build(build_id, builds_dir)
 
     engine.finalize_failed_build(build_id, build_dir, "package build failed", exit_code=2)
 
     assert engine.active_builds[build_id]["status"] == BuildStatus.FAILED
     assert engine.build_history[build_id]["logs"][0]["filename"] == "build.log"
+    assert build_dir.exists()
+
+    engine.cleanup_failed_build_dir(build_id, build_dir)
     assert not build_dir.exists()
 
 
-def test_finalize_failed_build_keeps_log_metadata_after_cleanup(builds_dir: Path):
-    build_id = "failed-build-3"
+def test_finalize_failed_build_keeps_log_metadata_before_cleanup(builds_dir: Path):
+    build_id = "failed-build-4"
     build_dir = _seed_active_failed_build(build_id, builds_dir)
 
     engine.finalize_failed_build(build_id, build_dir, "early failure")
@@ -82,4 +103,6 @@ def test_finalize_failed_build_keeps_log_metadata_after_cleanup(builds_dir: Path
     log_metadata = engine.build_history[build_id]["logs"][0]
     assert log_metadata["filename"] == "build.log"
     assert log_metadata["size"] > 0
+
+    engine.cleanup_failed_build_dir(build_id, build_dir)
     assert not build_dir.exists()

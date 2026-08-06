@@ -282,6 +282,14 @@ def cleanup_build_data():
 
 def cleanup_failed_build_dir(build_id: str, build_dir: Path) -> None:
     """Remove the on-disk build directory for a failed build after logs are finalized."""
+    if build_id in running_processes:
+        logger.info("Skipping cleanup for %s while build process is still tracked", build_id)
+        return
+
+    build_info = active_builds.get(build_id) or build_history.get(build_id)
+    if not build_info or build_info.get("status") != BuildStatus.FAILED:
+        return
+
     if not build_dir.is_dir():
         return
 
@@ -290,6 +298,31 @@ def cleanup_failed_build_dir(build_id: str, build_dir: Path) -> None:
         logger.info("Cleaned up failed build directory for %s", build_id)
     except Exception as exc:
         logger.error("Error cleaning up failed build directory for %s: %s", build_id, exc)
+
+
+def stop_tracked_build_process(build_id: str) -> None:
+    """Stop and untrack a build subprocess if it is still running."""
+    process = running_processes.pop(build_id, None)
+    if process is None or process.poll() is not None:
+        return
+
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.kill()
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        logger.warning("Error stopping build process for %s: %s", build_id, exc)
+        try:
+            process.kill()
+        except Exception:
+            pass
 
 
 def terminate_build(build_id: str):
@@ -931,7 +964,7 @@ def unlock_srcdest(lock_fd: int):
 
 
 def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code: int = 1):
-    """Finalize a failed build with proper logging and cleanup"""
+    """Finalize a failed build with proper logging."""
     try:
         # Update build status
         active_builds[build_id]["status"] = BuildStatus.FAILED
@@ -963,7 +996,6 @@ def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code
         build_history[build_id] = active_builds[build_id].copy()
 
         logger.info(f"Build {build_id} failed: {reason}")
-        cleanup_failed_build_dir(build_id, build_dir)
 
     except Exception as e:
         logger.error(f"Error finalizing failed build {build_id}: {e}")
@@ -975,6 +1007,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
     global build_counter
 
     logger.info(f"build_package called for build {build_id}")
+    should_cleanup_failed_dir = False
 
     try:
         # Update build status
@@ -1086,6 +1119,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     if srcdest_lock:
                         unlock_srcdest(srcdest_lock)
                     finalize_failed_build(build_id, build_dir, "Failed to download GPG keys for custom repositories")
+                    should_cleanup_failed_dir = True
                     return
 
                 # Create custom pacman.conf with custom repositories
@@ -1095,6 +1129,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     if srcdest_lock:
                         unlock_srcdest(srcdest_lock)
                     finalize_failed_build(build_id, build_dir, "Failed to create custom pacman.conf for custom repositories")
+                    should_cleanup_failed_dir = True
                     return
 
             # Build makechrootpkg command with correct flags
@@ -1233,10 +1268,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 log_output(f"Build failed with exit code {process.returncode}")
 
         finally:
+            stop_tracked_build_process(build_id)
             if srcdest_lock:
                 unlock_srcdest(srcdest_lock)
-            if build_id in running_processes:
-                del running_processes[build_id] # Ensure process is removed from tracking
 
         # Finalize build
         active_builds[build_id]["end_time"] = time.time()
@@ -1261,7 +1295,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         build_history[build_id] = active_builds[build_id].copy()
 
         if active_builds[build_id]["status"] == BuildStatus.FAILED:
-            cleanup_failed_build_dir(build_id, build_dir)
+            should_cleanup_failed_dir = True
 
     except Exception as e:
         logger.error(f"Build error: {e}")
@@ -1283,10 +1317,12 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
-        cleanup_failed_build_dir(build_id, build_dir)
+        should_cleanup_failed_dir = True
 
     finally:
         close_build_log(build_id)
+        if should_cleanup_failed_dir:
+            cleanup_failed_build_dir(build_id, build_dir)
 
 
 def process_build_queue():
