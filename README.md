@@ -333,7 +333,7 @@ The server uses Arch Linux's standard build tools:
 ### Server Management
 
 - **Build Monitoring**: View builds at `http://server-host:8000/`
-- **Cleanup**: Trigger cleanup at `http://server-host:8000/admin/cleanup`
+- **Cleanup**: Trigger in-memory build data cleanup at `http://server-host:8000/admin/cleanup`
 - **Health Check**: Monitor health at `http://server-host:8000/health`
 
 ## Running APB Client
@@ -443,7 +443,7 @@ apb --farm --cancel 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 |--------|-------------|
 | `--farm` | Use APB Farm instead of direct server |
 | `--list-servers` | List available servers |
-| `--cleanup` | Trigger server cleanup |
+| `--cleanup` | Trigger in-memory build data cleanup on the server |
 | `--test-arch` | Test architecture compatibility |
 
 ### Client Configuration

@@ -1046,7 +1046,7 @@ def main():
     # Advanced options
     parser.add_argument("--farm", action="store_true", help="Use APB Farm instead of direct server")
     parser.add_argument("--list-servers", action="store_true", help="List available servers")
-    parser.add_argument("--cleanup", action="store_true", help="Trigger server cleanup")
+    parser.add_argument("--cleanup", action="store_true", help="Trigger in-memory build data cleanup on the server")
     parser.add_argument("--test-arch", action="store_true", help="Test architecture compatibility")
 
     args = parser.parse_args()
@@ -1255,7 +1255,7 @@ def main():
 
     if args.cleanup:
         if client.cleanup_server():
-            print("Server cleanup triggered")
+            print("In-memory build data cleanup triggered")
             sys.exit(0)
         else:
             print("Failed to trigger cleanup")

@@ -124,7 +124,7 @@ The server includes comprehensive resource monitoring capabilities:
 - **Memory Management**: Limits in-memory build outputs to 10,000 lines per build (for live `/output` and SSE); the on-disk `build.log` is always written in full as output is produced
 - **History Cleanup**: Maintains only 100 most recent builds in memory
 - **Old Build Removal**: Automatically removes builds older than 1 hour from memory
-- **Disk Cleanup**: Removes build directories older than 7 days
+- **Disk Cleanup**: Removes failed build directories immediately after finalization
 
 ### System Information Response
 Enhanced system information includes:
@@ -764,27 +764,24 @@ Download the latest build file for a package.
 Get cleanup administration page.
 
 **Response:** HTML page with cleanup options including:
-- Disk space usage summary
-- Old build cleanup configuration
+- In-memory build data cleanup
 - Memory usage and cleanup status
 - Manual cleanup triggers
 
 #### POST /admin/cleanup
-Trigger server cleanup with detailed results.
+Trigger in-memory build data cleanup.
 
 **Response:**
 ```json
 {
   "success": true,
-  "message": "Cleanup completed: removed 15 old builds",
+  "message": "In-memory build data cleanup completed",
   "cleanup_id": "cleanup_1642694400"
 }
 ```
 
 **Enhanced Cleanup Features:**
-- **Selective Cleanup**: Removes builds older than 7 days
-- **Memory Cleanup**: Clears build outputs and history
-- **Disk Management**: Removes old build directories
+- **Memory Cleanup**: Clears old build outputs, streams, and trims build history
 - **Error Handling**: Continues cleanup even if some operations fail
 - **Logging**: Detailed logging of cleanup operations
 
@@ -1101,7 +1098,7 @@ The server automatically configures system resource limits:
 - **Processes**: RLIMIT_NPROC set to unlimited
 
 #### Monitoring and Cleanup
-- **Memory Monitoring**: Triggers cleanup at 90% memory usage
-- **Disk Monitoring**: Triggers cleanup at 95% disk usage
+- **Memory Monitoring**: Triggers in-memory cleanup at 90% memory usage
+- **Disk Monitoring**: Logs a warning at 95% disk usage
 - **Build Output Limits**: Maximum 10,000 lines in memory per build (on-disk `build.log` is always complete)
 - **History Limits**: Maximum 100 builds in memory history

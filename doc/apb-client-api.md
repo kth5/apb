@@ -162,7 +162,7 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 
 - `--farm`: Use APB Farm instead of direct server (recommended)
 - `--list-servers`: List and test available servers
-- `--cleanup`: Trigger server cleanup
+- `--cleanup`: Trigger in-memory build data cleanup on the server
 - `--test-arch`: Test architecture compatibility
 
 ---
@@ -664,7 +664,7 @@ def get_latest_successful_build_id(self, is_interactive: bool = True) -> str
 
 #### cleanup_server()
 
-Trigger server cleanup.
+Trigger in-memory build data cleanup on the server.
 
 ```python
 def cleanup_server(self) -> bool

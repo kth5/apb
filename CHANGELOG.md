@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Build servers remove failed build directories from `BUILDS_DIR` immediately after finalizing the build log and status
+- Unit tests for immediate failed build directory cleanup on the build server
+- Unit tests for build server admin in-memory cleanup endpoint
 - `apb --farm --download` can resolve a PKGBUILD's `pkgname`/`pkgbase` and download the latest successful farm build for each architecture in `arch=()`
 - Farm API endpoints `GET /builds/pkgname/{pkgname}`, `GET /builds/pkgname/{pkgname}/latest`, `GET /builds/pkgname/{pkgname}/arch/{arch}/latest`, and `GET /builds/pkgname/{pkgname}/latest-by-arch`
 - Build servers write the full `build.log` to disk as output is produced (no longer limited by in-memory truncation)
@@ -24,12 +27,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Build server `POST /admin/cleanup` and `apb --cleanup` now trigger in-memory build data cleanup only
 - In-memory build output truncation (10,000 lines) no longer affects the on-disk `build.log`; live `/output` and SSE remain memory-limited
 - `nginx-apb-farm.conf` now allowlists all current farm endpoints (email notifications, cache, repositories, pkgname build lookups) with matching method restrictions
 - Project dependencies now require PyPI `multipart>=1.3` instead of Kludex `python-multipart`
 
 ### Removed
 
+- Build server age-based disk cleanup that removed build directories older than 7 days
 - Optional `ruff` development dependency (Rust-based linter/formatter)
 
 ### Fixed

@@ -205,7 +205,6 @@ def monitor_resources():
             disk = psutil.disk_usage(server_config.get("builds_dir", "/tmp"))
             if (disk.used / disk.total) > 0.95:
                 logger.warning(f"High disk usage: {(disk.used / disk.total) * 100:.1f}%")
-                cleanup_old_builds()
 
             # Regular cleanup every hour
             if time.time() - last_cleanup_time > 3600:
@@ -279,32 +278,16 @@ def cleanup_build_data():
         logger.error(f"Error cleaning up build data: {e}")
 
 
-def cleanup_old_builds():
-    """Clean up old build directories"""
+def cleanup_failed_build_dir(build_id: str, build_dir: Path) -> None:
+    """Remove the on-disk build directory for a failed build after logs are finalized."""
+    if not build_dir.is_dir():
+        return
+
     try:
-        builds_dir = Path(server_config.get("builds_dir", "/tmp"))
-        current_time = time.time()
-        week_ago = current_time - (7 * 24 * 60 * 60)
-
-        cleaned_count = 0
-        for build_dir in builds_dir.iterdir():
-            if build_dir.is_dir():
-                try:
-                    if build_dir.stat().st_mtime < week_ago:
-                        shutil.rmtree(build_dir)
-                        cleaned_count += 1
-
-                        # Remove from build_history if present
-                        if build_dir.name in build_history:
-                            del build_history[build_dir.name]
-
-                except Exception as e:
-                    logger.error(f"Error cleaning up {build_dir}: {e}")
-
-        logger.info(f"Cleaned up {cleaned_count} old build directories")
-
-    except Exception as e:
-        logger.error(f"Error cleaning up old builds: {e}")
+        shutil.rmtree(build_dir)
+        logger.info("Cleaned up failed build directory for %s", build_id)
+    except Exception as exc:
+        logger.error("Error cleaning up failed build directory for %s: %s", build_id, exc)
 
 
 def terminate_build(build_id: str):
@@ -892,6 +875,7 @@ def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code
         build_history[build_id] = active_builds[build_id].copy()
 
         logger.info(f"Build {build_id} failed: {reason}")
+        cleanup_failed_build_dir(build_id, build_dir)
 
     except Exception as e:
         logger.error(f"Error finalizing failed build {build_id}: {e}")
@@ -1188,6 +1172,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
 
+        if active_builds[build_id]["status"] == BuildStatus.FAILED:
+            cleanup_failed_build_dir(build_id, build_dir)
+
     except Exception as e:
         logger.error(f"Build error: {e}")
         # Release SRCDEST lock if it was acquired
@@ -1208,6 +1195,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
+        cleanup_failed_build_dir(build_id, build_dir)
 
     finally:
         close_build_log(build_id)

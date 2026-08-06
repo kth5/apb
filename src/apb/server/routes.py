@@ -4,7 +4,6 @@ import json
 import logging
 import platform
 import queue
-import shutil
 import tarfile
 import time
 from datetime import datetime, timezone
@@ -822,7 +821,7 @@ async def admin_cleanup_page():
     <head><title>APB Server Admin - Cleanup</title></head>
     <body>
         <h1>APB Server Administration - Cleanup</h1>
-        <p>Use this page to clean up old builds and temporary files.</p>
+        <p>Use this page to free in-memory build outputs, streams, and trim build history.</p>
         <form method="post" action="/admin/cleanup">
             <button type="submit">Start Cleanup</button>
         </form>
@@ -833,31 +832,14 @@ async def admin_cleanup_page():
 
 @router.post("/admin/cleanup")
 async def admin_cleanup():
-    """Trigger server cleanup"""
+    """Trigger in-memory build data cleanup"""
     try:
         cleanup_id = f"cleanup_{int(time.time())}"
-
-        # Clean up old builds (example: remove builds older than 7 days)
-        builds_dir = Path(engine.server_config["builds_dir"])
-        current_time = time.time()
-        week_ago = current_time - (7 * 24 * 60 * 60)
-
-        cleaned_count = 0
-        for build_dir in builds_dir.iterdir():
-            if build_dir.is_dir():
-                try:
-                    # Check if build is old
-                    if build_dir.stat().st_mtime < week_ago:
-                        shutil.rmtree(build_dir)
-                        cleaned_count += 1
-                except Exception as e:
-                    logger.error(f"Error cleaning up {build_dir}: {e}")
-
-        logger.info(f"Cleanup completed: removed {cleaned_count} old builds")
+        engine.cleanup_build_data()
 
         return {
             "success": True,
-            "message": f"Cleanup completed: removed {cleaned_count} old builds",
+            "message": "In-memory build data cleanup completed",
             "cleanup_id": cleanup_id
         }
 

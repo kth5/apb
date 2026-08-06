@@ -422,12 +422,12 @@ class APBotClient:
 
     def cleanup_server(self) -> bool:
         """
-        Trigger server cleanup.
+        Trigger in-memory build data cleanup on the server.
 
         Returns:
             True if cleanup was triggered successfully
         """
-        url = urljoin(self.server_url, '/cleanup')
+        url = urljoin(self.server_url, '/admin/cleanup')
         try:
             response = self.session.post(url)
             response.raise_for_status()
