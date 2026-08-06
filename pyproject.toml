@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "apb"
-version = "2026.06.30"
+version = "2026.08.06"
 description = "Arch Package Builder - distributed package building system"
 readme = "README.md"
 license = "MIT"
