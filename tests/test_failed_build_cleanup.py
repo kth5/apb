@@ -56,28 +56,59 @@ def _seed_active_failed_build(build_id: str, builds_dir: Path) -> Path:
     return build_dir
 
 
-def test_cleanup_failed_build_dir_removes_directory(builds_dir: Path):
+def test_cleanup_failed_build_dir_keeps_build_log(builds_dir: Path):
     build_id = "failed-build-1"
     build_dir = builds_dir / build_id
     build_dir.mkdir()
     (build_dir / "build.log").write_text("ERROR\n", encoding="utf-8")
+    (build_dir / "PKGBUILD").write_text("pkgname=test\n", encoding="utf-8")
+    (build_dir / "src").mkdir()
+    (build_dir / "src" / "source.tar.gz").write_bytes(b"payload")
     engine.build_history[build_id] = {"build_id": build_id, "status": BuildStatus.FAILED}
 
     engine.cleanup_failed_build_dir(build_id, build_dir)
 
-    assert not build_dir.exists()
+    assert build_dir.is_dir()
+    assert (build_dir / "build.log").read_text(encoding="utf-8") == "ERROR\n"
+    assert not (build_dir / "PKGBUILD").exists()
+    assert not (build_dir / "src").exists()
 
 
 def test_cleanup_failed_build_dir_skips_while_process_is_tracked(builds_dir: Path):
     build_id = "failed-build-2"
     build_dir = builds_dir / build_id
     build_dir.mkdir()
+    (build_dir / "PKGBUILD").write_text("pkgname=test\n", encoding="utf-8")
     engine.active_builds[build_id] = {"build_id": build_id, "status": BuildStatus.FAILED}
     engine.running_processes[build_id] = MagicMock()
 
     engine.cleanup_failed_build_dir(build_id, build_dir)
 
-    assert build_dir.exists()
+    assert (build_dir / "PKGBUILD").exists()
+
+
+def test_cleanup_failed_build_dir_skips_successful_build(builds_dir: Path):
+    build_id = "completed-build-1"
+    build_dir = builds_dir / build_id
+    build_dir.mkdir()
+    (build_dir / "test-1-1-any.pkg.tar.zst").write_bytes(b"package")
+    engine.build_history[build_id] = {"build_id": build_id, "status": BuildStatus.COMPLETED}
+
+    engine.cleanup_failed_build_dir(build_id, build_dir)
+
+    assert (build_dir / "test-1-1-any.pkg.tar.zst").exists()
+
+
+def test_cleanup_failed_build_dir_skips_building_build(builds_dir: Path):
+    build_id = "building-build-1"
+    build_dir = builds_dir / build_id
+    build_dir.mkdir()
+    (build_dir / "PKGBUILD").write_text("pkgname=test\n", encoding="utf-8")
+    engine.active_builds[build_id] = {"build_id": build_id, "status": BuildStatus.BUILDING}
+
+    engine.cleanup_failed_build_dir(build_id, build_dir)
+
+    assert (build_dir / "PKGBUILD").exists()
 
 
 def test_finalize_failed_build_defers_directory_cleanup(builds_dir: Path):
@@ -88,21 +119,23 @@ def test_finalize_failed_build_defers_directory_cleanup(builds_dir: Path):
 
     assert engine.active_builds[build_id]["status"] == BuildStatus.FAILED
     assert engine.build_history[build_id]["logs"][0]["filename"] == "build.log"
-    assert build_dir.exists()
+    assert (build_dir / "PKGBUILD").exists()
 
     engine.cleanup_failed_build_dir(build_id, build_dir)
-    assert not build_dir.exists()
+    assert not (build_dir / "PKGBUILD").exists()
 
 
-def test_finalize_failed_build_keeps_log_metadata_before_cleanup(builds_dir: Path):
+def test_failed_build_log_stays_downloadable_after_cleanup(builds_dir: Path):
     build_id = "failed-build-4"
     build_dir = _seed_active_failed_build(build_id, builds_dir)
 
     engine.finalize_failed_build(build_id, build_dir, "early failure")
+    engine.cleanup_failed_build_dir(build_id, build_dir)
 
     log_metadata = engine.build_history[build_id]["logs"][0]
-    assert log_metadata["filename"] == "build.log"
-    assert log_metadata["size"] > 0
+    log_path = build_dir / "build.log"
 
-    engine.cleanup_failed_build_dir(build_id, build_dir)
-    assert not build_dir.exists()
+    assert log_metadata["filename"] == "build.log"
+    assert log_path.is_file()
+    assert log_path.stat().st_size == log_metadata["size"]
+    assert "early failure" in log_path.read_text(encoding="utf-8")

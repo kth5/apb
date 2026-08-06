@@ -50,6 +50,9 @@ DEFAULT_SRCDEST_CLEANUP_INTERVAL = 86400
 DEFAULT_SRCDEST_RETENTION_DAYS = 30
 BUILD_TIMEOUT = BUILD_TIMEOUT_DEFAULT
 
+# Kept on disk after a failed build so the farm and clients can still download it
+FAILED_BUILD_RETAINED_FILES = {"build.log"}
+
 # Global state
 build_queue = queue.Queue()
 active_builds: Dict[str, Dict] = {}
@@ -281,7 +284,7 @@ def cleanup_build_data():
 
 
 def cleanup_failed_build_dir(build_id: str, build_dir: Path) -> None:
-    """Remove the on-disk build directory for a failed build after logs are finalized."""
+    """Purge sources and artifacts of a failed build, keeping build.log downloadable."""
     if build_id in running_processes:
         logger.info("Skipping cleanup for %s while build process is still tracked", build_id)
         return
@@ -293,11 +296,25 @@ def cleanup_failed_build_dir(build_id: str, build_dir: Path) -> None:
     if not build_dir.is_dir():
         return
 
-    try:
-        shutil.rmtree(build_dir)
-        logger.info("Cleaned up failed build directory for %s", build_id)
-    except Exception as exc:
-        logger.error("Error cleaning up failed build directory for %s: %s", build_id, exc)
+    removed_count = 0
+    for entry in build_dir.iterdir():
+        if entry.name in FAILED_BUILD_RETAINED_FILES:
+            continue
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed_count += 1
+        except Exception as exc:
+            logger.error("Error removing %s for failed build %s: %s", entry, build_id, exc)
+
+    logger.info(
+        "Cleaned up failed build %s: removed %s entries, retained %s",
+        build_id,
+        removed_count,
+        ", ".join(sorted(FAILED_BUILD_RETAINED_FILES)),
+    )
 
 
 def stop_tracked_build_process(build_id: str) -> None:

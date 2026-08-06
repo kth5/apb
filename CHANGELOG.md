@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - Build server periodic SRCDEST cleanup: orphaned lock removal and age-based pruning of cached source files when `SRCDEST` is set in `/etc/makepkg.conf`, configurable via `--srcdest-cleanup-interval` and `--srcdest-retention-days`
-- Build servers remove failed build directories from `BUILDS_DIR` immediately after finalizing the build log and status
+- Build servers purge failed build sources and artifacts from `BUILDS_DIR` immediately after finalizing the build, retaining `build.log` so the farm and clients can still download it
 - Unit tests for immediate failed build directory cleanup on the build server
 - Unit tests for build server admin in-memory cleanup endpoint
 - `apb --farm --download` can resolve a PKGBUILD's `pkgname`/`pkgbase` and download the latest successful farm build for each architecture in `arch=()`
@@ -41,6 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - Build servers no longer remove failed build directories while the build subprocess is still running; cleanup runs only after the process exits and logs are finalized
+- Failed-build cleanup explicitly preserves directories for builds still in the `BUILDING` state
+- Failed build cleanup no longer deletes `build.log` before the farm has fetched it, which made farm artifact caching return 404
 - `apb --farm --login` no longer raises `NameError` because `getpass` was not imported in the client CLI
 - Client no longer raises `UnboundLocalError` in `check_package_exists` when the output directory is missing (local variable shadowed the `package_arch_suffix` import)
 - Build servers drain makechrootpkg stdout in large binary chunks without a per-line sleep, and flush `build.log` periodically, so high-volume builds no longer stall on a full pipe buffer

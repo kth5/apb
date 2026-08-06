@@ -124,7 +124,7 @@ The server includes comprehensive resource monitoring capabilities:
 - **Memory Management**: Limits in-memory build outputs to 10,000 lines per build (for live `/output` and SSE); the on-disk `build.log` is always written in full as output is produced
 - **History Cleanup**: Maintains only 100 most recent builds in memory
 - **Old Build Removal**: Automatically removes builds older than 1 hour from memory
-- **Disk Cleanup**: Removes failed build directories immediately after finalization
+- **Disk Cleanup**: Removes failed build sources and artifacts immediately after finalization; `build.log` is retained so it stays downloadable
 
 ### System Information Response
 Enhanced system information includes:
