@@ -93,3 +93,62 @@ pkgver=1.0.0
     info = parse_pkgbuild(content)
     assert info.pkgname_list == ["foo", "foo-docs"]
     assert info.pkgname == "foo"
+
+
+def test_parse_pkgbuild_multiline_apb_extra_repos():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=('x86_64' 'aarch64')
+apb_extra_repos=(
+    "extra-any::https://repo.wii-linux.org/arch/extra/any"
+    "extra::https://repo.wii-linux.org/arch/extra/$arch"
+)
+"""
+    info = parse_pkgbuild(content)
+    assert info.extra_repos == [
+        "extra-any::https://repo.wii-linux.org/arch/extra/any",
+        "extra::https://repo.wii-linux.org/arch/extra/$arch",
+    ]
+
+
+def test_parse_pkgbuild_multiline_arch_and_pkgname():
+    content = """
+pkgname=(
+    'foo'
+    'foo-docs'
+)
+arch=(
+    'x86_64'
+    'aarch64'
+)
+pkgver=1.0.0
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgname_list == ["foo", "foo-docs"]
+    assert info.pkgname == "foo"
+    assert info.arch == ["x86_64", "aarch64"]
+
+
+def test_parse_pkgbuild_apb_extra_repos_preserves_pacman_arch():
+    """$arch/$repo in repo URLs must stay literal for pacman.conf matching."""
+    content = """
+arch=('x86_64')
+_base=https://repo.example.com
+apb_extra_repos=("extra::${_base}/arch/extra/$arch" "other::https://repo.example.com/$repo")
+"""
+    info = parse_pkgbuild(content)
+    assert info.extra_repos == [
+        "extra::https://repo.example.com/arch/extra/$arch",
+        "other::https://repo.example.com/$repo",
+    ]
+
+
+def test_parse_pkgbuild_arch_first_element_available_elsewhere():
+    content = """
+arch=('aarch64' 'x86_64')
+pkgname="pkg-$arch"
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgname == "pkg-aarch64"

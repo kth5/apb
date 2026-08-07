@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [ UNRELEASED ]
+
+### Fixed
+
+- PKGBUILD parser now collects multi-line bash arrays (`apb_extra_repos=(...)`, `arch=(...)`, `pkgname=(...)`) instead of treating a lone `(` as a repository name and rejecting farm submissions
+- `apb_extra_repos` URLs preserve pacman `$arch` / `$repo` placeholders so they match admin-configured repository URLs and expand at pacman runtime; other `${var}` references in those URLs still expand normally
+
 ## 2026.08.06
 
 ### Added

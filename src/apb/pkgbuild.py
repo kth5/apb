@@ -4,9 +4,13 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+# Pacman Server URL placeholders; leave intact in apb_extra_repos so they match
+# admin-configured URLs and expand at pacman runtime.
+_PACMAN_URL_VARS = frozenset({"arch", "repo"})
 
 
 @dataclass
@@ -28,15 +32,29 @@ def _strip_value(value: str) -> str:
     return value.strip().strip("'\"")
 
 
-def _substitute_variables(text: str, variables: dict[str, str]) -> str:
+def _substitute_variables(
+    text: str,
+    variables: dict[str, str],
+    *,
+    preserve: Optional[Set[str]] = None,
+) -> str:
+    preserve_names = preserve or set()
+
     def replace(match: re.Match[str]) -> str:
         name = match.group(1) or match.group(2)
+        if name in preserve_names:
+            return match.group(0)
         return variables.get(name, "")
 
     return _VAR_REF_PATTERN.sub(replace, text)
 
 
-def _resolve_value(value: str, variables: dict[str, str]) -> str:
+def _resolve_value(
+    value: str,
+    variables: dict[str, str],
+    *,
+    preserve: Optional[Set[str]] = None,
+) -> str:
     """Resolve a scalar PKGBUILD assignment value with bash-like variable expansion."""
     value = value.strip()
     if not value:
@@ -46,15 +64,72 @@ def _resolve_value(value: str, variables: dict[str, str]) -> str:
         return value[1:-1]
 
     if value[0] == '"' and value.endswith('"') and len(value) >= 2:
-        return _substitute_variables(value[1:-1], variables)
+        return _substitute_variables(value[1:-1], variables, preserve=preserve)
 
-    return _substitute_variables(_strip_value(value), variables)
+    return _substitute_variables(_strip_value(value), variables, preserve=preserve)
 
 
-def _parse_array(value: str, variables: Optional[dict[str, str]] = None) -> List[str]:
+def _parens_balanced(text: str) -> bool:
+    """Return True when parentheses are balanced outside of quoted strings."""
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if in_single:
+            if char == "'":
+                in_single = False
+        elif in_double:
+            if char == "\\" and i + 1 < len(text):
+                i += 2
+                continue
+            if char == '"':
+                in_double = False
+        elif char == "'":
+            in_single = True
+        elif char == '"':
+            in_double = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return True
+        i += 1
+    return depth <= 0
+
+
+def _read_assignment_value(lines: List[str], start_idx: int, initial_value: str) -> tuple[str, int]:
+    """Collect a full assignment value, joining multi-line arrays until ')'."""
+    value = initial_value.strip()
+    idx = start_idx
+    if not value.startswith("(") or _parens_balanced(value):
+        return value, idx
+
+    parts = [value]
+    idx += 1
+    while idx < len(lines):
+        parts.append(lines[idx].strip())
+        joined = " ".join(parts)
+        if _parens_balanced(joined):
+            return joined, idx
+        idx += 1
+    return " ".join(parts), idx
+
+
+def _parse_array(
+    value: str,
+    variables: Optional[dict[str, str]] = None,
+    *,
+    preserve: Optional[Set[str]] = None,
+) -> List[str]:
     value = value.strip()
     if value.startswith("(") and value.endswith(")"):
         value = value[1:-1].strip()
+    elif value.startswith("(") and not _parens_balanced(value):
+        # Incomplete array (e.g. lone "("); treat as empty rather than ['(']
+        return []
     if not value:
         return []
 
@@ -62,7 +137,7 @@ def _parse_array(value: str, variables: Optional[dict[str, str]] = None) -> List
         return [_strip_value(item) for item in re.split(r"\s+", value) if item.strip("'\"")]
 
     return [
-        _resolve_value(item, variables)
+        _resolve_value(item, variables, preserve=preserve)
         for item in re.split(r"\s+", value)
         if item.strip("'\"")
     ]
@@ -80,13 +155,17 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
     info = PkgbuildInfo()
     pkgbase: Optional[str] = None
     variables: dict[str, str] = {}
+    lines = content.splitlines()
+    line_idx = 0
 
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
+    while line_idx < len(lines):
+        line = lines[line_idx].strip()
         assignment = _extract_assignment(line)
         if not assignment:
+            line_idx += 1
             continue
         key, value = assignment
+        value, line_idx = _read_assignment_value(lines, line_idx, value)
 
         if key == "pkgbase":
             pkgbase = _resolve_value(value, variables)
@@ -97,6 +176,7 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
                 info.pkgname_list = names
                 if names:
                     info.pkgname = names[0]
+                    variables[key] = names[0]
             else:
                 name = _resolve_value(value, variables)
                 info.pkgname = name
@@ -113,8 +193,14 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
             variables[key] = info.epoch
         elif key == "arch":
             info.arch = _parse_array(value, variables) or info.arch
+            if info.arch:
+                variables[key] = info.arch[0]
         elif key == "apb_extra_repos":
-            info.extra_repos = _parse_array(value, variables)
+            info.extra_repos = _parse_array(
+                value,
+                variables,
+                preserve=set(_PACMAN_URL_VARS),
+            )
         elif key == "apb_output_timeout":
             timeout_str = _resolve_value(value.split("#", 1)[0], variables)
             try:
@@ -129,6 +215,8 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
                 logger.warning("Invalid apb_output_timeout value '%s', ignoring", timeout_str)
         elif not value.startswith("("):
             variables[key] = _resolve_value(value, variables)
+
+        line_idx += 1
 
     if pkgbase:
         info.pkgname = pkgbase

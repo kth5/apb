@@ -714,14 +714,16 @@ Users can specify custom repositories in their PKGBUILD files using the followin
 ```bash
 apb_extra_repos=(
   reponame::https://myrepo.example.com
-  anotherrepo::https://another.example.com
+  anotherrepo::https://another.example.com/$arch
 )
 ```
+
+Multi-line and single-line array forms are both accepted. Pacman placeholders `$arch` and `$repo` in repository URLs are preserved (not expanded by the PKGBUILD parser) so they must match the admin-configured URL literally and are expanded by pacman when the custom `pacman.conf` is used. Other bash-style `${var}` references in those URLs are expanded normally.
 
 #### Repository Validation
 
 - All requested repositories must be pre-configured by an administrator
-- Repository URLs must match exactly what was configured
+- Repository URLs must match exactly what was configured (including literal `$arch` / `$repo` if used)
 - GPG keys must be valid and trusted
 - Builds will fail if invalid repositories are requested
 - Builds fail immediately if custom repository setup fails (GPG key download or pacman.conf modification)
