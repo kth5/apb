@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Client build tarballs no longer include the output directory, build artifacts (`.pkg.tar.*`, `.sig`, `.log`), or common non-source paths (`pkg/`, `.git/`, etc.)
 - PKGBUILD parser now collects multi-line bash arrays (`apb_extra_repos=(...)`, `arch=(...)`, `pkgname=(...)`) instead of treating a lone `(` as a repository name and rejecting farm submissions
 - `apb_extra_repos` URLs preserve pacman `$arch` / `$repo` placeholders so they match admin-configured repository URLs and expand at pacman runtime; other `${var}` references in those URLs still expand normally
 

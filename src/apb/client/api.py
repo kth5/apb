@@ -8,7 +8,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, Iterable, List, Optional
 from urllib.parse import urljoin
 
 import httpx
@@ -41,7 +41,11 @@ class APBotClient:
             headers = self.auth_client.get_auth_headers()
             self.session.headers.update(headers)
 
-    def build_package(self, build_path: Path) -> str:
+    def build_package(
+        self,
+        build_path: Path,
+        exclude_paths: Optional[Iterable[Path]] = None,
+    ) -> str:
         """
         Submit a build request to the server using a tarball of all files in the build directory.
 
@@ -63,7 +67,7 @@ class APBotClient:
 
         with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
             try:
-                create_build_tarball(build_path, Path(temp_tarball.name))
+                create_build_tarball(build_path, Path(temp_tarball.name), exclude_paths=exclude_paths)
 
                 # Submit the tarball using streaming to avoid memory issues
                 with open(temp_tarball.name, 'rb') as f:

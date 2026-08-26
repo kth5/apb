@@ -221,7 +221,12 @@ def download_latest_from_pkgbuild(
     return all(results)
 
 
-def submit_build(server_url: str, build_path: Path, auth_client: Optional[APBAuthClient] = None) -> Optional[str]:
+def submit_build(
+    server_url: str,
+    build_path: Path,
+    auth_client: Optional[APBAuthClient] = None,
+    exclude_paths: Optional[List[Path]] = None,
+) -> Optional[str]:
     """
     Submit a build to a server using a tarball of the build directory.
 
@@ -235,12 +240,19 @@ def submit_build(server_url: str, build_path: Path, auth_client: Optional[APBAut
     """
     try:
         client = APBotClient(server_url, auth_client)
-        return client.build_package(build_path)
+        return client.build_package(build_path, exclude_paths=exclude_paths)
     except httpx.HTTPError:
         return None
 
 
-def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[str] = None, auth_client: Optional[APBAuthClient] = None, build_timeout: Optional[int] = None) -> Optional[Dict]:
+def submit_build_to_farm(
+    server_url: str,
+    build_path: Path,
+    architectures: List[str] = None,
+    auth_client: Optional[APBAuthClient] = None,
+    build_timeout: Optional[int] = None,
+    exclude_paths: Optional[List[Path]] = None,
+) -> Optional[Dict]:
     """
     Submit a build to a farm server using a tarball and return the full response.
 
@@ -269,7 +281,7 @@ def submit_build_to_farm(server_url: str, build_path: Path, architectures: List[
 
         with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
             try:
-                create_build_tarball(build_path, Path(temp_tarball.name))
+                create_build_tarball(build_path, Path(temp_tarball.name), exclude_paths=exclude_paths)
 
                 # Prepare form data
                 form_data = {}
@@ -875,7 +887,9 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                 if verbose:
                     print(f"[{arch}] Submitting build to {server_url}...")
 
-                build_id = submit_build(server_url, build_path, auth_client)
+                build_id = submit_build(
+                    server_url, build_path, auth_client, exclude_paths=[output_dir]
+                )
                 if build_id:
                     print(f"[{arch}] Build submitted: {build_id}")
                     arch_build_info[arch] = {
@@ -1329,7 +1343,14 @@ def main():
 
             if args.farm:
                 # Handle farm submission with multiple architectures
-                response = submit_build_to_farm(server_url, build_path, architectures_needing_build, auth_client, args.build_timeout)
+                response = submit_build_to_farm(
+                    server_url,
+                    build_path,
+                    architectures_needing_build,
+                    auth_client,
+                    args.build_timeout,
+                    exclude_paths=[args.output_dir],
+                )
                 if response:
                     if 'builds' in response and response['builds']:
                         # Multi-architecture farm response
@@ -1411,7 +1432,9 @@ def main():
                     sys.exit(1)
             else:
                 # Handle direct server submission (single architecture)
-                build_id = submit_build(server_url, build_path, auth_client)
+                build_id = submit_build(
+                    server_url, build_path, auth_client, exclude_paths=[args.output_dir]
+                )
                 if build_id:
                     print(f"Build submitted: {build_id}")
 
