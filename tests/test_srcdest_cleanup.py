@@ -1,8 +1,10 @@
-"""Unit tests for periodic SRCDEST cleanup on the build server."""
+"""Unit tests for SRCDEST configuration and periodic cleanup on the build server."""
 
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -114,3 +116,111 @@ def test_monitor_srcdest_cleanup_runs_once_before_waiting():
             engine.monitor_srcdest_cleanup()
 
     cleanup_mock.assert_called_once()
+
+
+HOST_MAKEPKG_CONF = """#!/hint/bash
+SRCDEST=/var/cache/makepkg/sources
+export CCACHE_DIR="/var/cache/ccache"
+"""
+
+
+@pytest.fixture
+def host_conf_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    conf_dir = tmp_path / "etc"
+    conf_dir.mkdir()
+    (conf_dir / "makepkg.conf").write_text(HOST_MAKEPKG_CONF, encoding="utf-8")
+    (conf_dir / "pacman.conf").write_text("[options]\nArchitecture = auto\n", encoding="utf-8")
+    monkeypatch.setattr(engine, "HOST_CONF_DIR", conf_dir)
+    return conf_dir
+
+
+def _fake_sudo_run(command, **_kwargs) -> subprocess.CompletedProcess:
+    """Stand in for the privileged `sudo cp` calls made while setting up the chroot."""
+    if command[:2] == ["sudo", "cp"]:
+        shutil.copy(command[2], command[3])
+    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+
+def test_get_makepkg_config_falls_back_to_makepkg_conf(host_conf_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(engine, "server_config", {})
+
+    config = engine.get_makepkg_config()
+
+    assert config["SRCDEST"] == "/var/cache/makepkg/sources"
+    assert config["CCACHE_DIR"] == "/var/cache/ccache"
+
+
+def test_get_makepkg_config_prefers_cli_srcdest(
+    host_conf_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    override = tmp_path / "cli-sources"
+    monkeypatch.setattr(engine, "server_config", {"srcdest": override})
+
+    config = engine.get_makepkg_config()
+
+    assert config["SRCDEST"] == str(override)
+    assert config["CCACHE_DIR"] == "/var/cache/ccache"
+
+
+def test_get_makepkg_config_cli_srcdest_without_conf_entry(
+    host_conf_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (host_conf_dir / "makepkg.conf").write_text("#SRCDEST=/var/cache/makepkg/sources\n", encoding="utf-8")
+    override = tmp_path / "cli-sources"
+    monkeypatch.setattr(engine, "server_config", {"srcdest": override})
+
+    assert engine.get_makepkg_config() == {"SRCDEST": str(override)}
+
+
+def test_apply_srcdest_override_replaces_active_assignment():
+    result = engine.apply_srcdest_override(HOST_MAKEPKG_CONF, "/data/sources")
+
+    assert 'SRCDEST="/data/sources"' in result
+    assert "SRCDEST=/var/cache/makepkg/sources" not in result
+    assert 'export CCACHE_DIR="/var/cache/ccache"' in result
+
+
+def test_apply_srcdest_override_appends_when_only_commented_out():
+    conf_text = "#SRCDEST=/var/cache/makepkg/sources\nBUILDDIR=/tmp/build\n"
+
+    result = engine.apply_srcdest_override(conf_text, "/data/sources")
+
+    assert result.splitlines() == [
+        "#SRCDEST=/var/cache/makepkg/sources",
+        "BUILDDIR=/tmp/build",
+        'SRCDEST="/data/sources"',
+    ]
+
+
+def test_setup_buildroot_writes_srcdest_override_into_chroot_conf(
+    host_conf_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    buildroot = tmp_path / "buildroot"
+    chroot_etc = buildroot / "root" / "etc"
+    chroot_etc.mkdir(parents=True)
+    override = tmp_path / "cli-sources"
+    monkeypatch.setattr(engine, "server_config", {"srcdest": override})
+
+    with patch.object(engine.subprocess, "run", side_effect=_fake_sudo_run):
+        assert engine.setup_buildroot(buildroot)
+
+    chroot_conf = chroot_etc / "makepkg.conf"
+    chroot_conf_text = chroot_conf.read_text(encoding="utf-8")
+    assert f'SRCDEST="{override}"' in chroot_conf_text
+    assert "SRCDEST=/var/cache/makepkg/sources" not in chroot_conf_text
+    assert chroot_conf.stat().st_mode & 0o777 == 0o644
+    assert not (buildroot / ".makepkg.conf.apb").exists()
+
+
+def test_setup_buildroot_keeps_host_conf_without_override(
+    host_conf_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    buildroot = tmp_path / "buildroot"
+    chroot_etc = buildroot / "root" / "etc"
+    chroot_etc.mkdir(parents=True)
+    monkeypatch.setattr(engine, "server_config", {})
+
+    with patch.object(engine.subprocess, "run", side_effect=_fake_sudo_run):
+        assert engine.setup_buildroot(buildroot)
+
+    assert (chroot_etc / "makepkg.conf").read_text(encoding="utf-8") == HOST_MAKEPKG_CONF

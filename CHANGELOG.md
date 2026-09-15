@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [ UNRELEASED ]
 
+### Added
+
+- `apb-server --srcdest PATH` overrides `SRCDEST` from `/etc/makepkg.conf`; the directory is created if missing, written into the buildroot's `makepkg.conf`, and used for source locking, bind mounting, and periodic cleanup
+- Unit tests for SRCDEST command-line precedence, `makepkg.conf` fallback, and buildroot configuration updates
+
 ### Fixed
 
 - Client build tarballs no longer include the output directory, build artifacts (`.pkg.tar.*`, `.sig`, `.log`), or common non-source paths (`pkg/`, `.git/`, etc.)

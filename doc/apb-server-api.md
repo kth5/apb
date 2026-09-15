@@ -875,7 +875,7 @@ The server implements sophisticated SRCDEST directory locking for concurrent bui
 - **Graceful Degradation**: Continues build even if locking fails
 
 #### Periodic Source Cleanup
-When `SRCDEST` is defined in `/etc/makepkg.conf`, the server can periodically prune cached source files and directories:
+When `SRCDEST` is configured, the server can periodically prune cached source files and directories:
 
 - **CLI Configuration**:
   - `--srcdest-cleanup-interval SECONDS` (default: `86400`, `0` disables the background task)
@@ -891,6 +891,18 @@ When `SRCDEST` is defined in `/etc/makepkg.conf`, the server can periodically pr
 SRCDEST="/data/sources"  # Shared source directory
 CCACHE_DIR="/data/ccache"  # Shared ccache directory
 ```
+
+The `SRCDEST` value from `/etc/makepkg.conf` can be overridden on the command line:
+
+```bash
+apb-server --srcdest /data/sources
+```
+
+- **Precedence**: `--srcdest` wins over `SRCDEST` in `/etc/makepkg.conf`; without it, the file value is used as before
+- **Directory Creation**: The directory is created at startup if it does not exist
+- **Buildroot Configuration**: The effective `SRCDEST` is written into the chroot's `/etc/makepkg.conf` when the buildroot is created or recreated
+- **Scope**: The effective value is used for lock files, the `makechrootpkg -d` bind mount, startup lock cleanup, and periodic source cleanup
+- **CCACHE_DIR**: Still read from `/etc/makepkg.conf` only
 
 ### Buildroot Management
 
@@ -911,6 +923,7 @@ apb-server.py --buildroot-autorecreate 50
 
 #### Configuration Management
 - **Host Configuration**: Copies `/etc/makepkg.conf` and `/etc/pacman.conf` to chroot
+- **SRCDEST Override**: Rewrites the chroot's `SRCDEST` when `--srcdest` is set
 - **Dependency Management**: Installs base, base-devel, and ccache packages
 - **Permission Handling**: Proper sudo permissions for chroot operations
 
@@ -1048,6 +1061,11 @@ Server behavior can be configured via command line arguments and environment var
 
 #### Architecture and Platform
 - `--architecture`: Override detected architecture (e.g., 'powerpc' for espresso)
+
+#### Source Cache
+- `--srcdest`: Shared source directory, overriding `SRCDEST` from `/etc/makepkg.conf`
+- `--srcdest-cleanup-interval`: Seconds between SRCDEST cleanups (default: 86400, `0` disables)
+- `--srcdest-retention-days`: Delete cached SRCDEST sources older than this many days (default: 30)
 
 #### File Size Limits
 - `--max-file-size`: Maximum individual file size in bytes (default: 100MB)

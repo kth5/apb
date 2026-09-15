@@ -38,6 +38,11 @@ def main() -> None:
     parser.add_argument("--max-request-size", type=int, default=500 * 1024 * 1024, help="Maximum total request size")
     parser.add_argument("--build-timeout", type=int, default=engine.BUILD_TIMEOUT_DEFAULT, help="Maximum build time")
     parser.add_argument(
+        "--srcdest",
+        type=engine.Path,
+        help="Shared source directory, overriding SRCDEST from /etc/makepkg.conf",
+    )
+    parser.add_argument(
         "--srcdest-cleanup-interval",
         type=int,
         default=engine.DEFAULT_SRCDEST_CLEANUP_INTERVAL,
@@ -75,12 +80,16 @@ def main() -> None:
         "max_file_size": args.max_file_size,
         "max_request_size": args.max_request_size,
         "build_timeout": args.build_timeout,
+        "srcdest": args.srcdest,
         "srcdest_cleanup_interval": args.srcdest_cleanup_interval,
         "srcdest_retention_days": args.srcdest_retention_days,
     }
 
     args.buildroot.mkdir(parents=True, exist_ok=True)
     args.builds_dir.mkdir(parents=True, exist_ok=True)
+    if args.srcdest:
+        args.srcdest.mkdir(parents=True, exist_ok=True)
+        logger.info("Using SRCDEST override: %s", args.srcdest)
 
     logger.info("Starting APB Server v%s", VERSION)
     logger.info("Detected server architecture: %s", engine.get_server_architecture())

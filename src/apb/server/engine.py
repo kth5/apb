@@ -49,6 +49,7 @@ DEFAULT_MAX_CONCURRENT = 3
 DEFAULT_SRCDEST_CLEANUP_INTERVAL = 86400
 DEFAULT_SRCDEST_RETENTION_DAYS = 30
 BUILD_TIMEOUT = BUILD_TIMEOUT_DEFAULT
+HOST_CONF_DIR = Path("/etc")
 
 # Kept on disk after a failed build so the farm and clients can still download it
 FAILED_BUILD_RETAINED_FILES = {"build.log"}
@@ -596,14 +597,24 @@ def setup_buildroot(buildroot_path: Path) -> bool:
 
         # Always copy host configuration files into the chroot after mkarchroot
         chroot_etc = root_path / "etc"
+        srcdest_override = get_srcdest_override()
 
         for conf_name in ("makepkg.conf", "pacman.conf"):
-            host_conf = Path("/etc") / conf_name
+            host_conf = HOST_CONF_DIR / conf_name
             chroot_conf = chroot_etc / conf_name
             if host_conf.exists():
                 logger.info(f"Copying host /etc/{conf_name} to chroot")
+                source_conf = host_conf
+                staged_conf = None
                 try:
-                    cmd = ["sudo", "cp", str(host_conf), str(chroot_conf)]
+                    if conf_name == "makepkg.conf" and srcdest_override:
+                        logger.info(f"Overriding chroot SRCDEST with {srcdest_override}")
+                        staged_conf = stage_makepkg_conf_override(
+                            host_conf, buildroot_path, srcdest_override
+                        )
+                        source_conf = staged_conf
+
+                    cmd = ["sudo", "cp", str(source_conf), str(chroot_conf)]
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     if result.returncode != 0:
                         logger.error(f"Failed to copy {conf_name}: {result.stderr}")
@@ -611,6 +622,9 @@ def setup_buildroot(buildroot_path: Path) -> bool:
                 except Exception as e:
                     logger.error(f"Failed to copy {conf_name}: {e}")
                     return False
+                finally:
+                    if staged_conf is not None:
+                        staged_conf.unlink(missing_ok=True)
             else:
                 logger.warning(f"Host /etc/{conf_name} not found")
 
@@ -620,11 +634,12 @@ def setup_buildroot(buildroot_path: Path) -> bool:
         return False
 
 
-def get_makepkg_config() -> Dict[str, str]:
-    """Parse /etc/makepkg.conf for SRCDEST and CCACHE_DIR"""
+def parse_makepkg_conf(conf_path: Optional[Path] = None) -> Dict[str, str]:
+    """Parse a makepkg.conf for SRCDEST and CCACHE_DIR"""
+    conf_path = conf_path or HOST_CONF_DIR / "makepkg.conf"
     config = {}
     try:
-        with open('/etc/makepkg.conf', 'r') as f:
+        with open(conf_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if line.startswith('SRCDEST=') and not line.startswith('#'):
@@ -632,9 +647,53 @@ def get_makepkg_config() -> Dict[str, str]:
                 elif line.startswith('export CCACHE_DIR=') and not line.startswith('#'):
                     config['CCACHE_DIR'] = line.split('=', 1)[1].strip('\'"')
     except Exception as e:
-        logger.error(f"Error reading makepkg.conf: {e}")
+        logger.error(f"Error reading {conf_path}: {e}")
 
     return config
+
+
+def get_srcdest_override() -> Optional[str]:
+    """Return the SRCDEST configured via the command line, if any"""
+    srcdest = server_config.get("srcdest")
+    return str(srcdest) if srcdest else None
+
+
+def get_makepkg_config() -> Dict[str, str]:
+    """Effective makepkg settings: /etc/makepkg.conf with the --srcdest override applied"""
+    config = parse_makepkg_conf()
+
+    srcdest_override = get_srcdest_override()
+    if srcdest_override:
+        config['SRCDEST'] = srcdest_override
+
+    return config
+
+
+def apply_srcdest_override(conf_text: str, srcdest: str) -> str:
+    """Replace or append the SRCDEST assignment in makepkg.conf content"""
+    assignment = f'SRCDEST="{srcdest}"'
+    lines = conf_text.splitlines()
+    replaced = False
+
+    for index, line in enumerate(lines):
+        if line.strip().startswith('SRCDEST='):
+            lines[index] = assignment
+            replaced = True
+
+    if not replaced:
+        lines.append(assignment)
+
+    return "\n".join(lines) + "\n"
+
+
+def stage_makepkg_conf_override(host_conf: Path, staging_dir: Path, srcdest: str) -> Path:
+    """Write a copy of makepkg.conf carrying the SRCDEST override, ready to be copied into a chroot"""
+    conf_text = host_conf.read_text(encoding="utf-8")
+    staged_conf = staging_dir / ".makepkg.conf.apb"
+    staged_conf.write_text(apply_srcdest_override(conf_text, srcdest), encoding="utf-8")
+    # The chroot copy inherits this mode, and makepkg runs as an unprivileged user inside it
+    staged_conf.chmod(0o644)
+    return staged_conf
 
 
 def create_custom_pacman_conf(buildroot_path: Path, build_dir: Path, extra_repos: List[Dict], log_output_func) -> Optional[Path]:
