@@ -150,6 +150,9 @@ def _extract_assignment(line: str) -> Optional[tuple[str, str]]:
     return key.strip(), value.strip()
 
 
+_TOP_LEVEL_ARCH_PATTERN = re.compile(r"^arch=")
+
+
 def parse_pkgbuild(content: str) -> PkgbuildInfo:
     """Parse PKGBUILD content into structured package information."""
     info = PkgbuildInfo()
@@ -157,9 +160,11 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
     variables: dict[str, str] = {}
     lines = content.splitlines()
     line_idx = 0
+    arch_assigned = False
 
     while line_idx < len(lines):
-        line = lines[line_idx].strip()
+        raw_line = lines[line_idx]
+        line = raw_line.strip()
         assignment = _extract_assignment(line)
         if not assignment:
             line_idx += 1
@@ -192,9 +197,11 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
             info.epoch = _resolve_value(value, variables)
             variables[key] = info.epoch
         elif key == "arch":
-            info.arch = _parse_array(value, variables) or info.arch
-            if info.arch:
-                variables[key] = info.arch[0]
+            if _TOP_LEVEL_ARCH_PATTERN.match(raw_line) and not arch_assigned:
+                info.arch = _parse_array(value, variables) or info.arch
+                if info.arch:
+                    variables[key] = info.arch[0]
+                arch_assigned = True
         elif key == "apb_extra_repos":
             info.extra_repos = _parse_array(
                 value,

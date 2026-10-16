@@ -152,3 +152,41 @@ pkgname="pkg-$arch"
 """
     info = parse_pkgbuild(content)
     assert info.pkgname == "pkg-aarch64"
+
+
+def test_parse_pkgbuild_ignores_second_top_level_arch():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=('x86_64' 'aarch64')
+arch=('any')
+"""
+    info = parse_pkgbuild(content)
+    assert info.arch == ["x86_64", "aarch64"]
+
+
+def test_parse_pkgbuild_ignores_indented_arch():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=('x86_64')
+
+package_foo() {
+    arch=('aarch64')
+}
+"""
+    info = parse_pkgbuild(content)
+    assert info.arch == ["x86_64"]
+
+
+def test_parse_pkgbuild_arch_variable_from_first_only():
+    content = """
+arch=('aarch64' 'x86_64')
+arch=('any')
+pkgname="pkg-$arch"
+"""
+    info = parse_pkgbuild(content)
+    assert info.arch == ["aarch64", "x86_64"]
+    assert info.pkgname == "pkg-aarch64"
