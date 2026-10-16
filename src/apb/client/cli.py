@@ -26,6 +26,7 @@ from apb.client.auth import APBAuthClient
 from apb.client.helpers import (
     get_architectures_needing_build,
     parse_pkgbuild_info,
+    select_pkgbuild_architectures,
     should_skip_build,
 )
 
@@ -1027,7 +1028,11 @@ def main():
     parser.add_argument("pkgbuild_path", nargs="?", type=Path,
                        help="Path to PKGBUILD or package directory")
     parser.add_argument("--server", type=str, help="Server URL")
-    parser.add_argument("--arch", type=str, help="Target architecture(s) (comma-separated)")
+    parser.add_argument(
+        "--arch",
+        type=str,
+        help="Target architecture(s) (comma-separated); with --farm, limits which PKGBUILD arch=() entries are queued",
+    )
     parser.add_argument("--config", type=Path, help="Path to configuration file")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--quiet", action="store_true", help="Suppress output except errors")
@@ -1300,8 +1305,23 @@ def main():
 
         # For farm submissions, check which architectures need building
         if args.farm:
-            # Get architectures that need building
-            architectures_needing_build = get_architectures_needing_build(pkgbuild_path, args.output_dir, args.force)
+            arch_filter = [a.strip() for a in args.arch.split(",") if a.strip()] if args.arch else None
+            if arch_filter:
+                pkg_info = parse_pkgbuild_info(pkgbuild_path)
+                pkgbuild_archs = pkg_info.get("arch") or []
+                _selected, missing_archs = select_pkgbuild_architectures(pkgbuild_archs, arch_filter)
+                if missing_archs:
+                    print(
+                        "Warning: architectures not in PKGBUILD arch=(): "
+                        f"{', '.join(missing_archs)}"
+                    )
+                if not _selected:
+                    print("Error: No matching architectures between --arch and PKGBUILD arch=()")
+                    sys.exit(1)
+
+            architectures_needing_build = get_architectures_needing_build(
+                pkgbuild_path, args.output_dir, args.force, arch_filter=arch_filter
+            )
 
             if not architectures_needing_build:
                 print("All packages already exist in output directory")

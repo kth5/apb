@@ -2,7 +2,7 @@
 
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from apb.arch import package_arch_suffix
 from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_info_to_dict
@@ -181,7 +181,31 @@ def should_skip_build(output_dir: Path, pkgbuild_path: Path, arch: str, force: b
     return False, "Package not found, proceeding with build"
 
 
-def get_architectures_needing_build(pkgbuild_path: Path, output_dir: Path, force: bool = False) -> List[str]:
+def select_pkgbuild_architectures(
+    pkgbuild_archs: List[str],
+    arch_filter: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str]]:
+    """
+    Intersect PKGBUILD arch=() with a client --arch request.
+
+    Returns:
+        (selected architectures in PKGBUILD order, requested names not in PKGBUILD)
+    """
+    if not arch_filter:
+        return list(pkgbuild_archs), []
+
+    requested = set(arch_filter)
+    selected = [arch for arch in pkgbuild_archs if arch in requested]
+    missing = sorted(requested - set(pkgbuild_archs))
+    return selected, missing
+
+
+def get_architectures_needing_build(
+    pkgbuild_path: Path,
+    output_dir: Path,
+    force: bool = False,
+    arch_filter: Optional[List[str]] = None,
+) -> List[str]:
     """
     Get list of architectures that need building (don't have existing packages).
 
@@ -189,15 +213,19 @@ def get_architectures_needing_build(pkgbuild_path: Path, output_dir: Path, force
         pkgbuild_path: Path to PKGBUILD file
         output_dir: Output directory to check for existing packages
         force: Force rebuild even if packages exist
+        arch_filter: If set, only consider these architectures (must appear in PKGBUILD)
 
     Returns:
         List of architectures that need building
     """
     pkg_info = parse_pkgbuild_info(pkgbuild_path)
-    target_archs = pkg_info.get("arch", ["x86_64"])
+    pkgbuild_archs = pkg_info.get("arch", ["x86_64"])
+    target_archs, _missing = select_pkgbuild_architectures(pkgbuild_archs, arch_filter)
+    if arch_filter and not target_archs:
+        return []
 
     if force:
-        # If force is specified, all architectures need building
+        # If force is specified, all selected architectures need building
         return target_archs
 
     # Special handling for "any" architecture

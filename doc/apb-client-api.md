@@ -79,6 +79,9 @@ python apb.py --farm /path/to/package/
 python apb.py --farm --login
 python apb.py --farm /path/to/package/
 
+# Farm: queue only selected PKGBUILD architectures (multi-arch PKGBUILD)
+python apb.py --farm --arch powerpc /path/to/package/
+
 # Monitor existing build
 python apb.py --monitor 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 
@@ -132,7 +135,7 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 
 - `pkgbuild_path` (positional): Path to PKGBUILD or package directory (optional if PKGBUILD in current dir)
 - `--server URL`: Server URL (default: from config or http://localhost:8000)
-- `--arch ARCH`: Target architecture(s) (comma-separated)
+- `--arch ARCH`: Target architecture(s) (comma-separated). With `--farm`, only these names from PKGBUILD `arch=()` are queued on matching build servers
 - `--config PATH`: Path to configuration file
 - `--verbose`: Enable verbose output
 - `--quiet`: Suppress output except errors
@@ -1116,7 +1119,7 @@ python apb.py --farm ./my-package/
 # Check what user is logged in
 python apb.py --farm --auth-status
 
-# Build for specific architectures with authentication
+# Build only for selected PKGBUILD architectures (not every arch=() entry)
 python apb.py --farm --arch x86_64,aarch64 ./my-package/
 
 # Monitor with authentication

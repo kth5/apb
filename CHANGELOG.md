@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `apb --farm --arch` now limits farm submission to the requested PKGBUILD `arch=()` entries instead of queuing every architecture in the PKGBUILD
 - PKGBUILD parser uses only the first top-level `arch=()` assignment; later or indented `arch=` lines (e.g. inside `package_*()` functions) are ignored
 - Client build tarballs no longer include the output directory, build artifacts (`.pkg.tar.*`, `.sig`, `.log`), or common non-source paths (`pkg/`, `.git/`, etc.)
 - PKGBUILD parser now collects multi-line bash arrays (`apb_extra_repos=(...)`, `arch=(...)`, `pkgname=(...)`) instead of treating a lone `(` as a repository name and rejecting farm submissions
