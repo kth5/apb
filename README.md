@@ -290,7 +290,10 @@ apb-server --architecture powerpc
 # Custom file size and timeout limits
 apb-server --max-file-size 209715200 --max-request-size 1073741824 --build-timeout 7200
 
-# Shared source directory, overriding SRCDEST from /etc/makepkg.conf
+# Alternate makepkg.conf for a second server on the same host
+apb-server --makepkg-conf /etc/apb-server2/makepkg.conf --buildroot /srv/apb2/buildroot --port 8001
+
+# Shared source directory, overriding SRCDEST from the configured makepkg.conf
 apb-server --srcdest /srv/apb/sources
 
 # Enable debug logging
@@ -311,7 +314,8 @@ apb-server --debug
 | `--max-file-size` | `100MB` | Maximum individual upload file size |
 | `--max-request-size` | `500MB` | Maximum total request size |
 | `--build-timeout` | `7200` | Maximum build time in seconds |
-| `--srcdest` | *from `/etc/makepkg.conf`* | Shared source directory, overriding `SRCDEST` |
+| `--makepkg-conf` | `/etc/makepkg.conf` | Host `makepkg.conf` to read and copy into the buildroot |
+| `--srcdest` | *from configured makepkg.conf* | Shared source directory, overriding `SRCDEST` |
 | `--srcdest-cleanup-interval` | `86400` | Seconds between SRCDEST cleanups (`0` disables) |
 | `--srcdest-retention-days` | `30` | Delete cached SRCDEST sources older than this many days |
 | `--debug` | `false` | Enable debug logging |

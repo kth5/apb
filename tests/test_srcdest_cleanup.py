@@ -172,6 +172,35 @@ def test_get_makepkg_config_cli_srcdest_without_conf_entry(
     assert engine.get_makepkg_config() == {"SRCDEST": str(override)}
 
 
+def test_get_makepkg_config_uses_makepkg_conf_option(
+    host_conf_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    alt_conf = tmp_path / "apb2-makepkg.conf"
+    alt_conf.write_text(
+        'SRCDEST="/srv/apb2/sources"\nexport CCACHE_DIR="/srv/apb2/ccache"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine, "server_config", {"makepkg_conf": alt_conf})
+
+    config = engine.get_makepkg_config()
+
+    assert config["SRCDEST"] == "/srv/apb2/sources"
+    assert config["CCACHE_DIR"] == "/srv/apb2/ccache"
+
+
+def test_get_makepkg_config_makepkg_conf_with_cli_srcdest(
+    host_conf_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    alt_conf = tmp_path / "apb2-makepkg.conf"
+    alt_conf.write_text('SRCDEST="/srv/apb2/sources"\n', encoding="utf-8")
+    override = tmp_path / "cli-sources"
+    monkeypatch.setattr(
+        engine, "server_config", {"makepkg_conf": alt_conf, "srcdest": override}
+    )
+
+    assert engine.get_makepkg_config() == {"SRCDEST": str(override)}
+
+
 def test_apply_srcdest_override_replaces_active_assignment():
     result = engine.apply_srcdest_override(HOST_MAKEPKG_CONF, "/data/sources")
 
@@ -224,3 +253,20 @@ def test_setup_buildroot_keeps_host_conf_without_override(
         assert engine.setup_buildroot(buildroot)
 
     assert (chroot_etc / "makepkg.conf").read_text(encoding="utf-8") == HOST_MAKEPKG_CONF
+
+
+def test_setup_buildroot_copies_configured_makepkg_conf(
+    host_conf_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    alt_conf = tmp_path / "apb2-makepkg.conf"
+    alt_text = 'SRCDEST="/srv/apb2/sources"\nexport CCACHE_DIR="/srv/apb2/ccache"\n'
+    alt_conf.write_text(alt_text, encoding="utf-8")
+    buildroot = tmp_path / "buildroot"
+    chroot_etc = buildroot / "root" / "etc"
+    chroot_etc.mkdir(parents=True)
+    monkeypatch.setattr(engine, "server_config", {"makepkg_conf": alt_conf})
+
+    with patch.object(engine.subprocess, "run", side_effect=_fake_sudo_run):
+        assert engine.setup_buildroot(buildroot)
+
+    assert (chroot_etc / "makepkg.conf").read_text(encoding="utf-8") == alt_text

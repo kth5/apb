@@ -38,9 +38,14 @@ def main() -> None:
     parser.add_argument("--max-request-size", type=int, default=500 * 1024 * 1024, help="Maximum total request size")
     parser.add_argument("--build-timeout", type=int, default=engine.BUILD_TIMEOUT_DEFAULT, help="Maximum build time")
     parser.add_argument(
+        "--makepkg-conf",
+        type=engine.Path,
+        help="Host makepkg.conf to read and copy into the buildroot (default: /etc/makepkg.conf)",
+    )
+    parser.add_argument(
         "--srcdest",
         type=engine.Path,
-        help="Shared source directory, overriding SRCDEST from /etc/makepkg.conf",
+        help="Shared source directory, overriding SRCDEST from the configured makepkg.conf",
     )
     parser.add_argument(
         "--srcdest-cleanup-interval",
@@ -56,6 +61,10 @@ def main() -> None:
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+
+    if args.makepkg_conf is not None and not args.makepkg_conf.is_file():
+        logger.error("makepkg.conf not found: %s", args.makepkg_conf)
+        sys.exit(1)
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
@@ -80,6 +89,7 @@ def main() -> None:
         "max_file_size": args.max_file_size,
         "max_request_size": args.max_request_size,
         "build_timeout": args.build_timeout,
+        "makepkg_conf": args.makepkg_conf,
         "srcdest": args.srcdest,
         "srcdest_cleanup_interval": args.srcdest_cleanup_interval,
         "srcdest_retention_days": args.srcdest_retention_days,
@@ -87,6 +97,9 @@ def main() -> None:
 
     args.buildroot.mkdir(parents=True, exist_ok=True)
     args.builds_dir.mkdir(parents=True, exist_ok=True)
+    makepkg_conf_path = args.makepkg_conf or (engine.HOST_CONF_DIR / "makepkg.conf")
+    logger.info("Using makepkg.conf: %s", makepkg_conf_path)
+
     if args.srcdest:
         args.srcdest.mkdir(parents=True, exist_ok=True)
         logger.info("Using SRCDEST override: %s", args.srcdest)

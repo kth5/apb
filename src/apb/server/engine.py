@@ -599,11 +599,15 @@ def setup_buildroot(buildroot_path: Path) -> bool:
         chroot_etc = root_path / "etc"
         srcdest_override = get_srcdest_override()
 
-        for conf_name in ("makepkg.conf", "pacman.conf"):
-            host_conf = HOST_CONF_DIR / conf_name
+        makepkg_host_conf = get_makepkg_conf_path()
+        conf_sources = (
+            ("makepkg.conf", makepkg_host_conf),
+            ("pacman.conf", HOST_CONF_DIR / "pacman.conf"),
+        )
+        for conf_name, host_conf in conf_sources:
             chroot_conf = chroot_etc / conf_name
             if host_conf.exists():
-                logger.info(f"Copying host /etc/{conf_name} to chroot")
+                logger.info("Copying host %s to chroot", host_conf)
                 source_conf = host_conf
                 staged_conf = None
                 try:
@@ -626,7 +630,7 @@ def setup_buildroot(buildroot_path: Path) -> bool:
                     if staged_conf is not None:
                         staged_conf.unlink(missing_ok=True)
             else:
-                logger.warning(f"Host /etc/{conf_name} not found")
+                logger.warning("Host %s not found", host_conf)
 
         return True
     except Exception as e:
@@ -634,9 +638,17 @@ def setup_buildroot(buildroot_path: Path) -> bool:
         return False
 
 
+def get_makepkg_conf_path() -> Path:
+    """Path to the host makepkg.conf for this server instance"""
+    configured = server_config.get("makepkg_conf")
+    if configured:
+        return Path(configured)
+    return HOST_CONF_DIR / "makepkg.conf"
+
+
 def parse_makepkg_conf(conf_path: Optional[Path] = None) -> Dict[str, str]:
     """Parse a makepkg.conf for SRCDEST and CCACHE_DIR"""
-    conf_path = conf_path or HOST_CONF_DIR / "makepkg.conf"
+    conf_path = conf_path or get_makepkg_conf_path()
     config = {}
     try:
         with open(conf_path, 'r') as f:
@@ -659,7 +671,7 @@ def get_srcdest_override() -> Optional[str]:
 
 
 def get_makepkg_config() -> Dict[str, str]:
-    """Effective makepkg settings: /etc/makepkg.conf with the --srcdest override applied"""
+    """Effective makepkg settings from the configured makepkg.conf with --srcdest override applied"""
     config = parse_makepkg_conf()
 
     srcdest_override = get_srcdest_override()

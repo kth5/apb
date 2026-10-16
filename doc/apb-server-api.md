@@ -892,17 +892,26 @@ SRCDEST="/data/sources"  # Shared source directory
 CCACHE_DIR="/data/ccache"  # Shared ccache directory
 ```
 
-The `SRCDEST` value from `/etc/makepkg.conf` can be overridden on the command line:
+The host `makepkg.conf` defaults to `/etc/makepkg.conf` and can be overridden per server instance:
+
+```bash
+apb-server --makepkg-conf /etc/apb-server2/makepkg.conf --buildroot /data/apb2/buildroot --port 8001
+```
+
+- **Multiple servers**: Use distinct `--makepkg-conf`, `--buildroot`, `--builds-dir`, and `--port` values so `SRCDEST`, `CCACHE_DIR`, and other makepkg settings do not collide on one host
+- **Validation**: If `--makepkg-conf` is set, the path must exist as a regular file at startup
+
+The `SRCDEST` value from the configured `makepkg.conf` can be overridden on the command line:
 
 ```bash
 apb-server --srcdest /data/sources
 ```
 
-- **Precedence**: `--srcdest` wins over `SRCDEST` in `/etc/makepkg.conf`; without it, the file value is used as before
+- **Precedence**: `--srcdest` wins over `SRCDEST` in the configured `makepkg.conf`; without it, the file value is used as before
 - **Directory Creation**: The directory is created at startup if it does not exist
 - **Buildroot Configuration**: The effective `SRCDEST` is written into the chroot's `/etc/makepkg.conf` when the buildroot is created or recreated
 - **Scope**: The effective value is used for lock files, the `makechrootpkg -d` bind mount, startup lock cleanup, and periodic source cleanup
-- **CCACHE_DIR**: Still read from `/etc/makepkg.conf` only
+- **CCACHE_DIR**: Read from the configured `makepkg.conf` (same file as `--makepkg-conf` or `/etc/makepkg.conf` by default)
 
 ### Buildroot Management
 
@@ -922,7 +931,7 @@ apb-server.py --buildroot-autorecreate 50
 ```
 
 #### Configuration Management
-- **Host Configuration**: Copies `/etc/makepkg.conf` and `/etc/pacman.conf` to chroot
+- **Host Configuration**: Copies the configured host `makepkg.conf` (default `/etc/makepkg.conf`) and `/etc/pacman.conf` to chroot
 - **SRCDEST Override**: Rewrites the chroot's `SRCDEST` when `--srcdest` is set
 - **Dependency Management**: Installs base, base-devel, and ccache packages
 - **Permission Handling**: Proper sudo permissions for chroot operations
@@ -1063,7 +1072,8 @@ Server behavior can be configured via command line arguments and environment var
 - `--architecture`: Override detected architecture (e.g., 'powerpc' for espresso)
 
 #### Source Cache
-- `--srcdest`: Shared source directory, overriding `SRCDEST` from `/etc/makepkg.conf`
+- `--makepkg-conf`: Host `makepkg.conf` path (default: `/etc/makepkg.conf`)
+- `--srcdest`: Shared source directory, overriding `SRCDEST` from the configured `makepkg.conf`
 - `--srcdest-cleanup-interval`: Seconds between SRCDEST cleanups (default: 86400, `0` disables)
 - `--srcdest-retention-days`: Delete cached SRCDEST sources older than this many days (default: 30)
 
