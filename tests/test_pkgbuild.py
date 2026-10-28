@@ -93,3 +93,137 @@ pkgver=1.0.0
     info = parse_pkgbuild(content)
     assert info.pkgname_list == ["foo", "foo-docs"]
     assert info.pkgname == "foo"
+
+
+def test_parse_pkgbuild_multiline_apb_extra_repos():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=('x86_64' 'aarch64')
+apb_extra_repos=(
+    "extra-any::https://repo.wii-linux.org/arch/extra/any"
+    "extra::https://repo.wii-linux.org/arch/extra/$arch"
+)
+"""
+    info = parse_pkgbuild(content)
+    assert info.extra_repos == [
+        "extra-any::https://repo.wii-linux.org/arch/extra/any",
+        "extra::https://repo.wii-linux.org/arch/extra/$arch",
+    ]
+
+
+def test_parse_pkgbuild_multiline_arch_and_pkgname():
+    content = """
+pkgname=(
+    'foo'
+    'foo-docs'
+)
+arch=(
+    'x86_64'
+    'aarch64'
+)
+pkgver=1.0.0
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgname_list == ["foo", "foo-docs"]
+    assert info.pkgname == "foo"
+    assert info.arch == ["x86_64", "aarch64"]
+
+
+def test_parse_pkgbuild_apb_extra_repos_preserves_pacman_arch():
+    """$arch/$repo in repo URLs must stay literal for pacman.conf matching."""
+    content = """
+arch=('x86_64')
+_base=https://repo.example.com
+apb_extra_repos=("extra::${_base}/arch/extra/$arch" "other::https://repo.example.com/$repo")
+"""
+    info = parse_pkgbuild(content)
+    assert info.extra_repos == [
+        "extra::https://repo.example.com/arch/extra/$arch",
+        "other::https://repo.example.com/$repo",
+    ]
+
+
+def test_parse_pkgbuild_arch_first_element_available_elsewhere():
+    content = """
+arch=('aarch64' 'x86_64')
+pkgname="pkg-$arch"
+"""
+    info = parse_pkgbuild(content)
+    assert info.pkgname == "pkg-aarch64"
+
+
+def test_parse_pkgbuild_ignores_second_top_level_arch():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=('x86_64' 'aarch64')
+arch=('any')
+"""
+    info = parse_pkgbuild(content)
+    assert info.arch == ["x86_64", "aarch64"]
+
+
+def test_parse_pkgbuild_ignores_indented_arch():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=('x86_64')
+
+package_foo() {
+    arch=('aarch64')
+}
+"""
+    info = parse_pkgbuild(content)
+    assert info.arch == ["x86_64"]
+
+
+def test_parse_pkgbuild_apb_arch_hint():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=(any)
+apb_arch_hint='powerpc'
+"""
+    info = parse_pkgbuild(content)
+    assert info.apb_arch_hint == "powerpc"
+    assert info.arch == ["any"]
+
+
+def test_parse_pkgbuild_apb_arch_hint_with_comment():
+    content = """
+arch=(any)
+apb_arch_hint=powerpc64le  # prefer LE builders
+pkgname=hello
+pkgver=1
+pkgrel=1
+"""
+    info = parse_pkgbuild(content)
+    assert info.apb_arch_hint == "powerpc64le"
+
+
+def test_parse_pkgbuild_apb_arch_hint_empty_ignored():
+    content = """
+arch=(any)
+apb_arch_hint=
+pkgname=hello
+pkgver=1
+pkgrel=1
+"""
+    info = parse_pkgbuild(content)
+    assert info.apb_arch_hint is None
+
+
+def test_parse_pkgbuild_arch_variable_from_first_only():
+    content = """
+arch=('aarch64' 'x86_64')
+arch=('any')
+pkgname="pkg-$arch"
+"""
+    info = parse_pkgbuild(content)
+    assert info.arch == ["aarch64", "x86_64"]
+    assert info.pkgname == "pkg-aarch64"

@@ -18,7 +18,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 import uuid
@@ -38,6 +37,7 @@ from apb.constants import (
     BuildStatus,
 )
 from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_info_to_dict
+from apb.upstream import build_download_path
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,13 @@ DEFAULT_PORT = 8000
 DEFAULT_BUILDROOT = Path.home() / ".apb" / "buildroot"
 DEFAULT_BUILDS_DIR = Path.home() / ".apb" / "builds"
 DEFAULT_MAX_CONCURRENT = 3
+DEFAULT_SRCDEST_CLEANUP_INTERVAL = 86400
+DEFAULT_SRCDEST_RETENTION_DAYS = 30
 BUILD_TIMEOUT = BUILD_TIMEOUT_DEFAULT
+HOST_CONF_DIR = Path("/etc")
+
+# Kept on disk after a failed build so the farm and clients can still download it
+FAILED_BUILD_RETAINED_FILES = {"build.log"}
 
 # Global state
 build_queue = queue.Queue()
@@ -128,7 +134,7 @@ def register_build_log_artifact(build_id: str, build_dir: Path) -> Path:
     active_builds[build_id]["logs"] = [{
         "filename": "build.log",
         "size": log_file.stat().st_size,
-        "download_url": f"/build/{build_id}/download/build.log"
+        "download_url": build_download_path(build_id, "build.log")
     }]
     return log_file
 
@@ -205,7 +211,6 @@ def monitor_resources():
             disk = psutil.disk_usage(server_config.get("builds_dir", "/tmp"))
             if (disk.used / disk.total) > 0.95:
                 logger.warning(f"High disk usage: {(disk.used / disk.total) * 100:.1f}%")
-                cleanup_old_builds()
 
             # Regular cleanup every hour
             if time.time() - last_cleanup_time > 3600:
@@ -279,32 +284,63 @@ def cleanup_build_data():
         logger.error(f"Error cleaning up build data: {e}")
 
 
-def cleanup_old_builds():
-    """Clean up old build directories"""
+def cleanup_failed_build_dir(build_id: str, build_dir: Path) -> None:
+    """Purge sources and artifacts of a failed build, keeping build.log downloadable."""
+    if build_id in running_processes:
+        logger.info("Skipping cleanup for %s while build process is still tracked", build_id)
+        return
+
+    build_info = active_builds.get(build_id) or build_history.get(build_id)
+    if not build_info or build_info.get("status") != BuildStatus.FAILED:
+        return
+
+    if not build_dir.is_dir():
+        return
+
+    removed_count = 0
+    for entry in build_dir.iterdir():
+        if entry.name in FAILED_BUILD_RETAINED_FILES:
+            continue
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed_count += 1
+        except Exception as exc:
+            logger.error("Error removing %s for failed build %s: %s", entry, build_id, exc)
+
+    logger.info(
+        "Cleaned up failed build %s: removed %s entries, retained %s",
+        build_id,
+        removed_count,
+        ", ".join(sorted(FAILED_BUILD_RETAINED_FILES)),
+    )
+
+
+def stop_tracked_build_process(build_id: str) -> None:
+    """Stop and untrack a build subprocess if it is still running."""
+    process = running_processes.pop(build_id, None)
+    if process is None or process.poll() is not None:
+        return
+
     try:
-        builds_dir = Path(server_config.get("builds_dir", "/tmp"))
-        current_time = time.time()
-        week_ago = current_time - (7 * 24 * 60 * 60)
-
-        cleaned_count = 0
-        for build_dir in builds_dir.iterdir():
-            if build_dir.is_dir():
-                try:
-                    if build_dir.stat().st_mtime < week_ago:
-                        shutil.rmtree(build_dir)
-                        cleaned_count += 1
-
-                        # Remove from build_history if present
-                        if build_dir.name in build_history:
-                            del build_history[build_dir.name]
-
-                except Exception as e:
-                    logger.error(f"Error cleaning up {build_dir}: {e}")
-
-        logger.info(f"Cleaned up {cleaned_count} old build directories")
-
-    except Exception as e:
-        logger.error(f"Error cleaning up old builds: {e}")
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.kill()
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        logger.warning("Error stopping build process for %s: %s", build_id, exc)
+        try:
+            process.kill()
+        except Exception:
+            pass
 
 
 def terminate_build(build_id: str):
@@ -561,14 +597,28 @@ def setup_buildroot(buildroot_path: Path) -> bool:
 
         # Always copy host configuration files into the chroot after mkarchroot
         chroot_etc = root_path / "etc"
+        srcdest_override = get_srcdest_override()
 
-        for conf_name in ("makepkg.conf", "pacman.conf"):
-            host_conf = Path("/etc") / conf_name
+        makepkg_host_conf = get_makepkg_conf_path()
+        conf_sources = (
+            ("makepkg.conf", makepkg_host_conf),
+            ("pacman.conf", HOST_CONF_DIR / "pacman.conf"),
+        )
+        for conf_name, host_conf in conf_sources:
             chroot_conf = chroot_etc / conf_name
             if host_conf.exists():
-                logger.info(f"Copying host /etc/{conf_name} to chroot")
+                logger.info("Copying host %s to chroot", host_conf)
+                source_conf = host_conf
+                staged_conf = None
                 try:
-                    cmd = ["sudo", "cp", str(host_conf), str(chroot_conf)]
+                    if conf_name == "makepkg.conf" and srcdest_override:
+                        logger.info(f"Overriding chroot SRCDEST with {srcdest_override}")
+                        staged_conf = stage_makepkg_conf_override(
+                            host_conf, buildroot_path, srcdest_override
+                        )
+                        source_conf = staged_conf
+
+                    cmd = ["sudo", "cp", str(source_conf), str(chroot_conf)]
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     if result.returncode != 0:
                         logger.error(f"Failed to copy {conf_name}: {result.stderr}")
@@ -576,8 +626,11 @@ def setup_buildroot(buildroot_path: Path) -> bool:
                 except Exception as e:
                     logger.error(f"Failed to copy {conf_name}: {e}")
                     return False
+                finally:
+                    if staged_conf is not None:
+                        staged_conf.unlink(missing_ok=True)
             else:
-                logger.warning(f"Host /etc/{conf_name} not found")
+                logger.warning("Host %s not found", host_conf)
 
         return True
     except Exception as e:
@@ -585,11 +638,20 @@ def setup_buildroot(buildroot_path: Path) -> bool:
         return False
 
 
-def get_makepkg_config() -> Dict[str, str]:
-    """Parse /etc/makepkg.conf for SRCDEST and CCACHE_DIR"""
+def get_makepkg_conf_path() -> Path:
+    """Path to the host makepkg.conf for this server instance"""
+    configured = server_config.get("makepkg_conf")
+    if configured:
+        return Path(configured)
+    return HOST_CONF_DIR / "makepkg.conf"
+
+
+def parse_makepkg_conf(conf_path: Optional[Path] = None) -> Dict[str, str]:
+    """Parse a makepkg.conf for SRCDEST and CCACHE_DIR"""
+    conf_path = conf_path or get_makepkg_conf_path()
     config = {}
     try:
-        with open('/etc/makepkg.conf', 'r') as f:
+        with open(conf_path, 'r') as f:
             for line in f:
                 line = line.strip()
                 if line.startswith('SRCDEST=') and not line.startswith('#'):
@@ -597,9 +659,53 @@ def get_makepkg_config() -> Dict[str, str]:
                 elif line.startswith('export CCACHE_DIR=') and not line.startswith('#'):
                     config['CCACHE_DIR'] = line.split('=', 1)[1].strip('\'"')
     except Exception as e:
-        logger.error(f"Error reading makepkg.conf: {e}")
+        logger.error(f"Error reading {conf_path}: {e}")
 
     return config
+
+
+def get_srcdest_override() -> Optional[str]:
+    """Return the SRCDEST configured via the command line, if any"""
+    srcdest = server_config.get("srcdest")
+    return str(srcdest) if srcdest else None
+
+
+def get_makepkg_config() -> Dict[str, str]:
+    """Effective makepkg settings from the configured makepkg.conf with --srcdest override applied"""
+    config = parse_makepkg_conf()
+
+    srcdest_override = get_srcdest_override()
+    if srcdest_override:
+        config['SRCDEST'] = srcdest_override
+
+    return config
+
+
+def apply_srcdest_override(conf_text: str, srcdest: str) -> str:
+    """Replace or append the SRCDEST assignment in makepkg.conf content"""
+    assignment = f'SRCDEST="{srcdest}"'
+    lines = conf_text.splitlines()
+    replaced = False
+
+    for index, line in enumerate(lines):
+        if line.strip().startswith('SRCDEST='):
+            lines[index] = assignment
+            replaced = True
+
+    if not replaced:
+        lines.append(assignment)
+
+    return "\n".join(lines) + "\n"
+
+
+def stage_makepkg_conf_override(host_conf: Path, staging_dir: Path, srcdest: str) -> Path:
+    """Write a copy of makepkg.conf carrying the SRCDEST override, ready to be copied into a chroot"""
+    conf_text = host_conf.read_text(encoding="utf-8")
+    staged_conf = staging_dir / ".makepkg.conf.apb"
+    staged_conf.write_text(apply_srcdest_override(conf_text, srcdest), encoding="utf-8")
+    # The chroot copy inherits this mode, and makepkg runs as an unprivileged user inside it
+    staged_conf.chmod(0o644)
+    return staged_conf
 
 
 def create_custom_pacman_conf(buildroot_path: Path, build_dir: Path, extra_repos: List[Dict], log_output_func) -> Optional[Path]:
@@ -850,6 +956,92 @@ def cleanup_orphaned_srcdest_locks():
         logger.error(f"Error during SRCDEST lock cleanup: {e}")
 
 
+def _has_active_builds() -> bool:
+    return any(
+        build_info.get("status") == BuildStatus.BUILDING
+        for build_info in active_builds.values()
+    )
+
+
+def cleanup_srcdest_sources(srcdest_path: Path, retention_days: int) -> Dict[str, int]:
+    """Remove top-level SRCDEST entries older than the retention period."""
+    cutoff = time.time() - retention_days * 86400
+    stats = {"removed_files": 0, "removed_dirs": 0, "freed_bytes": 0}
+
+    for entry in os.scandir(srcdest_path):
+        if entry.name.startswith(".apb-") and entry.name.endswith(".lock"):
+            continue
+
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+            if entry_stat.st_mtime >= cutoff:
+                continue
+
+            if entry.is_file(follow_symlinks=False):
+                stats["freed_bytes"] += entry_stat.st_size
+                os.unlink(entry.path)
+                stats["removed_files"] += 1
+            elif entry.is_dir(follow_symlinks=False):
+                dir_size = 0
+                for root, _dirs, files in os.walk(entry.path):
+                    for filename in files:
+                        try:
+                            dir_size += os.stat(
+                                os.path.join(root, filename),
+                                follow_symlinks=False,
+                            ).st_size
+                        except OSError:
+                            pass
+                shutil.rmtree(entry.path)
+                stats["removed_dirs"] += 1
+                stats["freed_bytes"] += dir_size
+        except OSError as exc:
+            logger.warning("Failed to remove SRCDEST entry %s: %s", entry.path, exc)
+
+    return stats
+
+
+def cleanup_srcdest() -> None:
+    """Clean orphaned SRCDEST locks and prune old cached source files."""
+    config = get_makepkg_config()
+    if "SRCDEST" not in config:
+        return
+
+    srcdest = Path(config["SRCDEST"])
+    if not srcdest.is_dir():
+        logger.warning("SRCDEST %s is not a directory, skipping cleanup", srcdest)
+        return
+
+    cleanup_orphaned_srcdest_locks()
+
+    if _has_active_builds():
+        logger.info("Skipping SRCDEST source cleanup while builds are active")
+        return
+
+    retention = server_config.get("srcdest_retention_days", DEFAULT_SRCDEST_RETENTION_DAYS)
+    stats = cleanup_srcdest_sources(srcdest, retention)
+    logger.info(
+        "SRCDEST source cleanup: removed %s files, %s dirs, freed ~%s bytes",
+        stats["removed_files"],
+        stats["removed_dirs"],
+        stats["freed_bytes"],
+    )
+
+
+def monitor_srcdest_cleanup() -> None:
+    """Periodically clean SRCDEST when configured."""
+    interval = server_config.get("srcdest_cleanup_interval", DEFAULT_SRCDEST_CLEANUP_INTERVAL)
+    if interval <= 0:
+        return
+
+    while not shutdown_event.is_set():
+        try:
+            cleanup_srcdest()
+        except Exception as exc:
+            logger.error("SRCDEST cleanup failed: %s", exc)
+        shutdown_event.wait(interval)
+
+
 def unlock_srcdest(lock_fd: int):
     """Unlock SRCDEST directory"""
     try:
@@ -860,7 +1052,7 @@ def unlock_srcdest(lock_fd: int):
 
 
 def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code: int = 1):
-    """Finalize a failed build with proper logging and cleanup"""
+    """Finalize a failed build with proper logging."""
     try:
         # Update build status
         active_builds[build_id]["status"] = BuildStatus.FAILED
@@ -903,6 +1095,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
     global build_counter
 
     logger.info(f"build_package called for build {build_id}")
+    should_cleanup_failed_dir = False
 
     try:
         # Update build status
@@ -1014,6 +1207,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     if srcdest_lock:
                         unlock_srcdest(srcdest_lock)
                     finalize_failed_build(build_id, build_dir, "Failed to download GPG keys for custom repositories")
+                    should_cleanup_failed_dir = True
                     return
 
                 # Create custom pacman.conf with custom repositories
@@ -1023,6 +1217,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     if srcdest_lock:
                         unlock_srcdest(srcdest_lock)
                     finalize_failed_build(build_id, build_dir, "Failed to create custom pacman.conf for custom repositories")
+                    should_cleanup_failed_dir = True
                     return
 
             # Build makechrootpkg command with correct flags
@@ -1150,7 +1345,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     packages.append({
                         "filename": pkg_file.name,
                         "size": pkg_file.stat().st_size,
-                        "download_url": f"/build/{build_id}/download/{pkg_file.name}"
+                        "download_url": build_download_path(build_id, pkg_file.name)
                     })
 
                 active_builds[build_id]["packages"] = packages
@@ -1161,10 +1356,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                 log_output(f"Build failed with exit code {process.returncode}")
 
         finally:
+            stop_tracked_build_process(build_id)
             if srcdest_lock:
                 unlock_srcdest(srcdest_lock)
-            if build_id in running_processes:
-                del running_processes[build_id] # Ensure process is removed from tracking
 
         # Finalize build
         active_builds[build_id]["end_time"] = time.time()
@@ -1188,6 +1382,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
 
+        if active_builds[build_id]["status"] == BuildStatus.FAILED:
+            should_cleanup_failed_dir = True
+
     except Exception as e:
         logger.error(f"Build error: {e}")
         # Release SRCDEST lock if it was acquired
@@ -1208,9 +1405,12 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
         # Move to history
         build_history[build_id] = active_builds[build_id].copy()
+        should_cleanup_failed_dir = True
 
     finally:
         close_build_log(build_id)
+        if should_cleanup_failed_dir:
+            cleanup_failed_build_dir(build_id, build_dir)
 
 
 def process_build_queue():

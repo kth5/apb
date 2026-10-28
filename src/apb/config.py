@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from apb.constants import DEFAULT_CONFIG_PATHS
+from apb.constants import DEFAULT_CONFIG_PATHS, DEFAULT_FARM_URL, DEFAULT_SERVER_URL
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +31,9 @@ def load_config(config_path: Optional[Path] = None, *, strict: bool = False) -> 
         return {"servers": {}}
 
     return {
-        "servers": {"x86_64": ["http://localhost:8000"]},
-        "default_server": "http://localhost:8000",
+        "servers": {"x86_64": [DEFAULT_SERVER_URL]},
+        "default_server": DEFAULT_SERVER_URL,
         "default_arch": "x86_64",
         "output_dir": "./output",
-        "farm_url": "http://localhost:8080",
+        "farm_url": DEFAULT_FARM_URL,
     }

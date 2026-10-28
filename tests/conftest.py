@@ -1,11 +1,13 @@
-"""Shared pytest fixtures for APB integration tests."""
+"""Shared pytest fixtures for APB unit and integration tests."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -21,6 +23,31 @@ from apb.client.auth import APBAuthClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 TEST_PACKAGE_DIR = REPO_ROOT / "tests" / "fixtures" / "test-package"
+
+
+@pytest.fixture
+def farm_db(monkeypatch: pytest.MonkeyPatch):
+    """In-memory farm database with the real builds schema, installed as core.build_database."""
+    from apb.farm import core
+
+    db = core.init_database(":memory:")
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
+    db.commit()
+    monkeypatch.setattr(core, "build_database", db)
+    yield db
+    db.close()
+
+
+@pytest.fixture
+def farm_queue_state(farm_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    """farm_db plus an empty farm build queue and a fresh shutdown event."""
+    from apb.farm import core
+
+    monkeypatch.setattr(core, "build_queue", [])
+    monkeypatch.setattr(core, "shutdown_event", asyncio.Event())
+    yield farm_db
+    core.shutdown_event.set()
+    core.build_queue.clear()
 
 
 def find_free_port() -> int:

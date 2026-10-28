@@ -2,18 +2,14 @@
 
 import asyncio
 import hashlib
-import io
 import json
 import logging
-import os
 import re
 import secrets
 import signal
 import smtplib
 import sqlite3
 import ssl
-import sys
-import tarfile
 import tempfile
 import time
 import uuid
@@ -24,7 +20,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -34,26 +30,32 @@ from pydantic import BaseModel, Field
 
 from apb import VERSION
 from apb.config import load_config
-from apb.constants import ADMIN_ROLE, GUEST_BUILD_LOG_TAIL_LINES, TOKEN_EXPIRY_DAYS, USER_ROLE, BuildStatus
-from apb.pkgbuild import parse_pkgbuild
+from apb.constants import (
+    ADMIN_ROLE,
+    BUILD_TIMEOUT_DEFAULT,
+    DEFAULT_FARM_URL,
+    GUEST_BUILD_LOG_TAIL_LINES,
+    GUEST_ROLE,
+    TOKEN_EXPIRY_DAYS,
+    USER_ROLE,
+    BuildStatus,
+)
+from apb.http import create_async_client
+from apb.models import BuildListResponse, BuildSummary, UserResponse
+from apb.pkgbuild import parse_pkgbuild, pkgbuild_arch_is_any_only
+from apb.tarball import create_build_tarball
+from apb.upstream import (
+    BUILD_SUBMIT_PATH,
+    BUILDS_LATEST_PATH,
+    build_download_path,
+    build_status_page_path,
+    build_status_path,
+    download_async,
+    upstream_url,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 8080
-
-
-# Version and constants
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 8080
-DEFAULT_CONFIG_PATHS = [
-    Path.cwd() / "apb.json",
-    Path("/etc/apb/apb.json"),
-    Path.home() / ".apb" / "apb.json",
-    Path.home() / ".apb-farm" / "apb.json"
-]
-
-# Authentication constants
 # Classes need to be defined before global state to avoid NameError
 class ServerHealth(Enum):
     HEALTHY = "healthy"
@@ -63,9 +65,9 @@ class ServerHealth(Enum):
 
 
 class UserRole(Enum):
-    ADMIN = "admin"
-    USER = "user"
-    GUEST = "guest"
+    ADMIN = ADMIN_ROLE
+    USER = USER_ROLE
+    GUEST = GUEST_ROLE
 
 
 @dataclass
@@ -104,37 +106,29 @@ class SMTPConfig:
     updated_at: float = 0
 
 
+def user_response(user: User) -> UserResponse:
+    """Serialize a farm user for the auth API."""
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        role=user.role.value,
+        created_at=user.created_at,
+        last_login=user.last_login,
+        email=user.email,
+        email_notifications_enabled=user.email_notifications_enabled,
+    )
+
+
 # Pydantic models for API requests/responses
-class LoginRequest(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
-    password: str = Field(..., min_length=8, max_length=100)
-
-
-class LoginResponse(BaseModel):
-    token: str
-    user: dict
-    expires_in_days: int = 10
-
-
 class CreateUserRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=8, max_length=100)
-    role: str = Field(default="user", pattern="^(user|admin)$")
+    role: str = Field(default=USER_ROLE, pattern=f"^({USER_ROLE}|{ADMIN_ROLE})$")
     email: Optional[str] = Field(None, max_length=255)
 
 
 class ChangeRoleRequest(BaseModel):
-    role: str = Field(..., pattern="^(user|admin)$")
-
-
-class UserResponse(BaseModel):
-    id: int
-    username: str
-    role: str
-    created_at: float
-    last_login: Optional[float]
-    email: Optional[str]
-    email_notifications_enabled: bool
+    role: str = Field(..., pattern=f"^({USER_ROLE}|{ADMIN_ROLE})$")
 
 
 class ChangePasswordRequest(BaseModel):
@@ -189,6 +183,11 @@ background_tasks: List[asyncio.Task] = []
 artifact_cache_tasks: Dict[str, asyncio.Task] = {}
 server_status_tracker: Dict[str, ServerStatus] = {}
 auth_manager = None
+
+
+def farm_page_url(path: str) -> str:
+    """Public farm URL for path, based on the configured farm_url."""
+    return upstream_url(config.get("farm_url", DEFAULT_FARM_URL), path)
 
 
 class AuthManager:
@@ -591,39 +590,6 @@ class AuthManager:
             logger.error(f"Failed to update email notifications preference: {e}")
             return False
 
-    def get_user_builds(self, user_id: int, limit: int = 50) -> List[Dict]:
-        """Get builds created by a specific user"""
-        cursor = self.db.cursor()
-        cursor.execute('''
-            SELECT id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, epoch, pkgver, pkgrel
-            FROM builds
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        ''', (user_id, limit))
-
-        builds = []
-        for row in cursor.fetchall():
-            # Format package name with version
-            pkgname = row[3]
-            epoch = row[8]
-            pkgver = row[9]
-            pkgrel = row[10]
-            display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
-
-            builds.append({
-                "id": row[0],
-                "server_url": row[1],
-                "server_arch": row[2],
-                "pkgname": pkgname,
-                "display_name": display_name,
-                "status": row[4],
-                "start_time": row[5],
-                "end_time": row[6],
-                "created_at": row[7]
-            })
-        return builds
-
     def can_cancel_build(self, user: User, build_id: str) -> bool:
         """Check if user can cancel a specific build"""
         if user.role == UserRole.ADMIN:
@@ -785,10 +751,7 @@ class AuthManager:
         if not user_email:
             return False
 
-        # Get dashboard URL from configuration
-        global config
-        farm_url = config.get('farm_url', 'http://localhost:8080')
-        dashboard_url = f"{farm_url.rstrip('/')}/dashboard"
+        dashboard_url = farm_page_url("/dashboard")
 
         subject_map = {
             'created': f'Your APB Farm account has been created',
@@ -839,11 +802,8 @@ APB Farm System"""
         if not user_email:
             return False
 
-        # Get farm URL from configuration
-        global config
-        farm_url = config.get('farm_url', 'http://localhost:8080')
-        build_status_url = f"{farm_url.rstrip('/')}/build/{build_id}/status"
-        dashboard_url = f"{farm_url.rstrip('/')}/dashboard"
+        build_status_url = farm_page_url(build_status_page_path(build_id))
+        dashboard_url = farm_page_url("/dashboard")
 
         # Determine subject and status message
         status_display = {
@@ -859,12 +819,12 @@ APB Farm System"""
         if artifacts and status == BuildStatus.COMPLETED:
             artifacts_section = "\n\nAvailable Artifacts:\n"
             for artifact in artifacts:
-                download_url = f"{farm_url.rstrip('/')}/build/{build_id}/download/{artifact['filename']}"
+                download_url = upstream_url(farm_url, build_download_path(build_id, artifact['filename']))
                 artifacts_section += f"  • {artifact['filename']} ({artifact.get('size', 'unknown')} bytes)\n"
                 artifacts_section += f"    Download: {download_url}\n"
 
         # Build log section (always available)
-        log_section = f"\n\nBuild Log:\n  • build.log\n    Download: {farm_url.rstrip('/')}/build/{build_id}/download/build.log"
+        log_section = f"\n\nBuild Log:\n  • build.log\n    Download: {upstream_url(farm_url, build_download_path(build_id, 'build.log'))}"
 
         # Create email body
         body = f"""Hello {username},
@@ -1030,10 +990,29 @@ async def cleanup_cache_task():
             await asyncio.sleep(300)  # Wait 5 minutes before retrying
 
 
-def init_database() -> sqlite3.Connection:
-    """Initialize SQLite database for build tracking"""
-    db_path = Path.home() / ".apb" / "farm.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+DEFAULT_DATABASE_PATH = Path.home() / ".apb" / "farm.db"
+
+# Columns added after the original builds schema, in the order existing databases received them.
+BUILD_COLUMN_MIGRATIONS = (
+    ("submission_group", "TEXT"),
+    ("last_known_status", "TEXT"),
+    ("last_status_update", "REAL"),
+    ("server_available", "BOOLEAN DEFAULT 1"),
+    ("cached_response", "TEXT"),
+    ("build_timeout", f"INTEGER DEFAULT {BUILD_TIMEOUT_DEFAULT}"),
+    ("epoch", "TEXT"),
+    ("pkgver", "TEXT"),
+    ("pkgrel", "TEXT"),
+    ("first_missing_at", "REAL"),
+    ("user_id", "INTEGER"),
+)
+
+
+def init_database(db_path: Union[Path, str, None] = None) -> sqlite3.Connection:
+    """Open (and create or migrate) the build tracking database; pass ":memory:" for tests."""
+    if db_path is None:
+        db_path = DEFAULT_DATABASE_PATH
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.execute('''
@@ -1046,71 +1025,15 @@ def init_database() -> sqlite3.Connection:
             start_time REAL,
             end_time REAL,
             created_at REAL,
-            queue_position INTEGER,
-            submission_group TEXT,
-            last_known_status TEXT,
-            last_status_update REAL,
-            server_available BOOLEAN DEFAULT 1,
-            cached_response TEXT
+            queue_position INTEGER
         )
     ''')
 
-    # Add new columns if they don't exist (for existing databases)
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN submission_group TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(builds)")}
+    for column, column_type in BUILD_COLUMN_MIGRATIONS:
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE builds ADD COLUMN {column} {column_type}")
 
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN last_known_status TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN last_status_update REAL')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN server_available BOOLEAN DEFAULT 1')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN cached_response TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN build_timeout INTEGER DEFAULT 7200')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN epoch TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN pkgver TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN pkgrel TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    # Create cache artifacts table
     conn.execute('''
         CREATE TABLE IF NOT EXISTS cached_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1124,20 +1047,6 @@ def init_database() -> sqlite3.Connection:
             UNIQUE(build_id, filename)
         )
     ''')
-
-    conn.commit()
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN first_missing_at REAL')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute('ALTER TABLE builds ADD COLUMN user_id INTEGER')
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
 
     conn.commit()
     return conn
@@ -1412,17 +1321,14 @@ async def download_artifact_from_server(
     """Download a build artifact from the build server with retries."""
     timeout = httpx.Timeout(300.0, connect=15.0)
 
+    url = upstream_url(server_url, build_download_path(build_id, filename))
+
     for attempt in range(max_retries):
         try:
-            response = await http_session.get(
-                f"{server_url}/build/{build_id}/download/{filename}",
-                timeout=timeout,
-            )
-            if response.status_code == 200:
-                return response.content
-
+            return await download_async(http_session, url, timeout=timeout)
+        except httpx.HTTPStatusError as exc:
             logger.warning(
-                f"Server returned HTTP {response.status_code} for {filename} "
+                f"Server returned HTTP {exc.response.status_code} for {filename} "
                 f"(build {build_id}, attempt {attempt + 1}/{max_retries})"
             )
         except Exception as exc:
@@ -1677,37 +1583,27 @@ def format_package_name_with_version(pkgname: str, epoch: str = None, pkgver: st
     return f"{pkgname} ({version_str})"
 
 
-def _build_row_to_pkgname_dict(row, *, obfuscate: bool = True) -> Dict:
-    """Convert a builds JOIN users row into a public build summary dict."""
+def _build_row_to_summary(row, *, obfuscate: bool = True) -> BuildSummary:
+    """Convert a builds JOIN users row into a build summary."""
     build_id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, username, epoch, pkgver, pkgrel = row
-    display_name = format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
-    start_time_str = safe_timestamp_to_datetime(start_time)
-    end_time_str = safe_timestamp_to_datetime(end_time)
-    created_at_str = safe_timestamp_to_datetime(created_at)
-
-    display_server = "unknown"
-    if server_url:
-        display_server = obfuscate_server_url(server_url) if obfuscate else server_url
-
-    return {
-        "id": build_id,
-        "build_id": build_id,
-        "server_url": display_server,
-        "server_arch": server_arch,
-        "pkgname": pkgname,
-        "display_name": display_name,
-        "status": status,
-        "start_time": f"{start_time_str} UTC" if start_time_str else None,
-        "end_time": f"{end_time_str} UTC" if end_time_str else None,
-        "created_at": f"{created_at_str} UTC" if created_at_str else "unknown",
-        "username": username if username else "#anon#",
-        "epoch": epoch,
-        "pkgver": pkgver,
-        "pkgrel": pkgrel,
-    }
+    if server_url and obfuscate:
+        server_url = obfuscate_server_url(server_url)
+    return BuildSummary(
+        build_id=build_id,
+        pkgname=pkgname,
+        status=status,
+        start_time=start_time,
+        end_time=end_time,
+        created_at=created_at,
+        duration=end_time - start_time if start_time and end_time else None,
+        server_arch=server_arch,
+        server_url=server_url or None,
+        display_name=format_package_name_with_version(pkgname, epoch, pkgver, pkgrel),
+        username=username or "#anon#",
+    )
 
 
-_PKGNAME_BUILD_SELECT = '''
+_BUILD_SUMMARY_SELECT = '''
     SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time,
            b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
     FROM builds b
@@ -1715,26 +1611,37 @@ _PKGNAME_BUILD_SELECT = '''
 '''
 
 
-def get_builds_for_pkgname(pkgname: str, limit: int = 20, status: Optional[str] = None) -> List[Dict]:
-    """Return recent builds for a package name, newest first."""
+def list_builds(
+    *,
+    pkgname: Optional[str] = None,
+    status: Optional[str] = None,
+    arch: Optional[str] = None,
+    user_id: Optional[int] = None,
+    limit: int = 20,
+    obfuscate: bool = True,
+) -> BuildListResponse:
+    """
+    Return matching builds newest first, with ``total`` counting all matches.
+
+    When arch is 'any' or None, match any server_arch. Otherwise require an exact
+    server_arch match (arch=(any) packages are stored under the build server arch).
+    """
+    filters = {
+        "b.pkgname": pkgname,
+        "b.status": status,
+        "b.server_arch": None if arch == "any" else arch,
+        "b.user_id": user_id,
+    }
+    active_filters = {column: value for column, value in filters.items() if value is not None}
+    where = f"WHERE {' AND '.join(f'{column} = ?' for column in active_filters)}" if active_filters else ""
+    params = list(active_filters.values())
+
     cursor = build_database.cursor()
-    if status:
-        cursor.execute(
-            _PKGNAME_BUILD_SELECT + '''
-            WHERE b.pkgname = ? AND b.status = ?
-            ORDER BY b.created_at DESC LIMIT ?
-            ''',
-            (pkgname, status, limit),
-        )
-    else:
-        cursor.execute(
-            _PKGNAME_BUILD_SELECT + '''
-            WHERE b.pkgname = ?
-            ORDER BY b.created_at DESC LIMIT ?
-            ''',
-            (pkgname, limit),
-        )
-    return [_build_row_to_pkgname_dict(row) for row in cursor.fetchall()]
+    cursor.execute(f"SELECT COUNT(*) FROM builds b {where}", params)
+    total = cursor.fetchone()[0]
+    cursor.execute(f"{_BUILD_SUMMARY_SELECT} {where} ORDER BY b.created_at DESC LIMIT ?", [*params, limit])
+    builds = [_build_row_to_summary(row, obfuscate=obfuscate) for row in cursor.fetchall()]
+    return BuildListResponse(pkgname=pkgname, builds=builds, total=total)
 
 
 def get_latest_build_for_pkgname(
@@ -1742,48 +1649,22 @@ def get_latest_build_for_pkgname(
     *,
     arch: Optional[str] = None,
     successful_only: bool = True,
-) -> Optional[Dict]:
-    """
-    Return the latest build for a package.
-
-    When arch is 'any' or None, match any server_arch. Otherwise require an exact
-    server_arch match (arch=(any) packages are stored under the build server arch).
-    """
-    cursor = build_database.cursor()
-    params: List = [pkgname]
-    where = ["b.pkgname = ?"]
-
-    if successful_only:
-        where.append("b.status = ?")
-        params.append(BuildStatus.COMPLETED)
-
-    if arch and arch != "any":
-        where.append("b.server_arch = ?")
-        params.append(arch)
-
-    cursor.execute(
-        _PKGNAME_BUILD_SELECT + f'''
-        WHERE {' AND '.join(where)}
-        ORDER BY b.created_at DESC LIMIT 1
-        ''',
-        params,
-    )
-    row = cursor.fetchone()
-    if not row:
-        return None
-    return _build_row_to_pkgname_dict(row)
+) -> Optional[BuildSummary]:
+    """Return the latest build for a package, optionally on one server_arch."""
+    status = BuildStatus.COMPLETED if successful_only else None
+    builds = list_builds(pkgname=pkgname, status=status, arch=arch, limit=1).builds
+    return builds[0] if builds else None
 
 
-def get_latest_builds_by_arch_for_pkgname(pkgname: str, *, successful_only: bool = True) -> List[Dict]:
+def get_latest_builds_by_arch_for_pkgname(pkgname: str, *, successful_only: bool = True) -> BuildListResponse:
     """Return the latest build per server_arch for a package name."""
     status = BuildStatus.COMPLETED if successful_only else None
-    builds = get_builds_for_pkgname(pkgname, limit=500, status=status)
-    latest_by_arch: Dict[str, Dict] = {}
-    for build in builds:
-        arch = build.get("server_arch")
-        if arch and arch not in latest_by_arch:
-            latest_by_arch[arch] = build
-    return [latest_by_arch[arch] for arch in sorted(latest_by_arch)]
+    latest_by_arch: Dict[str, BuildSummary] = {}
+    for build in list_builds(pkgname=pkgname, status=status, limit=500).builds:
+        if build.server_arch and build.server_arch not in latest_by_arch:
+            latest_by_arch[build.server_arch] = build
+    builds = [latest_by_arch[arch] for arch in sorted(latest_by_arch)]
+    return BuildListResponse(pkgname=pkgname, builds=builds, total=len(builds))
 
 
 async def get_server_info(server_url: str) -> Optional[Dict]:
@@ -2131,7 +2012,63 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     build_database.commit()
 
 
-async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = 7200, original_tarball: Optional[bytes] = None, extra_repos: List[Dict] = None) -> List[Dict]:
+async def _select_server_arch_for_any_package(
+    available_archs: Dict[str, List[str]],
+    *,
+    arch_hint: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Pick a build server architecture for an arch=(any) package.
+
+    When arch_hint is set, only servers for that architecture are considered.
+    Returns (selected_arch, lowest_avg_load_or_none).
+    """
+    candidates = available_archs
+    if arch_hint:
+        if arch_hint not in available_archs or not available_archs[arch_hint]:
+            return None, None
+        candidates = {arch_hint: available_archs[arch_hint]}
+
+    best_arch = None
+    best_load = float("inf")
+    fallback_arch = None
+
+    for avail_arch, server_urls in candidates.items():
+        if not server_urls:
+            continue
+        if fallback_arch is None:
+            fallback_arch = avail_arch
+
+        total_load = 0
+        available_servers = 0
+
+        for server_url in server_urls:
+            try:
+                server_info = await get_server_info(server_url)
+                if server_info:
+                    queue_status = server_info.get("queue_status", {})
+                    current_builds = queue_status.get("current_builds_count", 0)
+                    queued_builds_count = queue_status.get("queued_builds", 0)
+                    max_concurrent = queue_status.get("max_concurrent_builds", 3)
+
+                    if current_builds < max_concurrent:
+                        total_load += current_builds + queued_builds_count
+                        available_servers += 1
+            except Exception:
+                continue
+
+        if available_servers > 0:
+            avg_load = total_load / available_servers
+            if avg_load < best_load:
+                best_load = avg_load
+                best_arch = avail_arch
+
+    selected = best_arch or fallback_arch
+    load = best_load if best_arch else None
+    return selected, load
+
+
+async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = BUILD_TIMEOUT_DEFAULT, original_tarball: Optional[bytes] = None, extra_repos: List[Dict] = None) -> List[Dict]:
     """
     Queue builds for each architecture that has available servers.
 
@@ -2156,6 +2093,23 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
     available_archs = await get_available_architectures()
     logger.info(f"Available server architectures: {list(available_archs.keys())}")
 
+    pkgbuild_info = parse_pkgbuild(pkgbuild_content)
+    any_arch_hint: Optional[str] = None
+    if pkgbuild_info.apb_arch_hint:
+        if pkgbuild_arch_is_any_only(pkgbuild_info.arch):
+            any_arch_hint = pkgbuild_info.apb_arch_hint
+            logger.info(
+                "Using apb_arch_hint '%s' for arch=(any) package '%s'",
+                any_arch_hint,
+                pkgname,
+            )
+        else:
+            logger.warning(
+                "apb_arch_hint '%s' ignored (arch=%s; hint applies only to arch=(any))",
+                pkgbuild_info.apb_arch_hint,
+                pkgbuild_info.arch,
+            )
+
     # Find architectures that have available servers
     buildable_archs = []
     skipped_archs = []
@@ -2164,44 +2118,18 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         if arch == "any":
             # arch=(any) packages can run on any build server regardless of native architecture
             if available_archs:
-                best_arch = None
-                best_load = float('inf')
-                fallback_arch = None
-
-                for avail_arch, server_urls in available_archs.items():
-                    if not server_urls:
-                        continue
-                    if fallback_arch is None:
-                        fallback_arch = avail_arch
-
-                    total_load = 0
-                    available_servers = 0
-
-                    for server_url in server_urls:
-                        try:
-                            server_info = await get_server_info(server_url)
-                            if server_info:
-                                queue_status = server_info.get("queue_status", {})
-                                current_builds = queue_status.get("current_builds_count", 0)
-                                queued_builds_count = queue_status.get("queued_builds", 0)
-                                max_concurrent = queue_status.get("max_concurrent_builds", 3)
-
-                                if current_builds < max_concurrent:
-                                    total_load += current_builds + queued_builds_count
-                                    available_servers += 1
-                        except Exception:
-                            continue
-
-                    if available_servers > 0:
-                        avg_load = total_load / available_servers
-                        if avg_load < best_load:
-                            best_load = avg_load
-                            best_arch = avail_arch
-
-                selected_arch = best_arch or fallback_arch
+                selected_arch, best_load = await _select_server_arch_for_any_package(
+                    available_archs,
+                    arch_hint=any_arch_hint,
+                )
                 if selected_arch:
                     buildable_archs.append(selected_arch)
-                    if best_arch:
+                    if any_arch_hint:
+                        logger.info(
+                            f"Selected architecture '{selected_arch}' for 'any' architecture package "
+                            f"(apb_arch_hint={any_arch_hint})"
+                        )
+                    elif best_load is not None:
                         logger.info(
                             f"Selected architecture '{selected_arch}' for 'any' architecture package "
                             f"(lowest load: {best_load:.1f})"
@@ -2213,7 +2141,13 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
                         )
                 else:
                     skipped_archs.append(arch)
-                    logger.warning("No available servers for 'any' architecture")
+                    if any_arch_hint:
+                        logger.warning(
+                            "No available servers for apb_arch_hint '%s' (arch=(any) package)",
+                            any_arch_hint,
+                        )
+                    else:
+                        logger.warning("No available servers for 'any' architecture")
             else:
                 skipped_archs.append(arch)
                 logger.warning("No server architectures available for 'any' architecture")
@@ -2436,51 +2370,32 @@ async def process_build_queue():
             await asyncio.sleep(10)
 
 
+def _pack_legacy_build_tarball(build_info: Dict) -> bytes:
+    """Pack PKGBUILD and source files of an individual-file submission into a tarball."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        build_path = temp_path / "build"
+        build_path.mkdir()
+        (build_path / "PKGBUILD").write_text(build_info["pkgbuild_content"], encoding="utf-8")
+        for source_file in build_info.get("source_files", []):
+            source_path = build_path / Path(source_file["filename"]).name
+            file_content = source_file["content"]
+            if isinstance(file_content, str):
+                source_path.write_text(file_content, encoding="utf-8")
+            else:
+                source_path.write_bytes(file_content)
+
+        tarball_path = temp_path / "build.tar.gz"
+        create_build_tarball(build_path, tarball_path, skip_artifacts=False)
+        return tarball_path.read_bytes()
+
+
 async def forward_build_to_server(build_info: Dict, server_url: str):
     """Forward a build to a specific server using tarball format"""
     build_id = build_info["build_id"]
-    temp_tarball_path = None
 
     try:
-        import tempfile
-
-        # Use original tarball if available (optimal), otherwise recreate from source_files (legacy compatibility)
-        if build_info.get("original_tarball"):
-            # Write original tarball to temporary file
-            with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
-                temp_tarball.write(build_info["original_tarball"])
-                temp_tarball.flush()
-                temp_tarball_path = temp_tarball.name
-        else:
-            # Fallback: Create temporary tarball from source_files (only for legacy individual file submissions)
-            import tarfile
-            with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
-                temp_tarball_path = temp_tarball.name
-                # Create a temporary directory for build files
-                with tempfile.TemporaryDirectory() as temp_build_dir:
-                    temp_build_path = Path(temp_build_dir)
-
-                    # Write PKGBUILD to real file
-                    pkgbuild_path = temp_build_path / "PKGBUILD"
-                    with open(pkgbuild_path, 'w', encoding='utf-8') as f:
-                        f.write(build_info["pkgbuild_content"])
-
-                    # Write source files to real files (legacy individual file submissions only)
-                    for source_file in build_info.get("source_files", []):
-                        source_path = temp_build_path / source_file["filename"]
-                        file_content = source_file["content"]
-                        if isinstance(file_content, str):
-                            with open(source_path, 'w', encoding='utf-8') as f:
-                                f.write(file_content)
-                        else:
-                            with open(source_path, 'wb') as f:
-                                f.write(file_content)
-
-                    # Create tarball from real files
-                    with tarfile.open(temp_tarball.name, 'w:gz') as tar:
-                        for item in temp_build_path.iterdir():
-                            if item.is_file():
-                                tar.add(item, arcname=item.name)
+        tarball = build_info.get("original_tarball") or _pack_legacy_build_tarball(build_info)
 
         form_data = {"build_id": build_id}
         if "build_timeout" in build_info:
@@ -2491,14 +2406,12 @@ async def forward_build_to_server(build_info: Dict, server_url: str):
         timeout = httpx.Timeout(120.0, connect=15.0)
         logger.info(f"Forwarding build {build_id} to {server_url}")
 
-        with open(temp_tarball_path, "rb") as tarball_file:
-            files = {"build_tarball": ("build.tar.gz", tarball_file, "application/gzip")}
-            response = await http_session.post(
-                f"{server_url}/build",
-                data=form_data,
-                files=files,
-                timeout=timeout,
-            )
+        response = await http_session.post(
+            upstream_url(server_url, BUILD_SUBMIT_PATH),
+            data=form_data,
+            files={"build_tarball": ("build.tar.gz", tarball, "application/gzip")},
+            timeout=timeout,
+        )
 
         if response.status_code == 200:
             cursor = build_database.cursor()
@@ -2532,14 +2445,6 @@ async def forward_build_to_server(build_info: Dict, server_url: str):
         logger.error(f"Error forwarding build {build_id} to {server_url}: {e}")
         return None
 
-    finally:
-        # Clean up temporary file
-        if temp_tarball_path:
-            try:
-                os.unlink(temp_tarball_path)
-            except OSError:
-                pass
-
 
 async def update_single_build_status(build_id: str, server_url: str):
     """Update status for a single build with proper error isolation"""
@@ -2547,7 +2452,7 @@ async def update_single_build_status(build_id: str, server_url: str):
         # Use shorter timeout specifically for status checks to avoid blocking
         timeout = httpx.Timeout(10.0, connect=3.0)
 
-        response = await http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=timeout)
+        response = await http_session.get(upstream_url(server_url, build_status_path(build_id)), timeout=timeout)
         if response.status_code == 200:
             build_status = response.json()
             status = build_status.get("status", BuildStatus.QUEUED)
@@ -2701,30 +2606,29 @@ async def discover_builds():
             for arch, server_urls in available_archs.items():
                 for server_url in server_urls:
                     try:
-                        response = await http_session.get(f"{server_url}/builds/latest?limit=50", timeout=10)
+                        response = await http_session.get(
+                            upstream_url(server_url, BUILDS_LATEST_PATH),
+                            params={"limit": 50},
+                            timeout=10,
+                        )
                         if response.status_code == 200:
-                            builds_data = response.json()
-                            builds = builds_data.get("builds", [])
-
-                            for build in builds:
-                                build_id = build.get("build_id") or build.get("id")
-                                if build_id:
-                                    cursor = build_database.cursor()
-                                    cursor.execute("SELECT id FROM builds WHERE id = ?", (build_id,))
-                                    if not cursor.fetchone():
-                                        cursor.execute('''
-                                            INSERT INTO builds
-                                            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at)
-                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                        ''', (
-                                            build_id, server_url, arch,
-                                            build.get("pkgname", "unknown"),
-                                            build.get("status", BuildStatus.QUEUED),
-                                            build.get("start_time", time.time()),
-                                            build.get("end_time"),
-                                            build.get("created_at", time.time())
-                                        ))
-                                        build_database.commit()
+                            for build in BuildListResponse.model_validate(response.json()).builds:
+                                cursor = build_database.cursor()
+                                cursor.execute("SELECT id FROM builds WHERE id = ?", (build.build_id,))
+                                if not cursor.fetchone():
+                                    cursor.execute('''
+                                        INSERT INTO builds
+                                        (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    ''', (
+                                        build.build_id, server_url, arch,
+                                        build.pkgname,
+                                        build.status,
+                                        build.start_time.timestamp() if build.start_time else None,
+                                        build.end_time.timestamp() if build.end_time else None,
+                                        build.created_at.timestamp() if build.created_at else time.time(),
+                                    ))
+                                    build_database.commit()
                     except Exception as e:
                         logger.error(f"Error discovering builds from {server_url}: {e}")
 
@@ -2764,7 +2668,7 @@ async def handle_unavailable_servers():
 
                         # Try to get one more status update
                         try:
-                            response = await http_session.get(f"{server_url}/build/{build_id}/status-api", timeout=10)
+                            response = await http_session.get(upstream_url(server_url, build_status_path(build_id)), timeout=10)
                             if response.status_code == 200:
                                 build_status = response.json()
                                 cursor.execute('''
@@ -2812,10 +2716,10 @@ async def handle_unavailable_servers():
 async def setup_http_session() -> None:
     """Setup HTTP client for upstream server communication."""
     global http_session
-    http_session = httpx.AsyncClient(
+    http_session = create_async_client(
+        component="Farm",
         timeout=httpx.Timeout(30.0, connect=5.0),
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-        follow_redirects=True,
     )
 
 
@@ -2828,4 +2732,4 @@ async def cleanup_http_session() -> None:
 
 def signal_handler(signum, frame):
     logger.info("Received signal %s, shutting down...", signum)
-    sys.exit(0)
+    shutdown_event.set()

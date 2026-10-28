@@ -124,7 +124,7 @@ The server includes comprehensive resource monitoring capabilities:
 - **Memory Management**: Limits in-memory build outputs to 10,000 lines per build (for live `/output` and SSE); the on-disk `build.log` is always written in full as output is produced
 - **History Cleanup**: Maintains only 100 most recent builds in memory
 - **Old Build Removal**: Automatically removes builds older than 1 hour from memory
-- **Disk Cleanup**: Removes build directories older than 7 days
+- **Disk Cleanup**: Removes failed build sources and artifacts immediately after finalization; `build.log` is retained so it stays downloadable
 
 ### System Information Response
 Enhanced system information includes:
@@ -227,7 +227,7 @@ Get comprehensive server information and status.
 ```json
 {
   "status": "running",
-  "version": "2026-06-30",
+  "version": "2026.10.28",
   "supported_architecture": "x86_64",
   "system_info": {
     "architecture": "x86_64",
@@ -284,7 +284,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "healthy",
-  "version": "2026-06-30",
+  "version": "2026.10.28",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 45.2,
   "checks": {
@@ -319,7 +319,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "degraded",
-  "version": "2026-06-30",
+  "version": "2026.10.28",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 2500.1,
   "warning": "High response time",
@@ -451,6 +451,8 @@ Get build status as JSON.
   ]
 }
 ```
+
+The response is the shared `BuildStatusResponse` model (`apb.models`), the same shape the farm returns. Fields without a value (for example `start_time` while queued) are omitted. Internal build records such as `extra_repos` are not exposed. Times are epoch seconds.
 
 **Status Values:**
 - `queued`: Build is waiting in queue
@@ -666,11 +668,18 @@ List packages produced by a build.
 
 ### Build History
 
+Build history endpoints share their response shape with the farm (`BuildSummary` and `BuildListResponse` in `apb.models`):
+
+- Each build has `build_id`, `pkgname`, `status`, `start_time`, `end_time`, `created_at` and `duration` (seconds). Fields without a value are omitted, for example `end_time` while a build is running.
+- Timestamps are ISO 8601 UTC strings.
+- `total` is the number of builds matching the filters, not the number returned.
+- Builds are ordered newest first by `created_at`.
+
 #### GET /builds/latest
 Get the latest builds with filtering support.
 
 **Parameters:**
-- `limit` (integer, optional): Maximum number of builds (default: 10, max: 100)
+- `limit` (integer, optional): Maximum number of builds (default: 20, min: 1, max: 100)
 - `status` (string, optional): Filter by status
 
 **Response:**
@@ -683,6 +692,7 @@ Get the latest builds with filtering support.
       "status": "completed",
       "start_time": "2024-01-20T10:00:00Z",
       "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T09:59:50Z",
       "duration": 300.0
     }
   ],
@@ -695,7 +705,8 @@ Get builds for a specific package.
 
 **Parameters:**
 - `pkgname` (string, required): The package name
-- `limit` (integer, optional): Maximum number of builds (default: 5, max: 50)
+- `limit` (integer, optional): Maximum number of builds (default: 20, min: 1, max: 100)
+- `status` (string, optional): Filter by status
 
 **Response:**
 ```json
@@ -704,9 +715,11 @@ Get builds for a specific package.
   "builds": [
     {
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "pkgname": "example-package",
       "status": "completed",
       "start_time": "2024-01-20T10:00:00Z",
       "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T09:59:50Z",
       "duration": 300.0
     }
   ],
@@ -715,13 +728,13 @@ Get builds for a specific package.
 ```
 
 #### GET /builds/pkgname/{pkgname}/latest
-Get the latest build for a specific package.
+Get the latest build for a specific package. Returns 404 when none is found.
 
 **Parameters:**
 - `pkgname` (string, required): The package name
 - `successful_only` (boolean, optional): Only return successful builds (default: true)
 
-**Response:**
+**Response:** A single build summary that also includes `packages`:
 ```json
 {
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -729,6 +742,7 @@ Get the latest build for a specific package.
   "status": "completed",
   "start_time": "2024-01-20T10:00:00Z",
   "end_time": "2024-01-20T10:05:00Z",
+  "created_at": "2024-01-20T09:59:50Z",
   "duration": 300.0,
   "packages": [
     {
@@ -764,27 +778,24 @@ Download the latest build file for a package.
 Get cleanup administration page.
 
 **Response:** HTML page with cleanup options including:
-- Disk space usage summary
-- Old build cleanup configuration
+- In-memory build data cleanup
 - Memory usage and cleanup status
 - Manual cleanup triggers
 
 #### POST /admin/cleanup
-Trigger server cleanup with detailed results.
+Trigger in-memory build data cleanup.
 
 **Response:**
 ```json
 {
   "success": true,
-  "message": "Cleanup completed: removed 15 old builds",
+  "message": "In-memory build data cleanup completed",
   "cleanup_id": "cleanup_1642694400"
 }
 ```
 
 **Enhanced Cleanup Features:**
-- **Selective Cleanup**: Removes builds older than 7 days
-- **Memory Cleanup**: Clears build outputs and history
-- **Disk Management**: Removes old build directories
+- **Memory Cleanup**: Clears old build outputs, streams, and trims build history
 - **Error Handling**: Continues cleanup even if some operations fail
 - **Logging**: Detailed logging of cleanup operations
 
@@ -872,9 +883,21 @@ The server implements sophisticated SRCDEST directory locking for concurrent bui
 
 #### Orphan Lock Cleanup
 - **Startup Cleanup**: Removes orphaned locks from previous server sessions
+- **Periodic Cleanup**: Re-runs orphan lock cleanup on the configured interval when `SRCDEST` is set
 - **Process Detection**: Uses `lsof` to verify if locks are actually held
 - **Age-based Cleanup**: Removes locks older than 5 minutes if lsof unavailable
 - **Graceful Degradation**: Continues build even if locking fails
+
+#### Periodic Source Cleanup
+When `SRCDEST` is configured, the server can periodically prune cached source files and directories:
+
+- **CLI Configuration**:
+  - `--srcdest-cleanup-interval SECONDS` (default: `86400`, `0` disables the background task)
+  - `--srcdest-retention-days DAYS` (default: `30`)
+- **Retention Semantics**: Deletes top-level SRCDEST entries whose modification time is older than the retention period
+- **Lock Files**: `.apb-*.lock` files are never removed by source pruning; they are handled by lock cleanup
+- **Active Builds**: Source pruning is skipped while any build is in `BUILDING` status; lock cleanup still runs
+- **No SRCDEST**: When `SRCDEST` is not configured, periodic cleanup is a no-op
 
 #### SRCDEST Configuration
 ```bash
@@ -882,6 +905,27 @@ The server implements sophisticated SRCDEST directory locking for concurrent bui
 SRCDEST="/data/sources"  # Shared source directory
 CCACHE_DIR="/data/ccache"  # Shared ccache directory
 ```
+
+The host `makepkg.conf` defaults to `/etc/makepkg.conf` and can be overridden per server instance:
+
+```bash
+apb-server --makepkg-conf /etc/apb-server2/makepkg.conf --buildroot /data/apb2/buildroot --port 8001
+```
+
+- **Multiple servers**: Use distinct `--makepkg-conf`, `--buildroot`, `--builds-dir`, and `--port` values so `SRCDEST`, `CCACHE_DIR`, and other makepkg settings do not collide on one host
+- **Validation**: If `--makepkg-conf` is set, the path must exist as a regular file at startup
+
+The `SRCDEST` value from the configured `makepkg.conf` can be overridden on the command line:
+
+```bash
+apb-server --srcdest /data/sources
+```
+
+- **Precedence**: `--srcdest` wins over `SRCDEST` in the configured `makepkg.conf`; without it, the file value is used as before
+- **Directory Creation**: The directory is created at startup if it does not exist
+- **Buildroot Configuration**: The effective `SRCDEST` is written into the chroot's `/etc/makepkg.conf` when the buildroot is created or recreated
+- **Scope**: The effective value is used for lock files, the `makechrootpkg -d` bind mount, startup lock cleanup, and periodic source cleanup
+- **CCACHE_DIR**: Read from the configured `makepkg.conf` (same file as `--makepkg-conf` or `/etc/makepkg.conf` by default)
 
 ### Buildroot Management
 
@@ -901,7 +945,8 @@ apb-server.py --buildroot-autorecreate 50
 ```
 
 #### Configuration Management
-- **Host Configuration**: Copies `/etc/makepkg.conf` and `/etc/pacman.conf` to chroot
+- **Host Configuration**: Copies the configured host `makepkg.conf` (default `/etc/makepkg.conf`) and `/etc/pacman.conf` to chroot
+- **SRCDEST Override**: Rewrites the chroot's `SRCDEST` when `--srcdest` is set
 - **Dependency Management**: Installs base, base-devel, and ccache packages
 - **Permission Handling**: Proper sudo permissions for chroot operations
 
@@ -1040,6 +1085,12 @@ Server behavior can be configured via command line arguments and environment var
 #### Architecture and Platform
 - `--architecture`: Override detected architecture (e.g., 'powerpc' for espresso)
 
+#### Source Cache
+- `--makepkg-conf`: Host `makepkg.conf` path (default: `/etc/makepkg.conf`)
+- `--srcdest`: Shared source directory, overriding `SRCDEST` from the configured `makepkg.conf`
+- `--srcdest-cleanup-interval`: Seconds between SRCDEST cleanups (default: 86400, `0` disables)
+- `--srcdest-retention-days`: Delete cached SRCDEST sources older than this many days (default: 30)
+
 #### File Size Limits
 - `--max-file-size`: Maximum individual file size in bytes (default: 100MB)
 - `--max-request-size`: Maximum total request size in bytes (default: 500MB)
@@ -1101,7 +1152,7 @@ The server automatically configures system resource limits:
 - **Processes**: RLIMIT_NPROC set to unlimited
 
 #### Monitoring and Cleanup
-- **Memory Monitoring**: Triggers cleanup at 90% memory usage
-- **Disk Monitoring**: Triggers cleanup at 95% disk usage
+- **Memory Monitoring**: Triggers in-memory cleanup at 90% memory usage
+- **Disk Monitoring**: Logs a warning at 95% disk usage
 - **Build Output Limits**: Maximum 10,000 lines in memory per build (on-disk `build.log` is always complete)
 - **History Limits**: Maximum 100 builds in memory history

@@ -79,6 +79,9 @@ python apb.py --farm /path/to/package/
 python apb.py --farm --login
 python apb.py --farm /path/to/package/
 
+# Farm: queue only selected PKGBUILD architectures (multi-arch PKGBUILD)
+python apb.py --farm --arch powerpc /path/to/package/
+
 # Monitor existing build
 python apb.py --monitor 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 
@@ -103,7 +106,10 @@ python apb.py --list-servers
 ### Python Library
 
 ```python
-from apb import APBotClient, APBAuthClient
+from pathlib import Path
+
+from apb.client.api import APBotClient
+from apb.client.auth import APBAuthClient
 
 # Create authentication client for farm
 auth_client = APBAuthClient("http://farm.example.com:8080")
@@ -114,14 +120,14 @@ auth_client.login("username", "password")
 # Create client instance with authentication
 client = APBotClient("http://farm.example.com:8080", auth_client)
 
-# Submit build
-build_id = client.build_package([Path("PKGBUILD")])
+# Submit the package directory (PKGBUILD plus sources)
+response = client.build_package(Path("./my-package"))
 
-# Monitor build
-status = client.get_build_status(build_id)
+# Check build status
+status = client.get_build_status(response.build_id)
 
 # Download results
-client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
+client.download_file(response.build_id, "package.pkg.tar.xz", Path("./downloads/"))
 ```
 
 ---
@@ -132,7 +138,7 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 
 - `pkgbuild_path` (positional): Path to PKGBUILD or package directory (optional if PKGBUILD in current dir)
 - `--server URL`: Server URL (default: from config or http://localhost:8000)
-- `--arch ARCH`: Target architecture(s) (comma-separated)
+- `--arch ARCH`: Target architecture(s) (comma-separated). With `--farm`, only these names from PKGBUILD `arch=()` are queued on matching build servers
 - `--config PATH`: Path to configuration file
 - `--verbose`: Enable verbose output
 - `--quiet`: Suppress output except errors
@@ -151,6 +157,10 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 - `--no-download`: Don't download build results
 - `--force`: Force rebuild even if package exists
 
+### PKGBUILD variables (client / farm)
+
+- **`apb_arch_hint=<arch>`**: Only when `arch=(any)`. Farm and config-based (`apb.json` servers) builds run on servers of that architecture instead of the default lowest-load or first-configured choice. Does not change the package architecture (`any`); artifacts still go under `output/any/`. Ignored with a warning for any other `arch=()` list. Does not replace `--arch`.
+
 ### Monitoring Options
 
 - `--monitor BUILD_ID`: Monitor existing build with real-time output
@@ -162,7 +172,7 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 
 - `--farm`: Use APB Farm instead of direct server (recommended)
 - `--list-servers`: List and test available servers
-- `--cleanup`: Trigger server cleanup
+- `--cleanup`: Trigger in-memory build data cleanup on the server
 - `--test-arch`: Test architecture compatibility
 
 ---
@@ -263,10 +273,11 @@ python apb.py --farm ./my-package/
 
 ### Configuration File Locations
 
-The client searches for configuration files in this order:
+The client searches for configuration files in this order (`apb.constants.DEFAULT_CONFIG_PATHS`, shared with the farm):
 1. `./apb.json` (current directory)
-2. `~/.config/apb.json` (user config directory)
-3. `/etc/apb.json` (system-wide config)
+2. `/etc/apb/apb.json` (system-wide config)
+3. `~/.apb/apb.json` (user home)
+4. `~/.apb-farm/apb.json` (farm-specific)
 
 ### Configuration Schema
 
@@ -355,10 +366,10 @@ When an APBAuthClient is provided, all requests automatically include authentica
 
 ```python
 # Authentication headers are automatically added
-build_id = client.build_package([Path("PKGBUILD")])
+response = client.build_package(Path("./my-package"))
 
 # No manual header management required
-status = client.get_build_status(build_id)
+status = client.get_build_status(response.build_id)
 ```
 
 ---
@@ -367,28 +378,34 @@ status = client.get_build_status(build_id)
 
 #### build_package()
 
-Submit a build request to the server.
+Submit a build to a server or farm. The build directory is packed into one tarball (the PKGBUILD plus sources, without build artifacts or `exclude_paths`) and posted as `build_tarball` to `POST /build`, together with the optional form fields.
 
 ```python
-def build_package(self, files: List[Path]) -> str
+def build_package(self, build_path: Path,
+                  exclude_paths: Optional[Iterable[Path]] = None,
+                  architectures: Optional[List[str]] = None,
+                  build_timeout: Optional[int] = None) -> BuildSubmitResponse
 ```
 
 **Parameters:**
-- `files` (List[Path]): List of file paths to upload (first should be PKGBUILD)
+- `build_path` (Path): Directory containing the PKGBUILD and source files
+- `exclude_paths` (Iterable[Path], optional): Paths left out of the tarball, such as the output directory
+- `architectures` (List[str], optional): PKGBUILD `arch=()` entries the farm should queue (sent as the `architectures` form field)
+- `build_timeout` (int, optional): Build timeout in seconds (`BUILD_TIMEOUT_MIN` to `BUILD_TIMEOUT_MAX`; admin only on the farm)
 
 **Returns:**
-- `str`: Build UUID
+- `FarmBuildSubmitResponse` when the farm queued per-architecture builds (`builds`, `queue_status`, ...)
+- `BuildSubmitResponse` (`build_id`, `status`, `message`) from a build server
 
 **Raises:**
-- `requests.HTTPError`: On HTTP errors
-- `requests.RequestException`: On connection errors
-- `ValueError`: On invalid response
+- `httpx.HTTPError`: On HTTP error responses or connection errors
+- `apb.client.api.BuildRejectedError`: The farm answered with an `error` payload (for example no servers for the requested architectures); the payload is in `exc.detail`
+- `ValueError`: Missing PKGBUILD, invalid `build_timeout` or an invalid response
 
 **Example:**
 ```python
-files = [Path("PKGBUILD"), Path("source.tar.gz")]
-build_id = client.build_package(files)
-print(f"Build started: {build_id}")
+response = client.build_package(Path("./my-package"), architectures=["x86_64"])
+print(f"Build started: {response.build_id}")
 ```
 
 #### get_build_status()
@@ -396,36 +413,37 @@ print(f"Build started: {build_id}")
 Get the current status of a build.
 
 ```python
-def get_build_status(self, build_id: str) -> Dict
+def get_build_status(self, build_id: str) -> BuildStatusResponse
 ```
 
 **Parameters:**
 - `build_id` (str): Build UUID
 
 **Returns:**
-- `Dict`: Build status information
+- `BuildStatusResponse`: Build status from `GET /build/{build_id}/status-api`. Farm-only fields (`artifacts_ready`, `queue_state`, `queue_position`, `server_unavailable`, ...) are `None` on build servers
 
 **Example:**
 ```python
 status = client.get_build_status("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3")
-print(f"Status: {status['status']}")
-print(f"Package: {status['pkgname']}")
+print(f"Status: {status.status}")
+print(f"Package: {status.pkgname}")
+for package in status.packages:
+    print(package.filename, package.size)
 ```
 
-**Response Format:**
+#### wait_for_farm_artifacts()
+
+Wait until a finished build's artifacts can be downloaded.
+
 ```python
-{
-    "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-    "pkgname": "example-package",
-    "status": "completed",  # queued, building, completed, failed, cancelled
-    "start_time": 1642694400.0,
-    "end_time": 1642694500.0,
-    "duration": 100.0,
-    "exit_code": 0,
-    "packages": [...],
-    "logs": [...]
-}
+def wait_for_farm_artifacts(self, build_id: str, timeout: float = 300.0,
+                            poll_interval: float = 2.0) -> Optional[BuildStatusResponse]
 ```
+
+The farm caches artifacts from the build server before serving them, and reports `artifacts_ready` once done. Build servers do not report `artifacts_ready`, so their status is returned straight away.
+
+**Returns:**
+- `BuildStatusResponse` once artifacts are ready, or `None` on timeout or when the build has not completed or failed
 
 #### cancel_build()
 
@@ -529,29 +547,39 @@ for line in client.stream_output("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3"):
 Get detailed information about a build.
 
 ```python
-def get_build_by_id(self, build_id: str) -> Dict
+def get_build_by_id(self, build_id: str) -> BuildStatusResponse
 ```
 
 **Parameters:**
 - `build_id` (str): Build UUID
 
 **Returns:**
-- `Dict`: Detailed build information including packages, logs, and metadata
+- `BuildStatusResponse`: Same as `get_build_status()`, including packages, logs, and metadata
 
 #### get_builds_by_pkgname()
 
 Get builds for a specific package.
 
 ```python
-def get_builds_by_pkgname(self, pkgname: str, limit: int = 5) -> Dict
+def get_builds_by_pkgname(self, pkgname: str, limit: int = 20,
+                          status: Optional[str] = None) -> BuildListResponse
 ```
 
 **Parameters:**
 - `pkgname` (str): Package name
-- `limit` (int): Maximum number of builds to return
+- `limit` (int): Maximum number of builds to return (1-100)
+- `status` (str, optional): Only return builds with this status
 
 **Returns:**
-- `Dict`: Build history for the package
+- `BuildListResponse`: `builds` (newest first) and `total` (all matching builds)
+
+**Example:**
+```python
+history = client.get_builds_by_pkgname("example-package", limit=5)
+print(f"{len(history.builds)} of {history.total} builds")
+for build in history.builds:
+    print(build.build_id, build.status, build.created_at)
+```
 
 #### get_latest_build_by_pkgname()
 
@@ -559,7 +587,7 @@ Get the latest build for a specific package.
 
 ```python
 def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True,
-                                arch: Optional[str] = None) -> Dict
+                                arch: Optional[str] = None) -> Optional[BuildSummary]
 ```
 
 **Parameters:**
@@ -568,7 +596,7 @@ def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True
 - `arch` (str, optional): Architecture filter. Use `'any'` for `arch=('any')` packages
 
 **Returns:**
-- `Dict`: Latest build information (empty dict if none found)
+- `Optional[BuildSummary]`: Latest build, or `None` if none found
 
 #### get_latest_builds_by_pkgname_per_arch()
 
@@ -576,7 +604,7 @@ Get the latest successful build for each architecture of a package.
 
 ```python
 def get_latest_builds_by_pkgname_per_arch(self, pkgname: str,
-                                          successful_only: bool = True) -> Dict[str, Dict]
+                                          successful_only: bool = True) -> Dict[str, BuildSummary]
 ```
 
 **Parameters:**
@@ -584,7 +612,7 @@ def get_latest_builds_by_pkgname_per_arch(self, pkgname: str,
 - `successful_only` (bool): Only consider successful builds
 
 **Returns:**
-- `Dict[str, Dict]`: Mapping of `server_arch` to build information
+- `Dict[str, BuildSummary]`: Mapping of `server_arch` to the latest build
 
 #### download_latest_build_files()
 
@@ -620,43 +648,27 @@ success = client.download_latest_build_files(
 Stream build status updates in real-time.
 
 ```python
-def stream_build_updates(self, build_id: str) -> Generator[Dict, None, None]
+def stream_build_updates(self, build_id: str) -> Generator[BuildStatusResponse, None, None]
 ```
 
 **Parameters:**
 - `build_id` (str): Build UUID
 
 **Returns:**
-- `Generator[Dict, None, None]`: Generator yielding status updates
+- `Generator[BuildStatusResponse, None, None]`: Status every 5 seconds until the build reaches a terminal state
 
 **Example:**
 ```python
 for update in client.stream_build_updates("48ea1df5-f7f3-477e-a7a7-36e526ea7cd3"):
-    print(f"Status: {update['status']}")
-    if update.get("queue_state") == "farm":
+    print(f"Status: {update.status}")
+    if update.queue_state == "farm":
         print(
-            f"Farm queue position {update['queue_position']}/{update['farm_queue_size']} "
-            f"({update['jobs_ahead']} job(s) ahead)"
+            f"Farm queue position {update.queue_position}/{update.farm_queue_size} "
+            f"({update.jobs_ahead} job(s) ahead)"
         )
-    if update['status'] in ['completed', 'failed', 'cancelled']:
-        break
 ```
 
 When a build is waiting in the farm queue, status responses include `queue_state`, `queue_position`, `jobs_ahead`, and `farm_queue_size`. The CLI prints these while monitoring and removes farm-queued builds on interrupt or `--cancel`.
-
-#### get_latest_successful_build_id()
-
-Get the build ID of the latest successful build for a package.
-
-```python
-def get_latest_successful_build_id(self, is_interactive: bool = True) -> str
-```
-
-**Parameters:**
-- `is_interactive` (bool): Whether to prompt user for input if multiple packages found
-
-**Returns:**
-- `str`: Build ID of the latest successful build
 
 ---
 
@@ -664,7 +676,7 @@ def get_latest_successful_build_id(self, is_interactive: bool = True) -> str
 
 #### cleanup_server()
 
-Trigger server cleanup.
+Trigger in-memory build data cleanup on the server.
 
 ```python
 def cleanup_server(self) -> bool
@@ -677,71 +689,76 @@ def cleanup_server(self) -> bool
 
 ## High-Level Functions
 
+These live in `apb.client.cli`.
+
 ### submit_build()
 
-Submit a build to a server with automatic server selection.
+Submit a build directory to a server or farm. Farm and direct server submissions use the same function; it wraps `APBotClient.build_package()` and prints errors instead of raising them.
 
 ```python
-def submit_build(server_url: str, pkgbuild_path: Path, source_files: List[Path], auth_client: Optional[APBAuthClient] = None) -> Optional[str]
+def submit_build(server_url: str, build_path: Path,
+                 auth_client: Optional[APBAuthClient] = None,
+                 exclude_paths: Optional[List[Path]] = None,
+                 architectures: Optional[List[str]] = None,
+                 build_timeout: Optional[int] = None) -> Optional[BuildSubmitResponse]
 ```
 
 **Parameters:**
-- `server_url` (str): Server URL
-- `pkgbuild_path` (Path): Path to PKGBUILD file
-- `source_files` (List[Path]): List of source files
+- `server_url` (str): Server or farm URL
+- `build_path` (Path): Directory containing the PKGBUILD and source files
 - `auth_client` (APBAuthClient, optional): Authentication client for farm connections
+- `exclude_paths` (List[Path], optional): Paths left out of the tarball
+- `architectures` (List[str], optional): PKGBUILD architectures the farm should queue
+- `build_timeout` (int, optional): Build timeout in seconds (admin only on the farm)
 
 **Returns:**
-- `Optional[str]`: Build ID if successful, None otherwise
-
-### submit_build_to_farm()
-
-Submit a build to a farm server with authentication support.
-
-```python
-def submit_build_to_farm(server_url: str, pkgbuild_path: Path, source_files: List[Path],
-                        architectures: List[str] = None,
-                        auth_client: Optional[APBAuthClient] = None) -> Optional[Dict]
-```
-
-**Parameters:**
-- `server_url` (str): Farm server URL
-- `pkgbuild_path` (Path): Path to PKGBUILD file
-- `source_files` (List[Path]): List of source files
-- `architectures` (List[str], optional): Target architectures
-- `auth_client` (APBAuthClient, optional): Authentication client
-
-**Returns:**
-- `Optional[Dict]`: Full response dictionary if successful, None otherwise
-
-**Enhanced Features:**
-- **Authentication Support**: Automatic authentication header inclusion
-- **Error Handling**: Clear authentication error messages
-- **Multi-Architecture**: Support for architecture-specific builds
+- `FarmBuildSubmitResponse` or `BuildSubmitResponse` (see `build_package()`), or `None` when the submission failed. Authentication (401), permission (403) and farm rejection details are printed
 
 **Example:**
 ```python
-# With authentication
 auth_client = APBAuthClient("https://farm.example.com")
 auth_client.login("username", "password")
 
-response = submit_build_to_farm(
+response = submit_build(
     "https://farm.example.com",
-    Path("PKGBUILD"),
-    [Path("source.tar.gz")],
-    ["x86_64", "aarch64"],
-    auth_client
+    Path("./my-package"),
+    auth_client,
+    architectures=["x86_64", "aarch64"],
 )
 ```
 
-### monitor_build()
+### monitor_builds()
 
-Monitor a build with optional real-time output and automatic downloading.
+Monitor submitted builds in parallel, then download their artifacts.
 
 ```python
-def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
-                 verbose: bool = False, allow_toggle: bool = True,
-                 status_callback = None, pkgname: str = None, arch: str = None) -> bool
+class MonitorTarget(NamedTuple):
+    build_id: str
+    client: APBotClient
+    output_dir: Optional[Path] = None   # None disables downloads
+    arch: Optional[str] = None          # used as the "[arch] " output prefix
+
+def monitor_builds(targets: List[MonitorTarget], *, verbose: bool = False) -> Dict[str, Tuple[str, bool]]
+```
+
+**Returns:**
+- `Dict[str, Tuple[str, bool]]`: Build ID mapped to (final status, is_successful). A build is successful when it completed and its artifacts were downloaded (or downloads are disabled)
+
+**Behaviour:**
+- One poll loop for farm and server builds, driven by `BuildStatusResponse` every 5 seconds
+- Prints status changes and the farm queue position while a build waits in the farm queue
+- Retries HTTP 502/503 and `server_unavailable` responses up to 8 times in a row; a cached terminal status is accepted after that
+- Gives up after 5 consecutive other errors (such as 404)
+- Waits for the farm's `artifacts_ready` before downloading completed or failed builds into `output_dir`
+- Ctrl-C cancels every unfinished build
+
+### monitor_build()
+
+Monitor a single build and download its artifacts. Wraps `monitor_builds()`.
+
+```python
+def monitor_build(build_id: str, client: APBotClient, output_dir: Optional[Path] = None,
+                  verbose: bool = False, arch: Optional[str] = None) -> bool
 ```
 
 **Parameters:**
@@ -749,77 +766,44 @@ def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
 - `client` (APBotClient): Client instance
 - `output_dir` (Path, optional): Directory to download results
 - `verbose` (bool): Enable verbose output
-- `allow_toggle` (bool): Allow toggling output display
-- `status_callback` (callable, optional): Callback for status updates
-- `pkgname` (str, optional): Package name to display
 - `arch` (str, optional): Architecture being built (for display purposes)
 
 **Returns:**
-- `bool`: True if build was successful
-
-### monitor_farm_builds()
-
-Monitor multiple builds from a farm submission with authentication support.
-
-```python
-def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Path = None,
-                       verbose: bool = False, pkgbuild_path: Path = None,
-                       auth_client: Optional[APBAuthClient] = None) -> bool
-```
-
-**Parameters:**
-- `builds` (List[Dict]): List of build information dictionaries
-- `client` (APBotClient): Client instance
-- `output_dir` (Path, optional): Base output directory
-- `verbose` (bool): Enable verbose output
-- `pkgbuild_path` (Path, optional): Path to PKGBUILD file
-- `auth_client` (APBAuthClient, optional): Authentication client
-
-**Returns:**
-- `bool`: True if all builds were successful
-
-**Authentication Features:**
-- **Automatic Authentication**: Uses auth_client for all requests
-- **Permission Checking**: Respects user permissions for build cancellation
-- **Error Handling**: Graceful handling of authentication errors
-
-**Enhanced Monitoring Features:**
-- **Interactive Controls**: Press 'd' to toggle detailed output, 's' for summary only
-- **Real-time Updates**: Live build status and progress tracking
-- **Automatic Downloads**: Downloads artifacts when build completes successfully
-- **Error Handling**: Graceful handling of connection issues and server unavailability
-- **Status Callbacks**: Custom callbacks for build status changes
+- `bool`: True if the build completed and its artifacts were downloaded
 
 ### build_for_multiple_arches()
 
-Build a package for multiple architectures using available servers.
+Build a package for multiple architectures using the per-architecture servers from the configuration. This is what `apb` runs when neither `--server` nor `--farm` is given.
 
 ```python
 def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
-                            verbose: bool = False, detach: bool = False,
-                            specific_arch: str = None, force: bool = False,
-                            auth_client: Optional[APBAuthClient] = None) -> bool
+                              verbose: bool = False, detach: bool = False,
+                              specific_arch: Optional[str] = None, force: bool = False,
+                              auth_client: Optional[APBAuthClient] = None,
+                              build_timeout: Optional[int] = None,
+                              download: bool = True) -> bool
 ```
 
 **Parameters:**
 - `build_path` (Path): Path to package directory
-- `output_dir` (Path): Output directory
+- `output_dir` (Path): Output directory; results go to `output_dir/<arch>`
 - `config` (Dict): Configuration dictionary
 - `verbose` (bool): Enable verbose output
 - `detach` (bool): Don't wait for completion
-- `specific_arch` (str, optional): Build for specific architecture only
+- `specific_arch` (str, optional): Comma-separated architectures to build (default: PKGBUILD `arch=()` entries with configured servers, or `any`)
 - `force` (bool): Force rebuild even if package exists
 - `auth_client` (APBAuthClient, optional): Authentication client
+- `build_timeout` (int, optional): Build timeout in seconds
+- `download` (bool): Download build results after completion
 
 **Returns:**
-- `bool`: True if all builds were successful
+- `bool`: True if every architecture was built (or, with `detach`, submitted) successfully or skipped because its package already exists. Architectures without configured servers count as failed.
 
 **Multi-Architecture Features:**
-- **Automatic Server Selection**: Chooses best server for each architecture
-- **Parallel Processing**: Handles multiple builds concurrently
-- **Progress Tracking**: Shows progress for all builds simultaneously
+- **Server Fallback**: Tries each configured server for an architecture until one accepts the build
+- **Parallel Monitoring**: All submitted builds are monitored at the same time
 - **Architecture Filtering**: Can build for specific architectures only
-- **Intelligent Fallback**: Falls back to farm if direct servers unavailable
+- **`arch=(any)` Support**: Uses `apb_arch_hint` or the first configured server architecture
 
 ---
 
@@ -904,19 +888,27 @@ def determine_server_url(args: argparse.Namespace, config: Dict) -> str
 
 ### Exception Types
 
-The client raises standard `requests` exceptions:
+The client raises `httpx` exceptions, plus `BuildRejectedError` for refused farm submissions:
 
-- `requests.HTTPError`: HTTP errors (4xx, 5xx responses)
-- `requests.ConnectionError`: Connection errors
-- `requests.Timeout`: Request timeouts
-- `requests.RequestException`: General request errors
+- `httpx.HTTPStatusError`: HTTP errors (4xx, 5xx responses)
+- `httpx.ConnectError`: Connection errors
+- `httpx.TimeoutException`: Request timeouts
+- `httpx.HTTPError`: Base class of all of the above
+- `apb.client.api.BuildRejectedError` (a `ValueError`): The farm answered `POST /build` with an `error` payload
 
 ### Enhanced Error Handling
 
 ```python
+import httpx
+
+from apb.client.api import BuildRejectedError
+
 try:
-    build_id = client.build_package([Path("PKGBUILD")])
-except requests.HTTPError as e:
+    build_id = client.build_package(Path("./my-package")).build_id
+except BuildRejectedError as e:
+    print(f"Farm refused the build: {e}")
+    print(e.detail.get("available_architectures"))
+except httpx.HTTPStatusError as e:
     if e.response.status_code == 503:
         print("Server unavailable - try again later")
     elif e.response.status_code == 400:
@@ -924,9 +916,9 @@ except requests.HTTPError as e:
     else:
         print(f"HTTP Error: {e.response.status_code}")
         print(f"Response: {e.response.text}")
-except requests.ConnectionError:
+except httpx.ConnectError:
     print("Could not connect to server - check URL and network")
-except requests.RequestException as e:
+except httpx.HTTPError as e:
     print(f"Request error: {e}")
 ```
 
@@ -945,41 +937,32 @@ except requests.RequestException as e:
 
 ```python
 from pathlib import Path
-from apb import APBotClient
+
+from apb.client.api import APBotClient
 
 # Create client
 client = APBotClient("http://build-server.example.com:8000")
 
 # Submit build
-files = [Path("PKGBUILD"), Path("source.tar.gz")]
-build_id = client.build_package(files)
+build_id = client.build_package(Path("./my-package")).build_id
 print(f"Build started: {build_id}")
 
 # Monitor progress
-while True:
-    status = client.get_build_status(build_id)
-    print(f"Status: {status['status']}")
-
-    if status['status'] in ['completed', 'failed', 'cancelled']:
-        break
-
-    time.sleep(5)
+for status in client.stream_build_updates(build_id):
+    print(f"Status: {status.status}")
 
 # Download results if successful
-if status['status'] == 'completed':
-    for package in status['packages']:
-        client.download_file(
-            build_id,
-            package['filename'],
-            Path("./downloads/")
-        )
+if status.status == "completed":
+    for package in status.packages:
+        client.download_file(build_id, package.filename, Path("./downloads/"))
 ```
 
 ### Authentication Workflow
 
 ```python
 from pathlib import Path
-from apb import APBAuthClient, APBotClient
+from apb.client.api import APBotClient
+from apb.client.auth import APBAuthClient
 
 # Setup authentication
 auth_client = APBAuthClient("https://farm.example.com")
@@ -996,8 +979,8 @@ if auth_client.login("username", "password"):
     client = APBotClient("https://farm.example.com", auth_client)
 
     # Submit build (authentication automatic)
-    build_id = client.build_package([Path("PKGBUILD")])
-    print(f"Build submitted: {build_id}")
+    response = client.build_package(Path("./my-package"))
+    print(f"Build submitted: {response.build_id}")
 else:
     print("Login failed")
 ```
@@ -1005,33 +988,34 @@ else:
 ### Farm Build with Authentication
 
 ```python
-from apb import APBAuthClient, submit_build_to_farm, monitor_farm_builds
+from pathlib import Path
+
+from apb.client.api import APBotClient
+from apb.client.auth import APBAuthClient
+from apb.client.cli import MonitorTarget, monitor_builds, submit_build
 
 # Setup authentication
 auth_client = APBAuthClient("https://farm.example.com")
 auth_client.login("username", "password")
 
 # Submit build to farm
-response = submit_build_to_farm(
+response = submit_build(
     "https://farm.example.com",
-    Path("PKGBUILD"),
-    [Path("source.tar.gz")],
-    ["x86_64", "aarch64"],
-    auth_client
+    Path("./my-package"),
+    auth_client,
+    architectures=["x86_64", "aarch64"],
 )
 
-if response and 'builds' in response:
-    # Monitor builds
+if response:
+    # Monitor all queued builds in parallel, one output directory per architecture
     client = APBotClient("https://farm.example.com", auth_client)
-    success = monitor_farm_builds(
-        response['builds'],
-        client,
-        output_dir=Path("./output/"),
+    results = monitor_builds(
+        [MonitorTarget(build.build_id, client, Path("./output") / build.arch, build.arch)
+         for build in response.builds],
         verbose=True,
-        auth_client=auth_client
     )
 
-    if success:
+    if all(is_successful for _status, is_successful in results.values()):
         print("All builds completed successfully!")
 else:
     print("Failed to submit builds")
@@ -1040,20 +1024,23 @@ else:
 ### Real-time Build Monitoring
 
 ```python
-from apb import APBotClient, monitor_build
+from pathlib import Path
+
+from apb.client.api import APBotClient
+from apb.client.cli import monitor_build
 
 client = APBotClient("http://build-server.example.com:8000")
 
 # Submit build
-build_id = client.build_package([Path("PKGBUILD")])
+build_id = client.build_package(Path("./my-package")).build_id
 
-# Monitor with real-time output and automatic downloading
+# Monitor with status output and automatic downloading
 success = monitor_build(
     build_id,
     client,
     output_dir=Path("./output/x86_64"),
     verbose=True,
-    allow_toggle=True
+    arch="x86_64",
 )
 
 if success:
@@ -1066,7 +1053,8 @@ else:
 
 ```python
 from pathlib import Path
-from apb import build_for_multiple_arches, load_config
+from apb.client.cli import build_for_multiple_arches
+from apb.config import load_config
 
 # Load configuration
 config = load_config()
@@ -1089,7 +1077,8 @@ else:
 ### Using APB Farm
 
 ```python
-from apb import APBotClient, APBAuthClient
+from apb.client.api import APBotClient
+from apb.client.auth import APBAuthClient
 
 # Setup authentication for farm
 auth_client = APBAuthClient("http://farm.example.com:8080")
@@ -1099,11 +1088,11 @@ auth_client.login("username", "password")
 client = APBotClient("http://farm.example.com:8080", auth_client)
 
 # Farm automatically routes builds to appropriate servers
-build_id = client.build_package([Path("PKGBUILD")])
+response = client.build_package(Path("./my-package"))
 
 # Monitor as usual - farm handles server unavailability
-status = client.get_build_status(build_id)
-print(f"Build routed to: {status.get('server_url', 'unknown')}")
+status = client.get_build_status(response.build_id)
+print(f"Build routed to: {status.server_url or 'unknown'}")
 ```
 
 ### Command Line Authentication Examples
@@ -1116,7 +1105,7 @@ python apb.py --farm ./my-package/
 # Check what user is logged in
 python apb.py --farm --auth-status
 
-# Build for specific architectures with authentication
+# Build only for selected PKGBUILD architectures (not every arch=() entry)
 python apb.py --farm --arch x86_64,aarch64 ./my-package/
 
 # Monitor with authentication
@@ -1143,17 +1132,21 @@ python apb.py --farm --login && python apb.py --farm ./my-package/
 ### Error Handling with Authentication
 
 ```python
-from apb import APBAuthClient, APBotClient
-import requests
 import getpass
+from pathlib import Path
+
+import httpx
+
+from apb.client.api import APBotClient
+from apb.client.auth import APBAuthClient
 
 auth_client = APBAuthClient("https://farm.example.com")
 client = APBotClient("https://farm.example.com", auth_client)
 
 try:
     # This will fail if not authenticated
-    build_id = client.build_package([Path("PKGBUILD")])
-except requests.HTTPError as e:
+    build_id = client.build_package(Path("./my-package")).build_id
+except httpx.HTTPStatusError as e:
     if e.response.status_code == 401:
         print("Authentication required - please login")
         # Attempt login
@@ -1161,7 +1154,9 @@ except requests.HTTPError as e:
         password = getpass.getpass("Password: ")
         if auth_client.login(username, password):
             print("Login successful, retrying build...")
-            build_id = client.build_package([Path("PKGBUILD")])
+            # A new client picks up the new token
+            client = APBotClient("https://farm.example.com", auth_client)
+            build_id = client.build_package(Path("./my-package")).build_id
         else:
             print("Login failed")
     elif e.response.status_code == 403:
@@ -1193,9 +1188,8 @@ except requests.HTTPError as e:
 - Use farms for multi-server environments
 
 ### Monitoring
-- Implement status callbacks for long-running builds
-- Use real-time streaming for immediate feedback
-- Enable interactive controls for manual monitoring
+- Use `monitor_builds()` to follow several builds in parallel
+- Use `stream_build_updates()` for custom status handling
 - Set up automatic downloading for completed builds
 
 ### Security

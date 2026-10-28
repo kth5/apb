@@ -8,12 +8,12 @@ import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from apb import VERSION
 from apb.server import engine
 from apb.server.routes import router
+from apb.service import add_default_cors
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,15 @@ async def lifespan(app: FastAPI):
     queue_thread = threading.Thread(target=engine.process_build_queue, daemon=True)
     queue_thread.start()
     logger.info("Queue processor thread started: %s", queue_thread.is_alive())
+
+    if engine.server_config.get("srcdest_cleanup_interval", 0) > 0:
+        srcdest_cleanup_thread = threading.Thread(
+            target=engine.monitor_srcdest_cleanup,
+            daemon=True,
+        )
+        srcdest_cleanup_thread.start()
+        logger.info("SRCDEST cleanup thread started")
+
     logger.info("APB Server background tasks started")
 
     yield
@@ -67,13 +76,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="APB Server", version=VERSION, lifespan=lifespan)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    add_default_cors(app)
 
     @app.middleware("http")
     async def request_timeout_middleware(request: Request, call_next):

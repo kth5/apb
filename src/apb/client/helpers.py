@@ -2,10 +2,10 @@
 
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
-from apb.arch import package_arch_suffix
-from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_info_to_dict
+from apb.arch import KNOWN_PACKAGE_ARCH_SUFFIXES, package_arch_suffix
+from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_arch_is_any_only, pkgbuild_info_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +30,10 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
     Returns:
         Tuple of (exists, found_filename_or_summary)
     """
-    # Use PKGBUILD architectures or fallback to common ones
     if pkgbuild_archs:
-        potential_suffixes = [package_arch_suffix(a) for a in pkgbuild_archs]
-        # Remove duplicates while preserving order
-        potential_suffixes = list(dict.fromkeys(potential_suffixes))
+        potential_suffixes = list(dict.fromkeys(package_arch_suffix(a) for a in pkgbuild_archs))
     else:
-        # Fallback to common architectures if PKGBUILD archs not provided
-        potential_suffixes = ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'espresso', 'any']
+        potential_suffixes = KNOWN_PACKAGE_ARCH_SUFFIXES
 
     # Helper function to construct version string with epoch
     def construct_version_string():
@@ -181,7 +177,70 @@ def should_skip_build(output_dir: Path, pkgbuild_path: Path, arch: str, force: b
     return False, "Package not found, proceeding with build"
 
 
-def get_architectures_needing_build(pkgbuild_path: Path, output_dir: Path, force: bool = False) -> List[str]:
+def print_apb_arch_hint_notice(pkg_info: dict) -> None:
+    """Print how apb_arch_hint applies for this PKGBUILD (farm and config client paths)."""
+    hint = pkg_info.get("apb_arch_hint")
+    if not hint:
+        return
+    archs = pkg_info.get("arch") or []
+    if pkgbuild_arch_is_any_only(archs):
+        print(f"Using PKGBUILD apb_arch_hint: {hint}")
+    else:
+        print(
+            f"Warning: apb_arch_hint={hint} ignored (only applies when arch=(any))"
+        )
+
+
+def effective_any_server_arch(pkg_info: dict, servers: dict) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve which configured server architecture to use for arch=(any).
+
+    Returns (server_arch, error_message). error_message is set when a hint was
+    required but no matching servers exist.
+    """
+    archs = pkg_info.get("arch") or []
+    hint = pkg_info.get("apb_arch_hint") if pkgbuild_arch_is_any_only(archs) else None
+
+    if hint:
+        server_urls = servers.get(hint) or []
+        if not server_urls:
+            return None, (
+                f"No servers configured for apb_arch_hint '{hint}' "
+                f"(available: {', '.join(sorted(servers.keys())) or 'none'})"
+            )
+        return hint, None
+
+    available_server_archs = [key for key, urls in servers.items() if urls]
+    if not available_server_archs:
+        return None, "No servers available for any architecture"
+    return available_server_archs[0], None
+
+
+def select_pkgbuild_architectures(
+    pkgbuild_archs: List[str],
+    arch_filter: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str]]:
+    """
+    Intersect PKGBUILD arch=() with a client --arch request.
+
+    Returns:
+        (selected architectures in PKGBUILD order, requested names not in PKGBUILD)
+    """
+    if not arch_filter:
+        return list(pkgbuild_archs), []
+
+    requested = set(arch_filter)
+    selected = [arch for arch in pkgbuild_archs if arch in requested]
+    missing = sorted(requested - set(pkgbuild_archs))
+    return selected, missing
+
+
+def get_architectures_needing_build(
+    pkgbuild_path: Path,
+    output_dir: Path,
+    force: bool = False,
+    arch_filter: Optional[List[str]] = None,
+) -> List[str]:
     """
     Get list of architectures that need building (don't have existing packages).
 
@@ -189,15 +248,19 @@ def get_architectures_needing_build(pkgbuild_path: Path, output_dir: Path, force
         pkgbuild_path: Path to PKGBUILD file
         output_dir: Output directory to check for existing packages
         force: Force rebuild even if packages exist
+        arch_filter: If set, only consider these architectures (must appear in PKGBUILD)
 
     Returns:
         List of architectures that need building
     """
     pkg_info = parse_pkgbuild_info(pkgbuild_path)
-    target_archs = pkg_info.get("arch", ["x86_64"])
+    pkgbuild_archs = pkg_info.get("arch", ["x86_64"])
+    target_archs, _missing = select_pkgbuild_architectures(pkgbuild_archs, arch_filter)
+    if arch_filter and not target_archs:
+        return []
 
     if force:
-        # If force is specified, all architectures need building
+        # If force is specified, all selected architectures need building
         return target_archs
 
     # Special handling for "any" architecture

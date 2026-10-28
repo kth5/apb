@@ -1,26 +1,53 @@
 """APB HTTP API client."""
 
-import json
 import logging
-import os
-import queue
 import tempfile
-import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
-from urllib.parse import urljoin
+from typing import Any, Dict, Generator, Iterable, List, Optional
 
 import httpx
+from pydantic import ValidationError
 
-from apb import VERSION
+from apb.constants import BuildStatus
 from apb.http import create_sync_client
+from apb.models import (
+    BuildListResponse,
+    BuildStatusResponse,
+    BuildSubmitResponse,
+    BuildSummary,
+    FarmBuildSubmitResponse,
+)
 from apb.tarball import create_build_tarball
+from apb.validation import validate_build_timeout
+from apb.upstream import (
+    ADMIN_CLEANUP_PATH,
+    BUILD_SUBMIT_PATH,
+    build_cancel_path,
+    build_download_path,
+    build_output_path,
+    build_status_path,
+    build_stream_path,
+    download,
+    pkgname_builds_path,
+    pkgname_latest_by_arch_path,
+    pkgname_latest_path,
+    upstream_url,
+)
 
 if True:
     from apb.client.auth import APBAuthClient
 
 logger = logging.getLogger(__name__)
+
+
+class BuildRejectedError(ValueError):
+    """The farm answered the submission with an ``error`` payload instead of queuing builds."""
+
+    def __init__(self, detail: Dict[str, Any]):
+        super().__init__(detail.get("message") or detail.get("error"))
+        self.detail = detail
+
 
 class APBotClient:
     """Main client class for interacting with APB servers."""
@@ -31,63 +58,64 @@ class APBotClient:
         self.session = create_sync_client(component="Client")
         self.auth_client = auth_client
 
-        # Set User-Agent header to identify the client
-        self.session.headers.update({
-            'User-Agent': f'APB-Client/{VERSION}'
-        })
-
         # Set authentication headers if available
         if self.auth_client:
             headers = self.auth_client.get_auth_headers()
             self.session.headers.update(headers)
 
-    def build_package(self, build_path: Path) -> str:
+    def build_package(
+        self,
+        build_path: Path,
+        exclude_paths: Optional[Iterable[Path]] = None,
+        architectures: Optional[List[str]] = None,
+        build_timeout: Optional[int] = None,
+    ) -> BuildSubmitResponse:
         """
-        Submit a build request to the server using a tarball of all files in the build directory.
+        Submit a tarball of the build directory to a server or farm.
 
         Args:
             build_path: Path to directory containing PKGBUILD and source files
+            exclude_paths: Paths left out of the tarball (e.g. the output directory)
+            architectures: PKGBUILD architectures the farm should queue (farm only)
+            build_timeout: Build timeout in seconds (admin only on the farm)
 
         Returns:
-            Build UUID provided by APB Farm
+            FarmBuildSubmitResponse when the farm queued per-architecture builds,
+            otherwise the server's BuildSubmitResponse
 
         Raises:
-            httpx.HTTPStatusError: On HTTP error responses
-            httpx.HTTPError: On connection errors
-            ValueError: On invalid response or missing PKGBUILD
+            httpx.HTTPError: On HTTP error responses or connection errors
+            BuildRejectedError: When the farm refuses to queue the submission
+            ValueError: On invalid response, build timeout or missing PKGBUILD
         """
-        # Ensure we have a PKGBUILD
-        pkgbuild_path = build_path / "PKGBUILD"
-        if not pkgbuild_path.exists():
+        if not (build_path / "PKGBUILD").exists():
             raise ValueError(f"PKGBUILD not found in {build_path}")
 
-        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
-            try:
-                create_build_tarball(build_path, Path(temp_tarball.name))
+        form_data: Dict[str, str] = {}
+        if architectures:
+            form_data['architectures'] = ','.join(architectures)
+        if build_timeout is not None:
+            form_data['build_timeout'] = str(validate_build_timeout(build_timeout))
 
-                # Submit the tarball using streaming to avoid memory issues
-                with open(temp_tarball.name, 'rb') as f:
-                    files_data = [('build_tarball', ('build.tar.gz', f, 'application/gzip'))]
+        url = upstream_url(self.server_url, BUILD_SUBMIT_PATH)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tarball_path = Path(temp_dir) / "build.tar.gz"
+            create_build_tarball(build_path, tarball_path, exclude_paths=exclude_paths)
+            with tarball_path.open('rb') as tarball:
+                files_data = [('build_tarball', ('build.tar.gz', tarball, 'application/gzip'))]
+                response = self.session.post(url, files=files_data, data=form_data)
+        response.raise_for_status()
 
-                    # Submit build request
-                    url = urljoin(self.server_url, '/build')
-                    response = self.session.post(url, files=files_data)
-                    response.raise_for_status()
+        payload = response.json()
+        if "error" in payload:
+            raise BuildRejectedError(payload)
+        response_model = FarmBuildSubmitResponse if "builds" in payload else BuildSubmitResponse
+        try:
+            return response_model.model_validate(payload)
+        except ValidationError as exc:
+            raise ValueError(f"Invalid build submit response: {exc}") from exc
 
-                result = response.json()
-                if 'build_id' not in result:
-                    raise ValueError("Invalid response: missing build_id")
-
-                return result['build_id']
-
-            finally:
-                # Clean up temporary file
-                try:
-                    os.unlink(temp_tarball.name)
-                except OSError:
-                    pass
-
-    def get_build_status(self, build_id: str) -> Dict:
+    def get_build_status(self, build_id: str) -> BuildStatusResponse:
         """
         Get the current status of a build.
 
@@ -95,40 +123,41 @@ class APBotClient:
             build_id: Build UUID
 
         Returns:
-            Build status information
+            Build status reported by the server or farm
         """
-        url = urljoin(self.server_url, f'/build/{build_id}/status')
-        response = self.session.get(url, params={'format': 'json'})
+        url = upstream_url(self.server_url, build_status_path(build_id))
+        response = self.session.get(url)
         response.raise_for_status()
-        return response.json()
+        return BuildStatusResponse.model_validate(response.json())
 
     def wait_for_farm_artifacts(
         self,
         build_id: str,
         timeout: float = 300.0,
         poll_interval: float = 2.0,
-    ) -> bool:
+    ) -> Optional[BuildStatusResponse]:
         """
         Wait until the farm has cached all build artifacts locally.
 
         The client must not download artifacts until the farm reports
-        ``artifacts_ready`` in the build status response.
+        ``artifacts_ready`` in the build status response. Build servers do not
+        report ``artifacts_ready``; their artifacts are ready immediately.
+
+        Returns:
+            The status once artifacts are ready, or None on timeout or when the
+            build has not finished
         """
         deadline = time.time() + timeout
 
         while time.time() < deadline:
             status = self.get_build_status(build_id)
-            build_status = status.get("status", "unknown")
-
-            if status.get("artifacts_ready"):
-                return True
-
-            if build_status not in ("completed", "failed"):
-                return False
-
+            if status.status not in (BuildStatus.COMPLETED, BuildStatus.FAILED):
+                return None
+            if status.artifacts_ready is not False:
+                return status
             time.sleep(poll_interval)
 
-        return False
+        return None
 
     def cancel_build(self, build_id: str) -> bool:
         """
@@ -140,7 +169,7 @@ class APBotClient:
         Returns:
             True if cancellation was successful
         """
-        url = urljoin(self.server_url, f'/build/{build_id}/cancel')
+        url = upstream_url(self.server_url, build_cancel_path(build_id))
         try:
             response = self.session.post(url)
             response.raise_for_status()
@@ -160,21 +189,12 @@ class APBotClient:
         Returns:
             True if download was successful
         """
-        url = urljoin(self.server_url, f'/build/{build_id}/download/{filename}')
+        url = upstream_url(self.server_url, build_download_path(build_id, filename))
 
         try:
-            with self.session.stream("GET", url) as response:
-                response.raise_for_status()
-
-                output_dir.mkdir(parents=True, exist_ok=True)
-                output_path = output_dir / filename
-
-                with open(output_path, "wb") as handle:
-                    for chunk in response.iter_bytes(chunk_size=8192):
-                        handle.write(chunk)
-
+            download(self.session, url, output_dir / Path(filename).name)
             return True
-        except httpx.HTTPError:
+        except (httpx.HTTPError, OSError):
             return False
 
     def download_latest_build_files(self, pkgname: str, output_dir: Path,
@@ -195,28 +215,17 @@ class APBotClient:
             if not latest_build:
                 return False
 
-            build_id = latest_build['build_id']
+            build_id = latest_build.build_id
 
-            # Get build status to find package files
             status = self.get_build_status(build_id)
-
-            # Download all package files
-            if 'packages' in status and status['packages']:
-                for package in status['packages']:
-                    if not self.download_file(build_id, package['filename'], output_dir):
-                        return False
-
-            # Download all log files
-            if 'logs' in status and status['logs']:
-                for log in status['logs']:
-                    if not self.download_file(build_id, log['filename'], output_dir):
-                        return False
-
-            return True
+            return all(
+                self.download_file(build_id, artifact.filename, output_dir)
+                for artifact in [*status.packages, *status.logs]
+            )
         except httpx.HTTPError:
             return False
 
-    def get_build_by_id(self, build_id: str) -> Dict:
+    def get_build_by_id(self, build_id: str) -> BuildStatusResponse:
         """
         Get detailed information about a build.
 
@@ -224,28 +233,40 @@ class APBotClient:
             build_id: Build UUID
 
         Returns:
-            Detailed build information
+            Build status including packages and logs
         """
         return self.get_build_status(build_id)
 
-    def get_builds_by_pkgname(self, pkgname: str, limit: int = 5) -> Dict:
+    def get_builds_by_pkgname(self, pkgname: str, limit: int = 20,
+                              status: Optional[str] = None) -> BuildListResponse:
         """
         Get builds for a specific package.
 
         Args:
             pkgname: Package name
-            limit: Maximum number of builds to return
+            limit: Maximum number of builds to return (1-100)
+            status: Optional build status filter
 
         Returns:
-            Build history for the package
+            Build history for the package, newest first
         """
-        url = urljoin(self.server_url, f'/builds/pkgname/{pkgname}')
-        response = self.session.get(url, params={'limit': limit})
+        url = upstream_url(self.server_url, pkgname_builds_path(pkgname))
+        params: Dict[str, Any] = {'limit': limit}
+        if status:
+            params['status'] = status
+        response = self.session.get(url, params=params)
         response.raise_for_status()
-        return response.json()
+        return BuildListResponse.model_validate(response.json())
+
+    def _list_pkgname_builds(self, pkgname: str, successful_only: bool) -> List[BuildSummary]:
+        status = BuildStatus.COMPLETED if successful_only else None
+        try:
+            return self.get_builds_by_pkgname(pkgname, limit=100, status=status).builds
+        except httpx.HTTPError:
+            return []
 
     def get_latest_build_by_pkgname(self, pkgname: str, successful_only: bool = True,
-                                    arch: Optional[str] = None) -> Dict:
+                                    arch: Optional[str] = None) -> Optional[BuildSummary]:
         """
         Get the latest build for a specific package.
 
@@ -256,85 +277,51 @@ class APBotClient:
                   (matches latest build regardless of server_arch).
 
         Returns:
-            Latest build information, or empty dict if none found
+            Latest build, or None if none found
         """
-        def _normalize_build(build: Dict) -> Dict:
-            if build and 'build_id' not in build and 'id' in build:
-                build['build_id'] = build['id']
-            return build
-
-        if arch:
-            url = urljoin(self.server_url, f'/builds/pkgname/{pkgname}/arch/{arch}/latest')
-        else:
-            url = urljoin(self.server_url, f'/builds/pkgname/{pkgname}/latest')
+        url = upstream_url(self.server_url, pkgname_latest_path(pkgname, arch))
 
         try:
             response = self.session.get(url, params={'successful_only': successful_only})
             if response.status_code == 200:
-                return _normalize_build(response.json())
+                return BuildSummary.model_validate(response.json())
         except httpx.HTTPError:
             pass
 
-        # Fall back to list endpoint for older servers or empty results
-        try:
-            builds = self.get_builds_by_pkgname(pkgname, limit=50)
-        except httpx.HTTPError:
-            return {}
-
-        if not builds.get('builds'):
-            return {}
-
-        for build in builds['builds']:
-            if successful_only and build.get('status') != 'completed':
-                continue
-            if arch and arch != 'any' and build.get('server_arch') != arch:
-                continue
-            return _normalize_build(build)
-        return {}
+        # Build servers have no per-arch latest endpoint; fall back to the list endpoint
+        return next(
+            (
+                build for build in self._list_pkgname_builds(pkgname, successful_only)
+                if not arch or arch == 'any' or build.server_arch == arch
+            ),
+            None,
+        )
 
     def get_latest_builds_by_pkgname_per_arch(self, pkgname: str,
-                                              successful_only: bool = True) -> Dict[str, Dict]:
+                                              successful_only: bool = True) -> Dict[str, BuildSummary]:
         """
         Get the latest build for each architecture of a package.
 
         Returns:
-            Mapping of server_arch -> build info
+            Mapping of server_arch -> latest build
         """
-        def _normalize_build(build: Dict) -> Dict:
-            if build and 'build_id' not in build and 'id' in build:
-                build['build_id'] = build['id']
-            return build
-
-        builds: List[Dict] = []
-        url = urljoin(self.server_url, f'/builds/pkgname/{pkgname}/latest-by-arch')
+        builds: List[BuildSummary] = []
+        url = upstream_url(self.server_url, pkgname_latest_by_arch_path(pkgname))
         try:
             response = self.session.get(url, params={'successful_only': successful_only})
             if response.status_code == 200:
-                builds = response.json().get('builds', [])
+                builds = BuildListResponse.model_validate(response.json()).builds
         except httpx.HTTPError:
-            builds = []
+            pass
 
         if not builds:
-            try:
-                listed = self.get_builds_by_pkgname(pkgname, limit=100).get('builds', [])
-            except httpx.HTTPError:
-                return {}
-            latest: Dict[str, Dict] = {}
-            for build in listed:
-                if successful_only and build.get('status') != 'completed':
-                    continue
-                arch = build.get('server_arch')
-                if arch and arch not in latest:
-                    latest[arch] = build
-            builds = list(latest.values())
+            builds = self._list_pkgname_builds(pkgname, successful_only)
 
-        result: Dict[str, Dict] = {}
+        latest: Dict[str, BuildSummary] = {}
         for build in builds:
-            build = _normalize_build(build)
-            arch = build.get('server_arch')
-            if arch:
-                result[arch] = build
-        return result
+            if build.server_arch and build.server_arch not in latest:
+                latest[build.server_arch] = build
+        return latest
 
     def get_build_output(self, build_id: str, start_index: int = 0, limit: int = 50) -> Dict:
         """
@@ -348,7 +335,7 @@ class APBotClient:
         Returns:
             Build output with metadata
         """
-        url = urljoin(self.server_url, f'/build/{build_id}/output')
+        url = upstream_url(self.server_url, build_output_path(build_id))
         params = {'start_index': start_index, 'limit': limit}
         response = self.session.get(url, params=params)
         response.raise_for_status()
@@ -364,7 +351,7 @@ class APBotClient:
         Yields:
             Output lines
         """
-        url = urljoin(self.server_url, f'/build/{build_id}/stream')
+        url = upstream_url(self.server_url, build_stream_path(build_id))
 
         try:
             with self.session.stream("GET", url) as response:
@@ -376,7 +363,7 @@ class APBotClient:
         except httpx.HTTPError:
             pass
 
-    def stream_build_updates(self, build_id: str) -> Generator[Dict, None, None]:
+    def stream_build_updates(self, build_id: str) -> Generator[BuildStatusResponse, None, None]:
         """
         Stream build status updates in real-time.
 
@@ -395,7 +382,7 @@ class APBotClient:
                 consecutive_errors = 0  # Reset error count on success
                 yield status
 
-                if status['status'] in ['completed', 'failed', 'cancelled']:
+                if status.status in BuildStatus.TERMINAL:
                     break
 
                 time.sleep(5)
@@ -406,72 +393,18 @@ class APBotClient:
                 # Wait longer before retrying on error
                 time.sleep(10)
 
-    def get_latest_successful_build_id(self, is_interactive: bool = True) -> str:
-        """
-        Get the build ID of the latest successful build for a package.
-
-        Args:
-            is_interactive: Whether to prompt user for input if multiple packages found
-
-        Returns:
-            Build ID of the latest successful build
-        """
-        # This would need to be implemented based on server capabilities
-        # For now, return empty string
-        return ""
-
     def cleanup_server(self) -> bool:
         """
-        Trigger server cleanup.
+        Trigger in-memory build data cleanup on the server.
 
         Returns:
             True if cleanup was triggered successfully
         """
-        url = urljoin(self.server_url, '/cleanup')
+        url = upstream_url(self.server_url, ADMIN_CLEANUP_PATH)
         try:
             response = self.session.post(url)
             response.raise_for_status()
             return True
         except httpx.HTTPError:
             return False
-
-
-def load_config(config_path: Optional[Path] = None) -> Dict:
-    """
-    Load configuration from file.
-
-    Args:
-        config_path: Specific config file path
-
-    Returns:
-        Configuration dictionary
-    """
-    config_locations = [
-        Path("./apb.json"),
-        Path("/etc/apb/apb.json"),
-        Path.home() / ".apb" / "apb.json",
-        Path.home() / ".apb-farm" / "apb.json"
-    ]
-
-    if config_path:
-        config_locations.insert(0, config_path)
-
-    for config_file in config_locations:
-        if config_file.exists():
-            try:
-                with open(config_file, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-
-    # Default configuration
-    return {
-        "servers": {
-            "x86_64": ["http://localhost:8000"]
-        },
-        "default_server": "http://localhost:8000",
-        "default_arch": "x86_64",
-        "output_dir": "./output",
-        "farm_url": "http://localhost:8080"
-    }
 

@@ -213,7 +213,7 @@ Get farm information and status of all managed servers.
 ```json
 {
   "status": "running",
-  "version": "2026-06-30",
+  "version": "2026.10.28",
   "servers": [
     {
       "url": "http://server1.example.com:8000",
@@ -221,7 +221,7 @@ Get farm information and status of all managed servers.
       "status": "online",
       "health": "healthy",
       "info": {
-        "version": "2026-06-30",
+        "version": "2026.10.28",
         "supported_architecture": "x86_64",
         "system_info": {
           "architecture": "x86_64",
@@ -265,7 +265,7 @@ Simple health check endpoint for the farm.
 ```json
 {
   "status": "healthy",
-  "version": "2026-06-30"
+  "version": "2026.10.28"
 }
 ```
 
@@ -456,6 +456,9 @@ Submit a build request to the farm (Authentication Required).
 **Architecture Filtering:**
 If `architectures` parameter is provided, only those architectures will be built (if they exist in the PKGBUILD and have available servers).
 
+**PKGBUILD `apb_arch_hint` (arch=(any) only):**
+When `arch=()` is exactly `(any)`, an optional `apb_arch_hint=powerpc` assignment pins server selection to that architecture. The client still submits `architectures=any`; package artifacts remain `*-any.pkg.tar.*`. If no server supports the hint, the build is not queued on another architecture. The hint is ignored (with a log warning) when `arch=()` lists anything other than `any` alone.
+
 **Error Responses:**
 - **401 Unauthorized**: Authentication required
 - **403 Forbidden**: Insufficient permissions (custom timeout without admin role)
@@ -495,6 +498,9 @@ Returns a comprehensive build status page with:
 - **Error Handling**: Graceful display of server unavailability
 
 **Enhanced JSON Response:**
+
+The JSON response is the shared `BuildStatusResponse` model (`apb.models`). It has the build server's status fields plus optional farm extras: `server_url`, `server_arch`, `artifacts_ready`, `queue_state`, `queue_position`, `jobs_ahead`, `farm_queue_size`, `server_unavailable`, `last_status_update` and `error_message`. Fields without a value are omitted. Times are epoch seconds.
+
 ```json
 {
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -503,10 +509,10 @@ Returns a comprehensive build status page with:
   "start_time": 1642694400.0,
   "end_time": 1642694500.0,
   "duration": 100.0,
+  "exit_code": 0,
+  "arch": ["x86_64"],
   "server_url": "ser---1",
   "server_arch": "x86_64",
-  "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
-  "user_id": 2,
   "created_at": 1642694300.0,
   "build_timeout": 7200,
   "packages": [
@@ -523,9 +529,7 @@ Returns a comprehensive build status page with:
       "download_url": "/build/48ea1df5-f7f3-477e-a7a7-36e526ea7cd3/download/build.log"
     }
   ],
-  "server_unavailable": false,
-  "artifacts_ready": true,
-  "last_status_update": 1642694500.0
+  "artifacts_ready": true
 }
 ```
 
@@ -576,7 +580,7 @@ When a build is waiting in the farm queue for server capacity, status JSON inclu
 **Note:** Server URLs are obfuscated in responses for security (e.g., `server1.example.com` → `ser---1`).
 
 #### GET /build/{build_id}/status-api
-Get build status as JSON (alias for `/build/{build_id}/status?format=json`).
+Get build status as JSON (alias for `/build/{build_id}/status?format=json`). The build server serves the same path with the same shape, so clients use `status-api` against either.
 
 **Parameters:**
 - `build_id` (string, required): The build ID
@@ -714,14 +718,16 @@ Users can specify custom repositories in their PKGBUILD files using the followin
 ```bash
 apb_extra_repos=(
   reponame::https://myrepo.example.com
-  anotherrepo::https://another.example.com
+  anotherrepo::https://another.example.com/$arch
 )
 ```
+
+Multi-line and single-line array forms are both accepted. Pacman placeholders `$arch` and `$repo` in repository URLs are preserved (not expanded by the PKGBUILD parser) so they must match the admin-configured URL literally and are expanded by pacman when the custom `pacman.conf` is used. Other bash-style `${var}` references in those URLs are expanded normally.
 
 #### Repository Validation
 
 - All requested repositories must be pre-configured by an administrator
-- Repository URLs must match exactly what was configured
+- Repository URLs must match exactly what was configured (including literal `$arch` / `$repo` if used)
 - GPG keys must be valid and trusted
 - Builds will fail if invalid repositories are requested
 - Builds fail immediately if custom repository setup fails (GPG key download or pacman.conf modification)
@@ -793,11 +799,19 @@ Delete a custom repository (admin only).
 
 ### Build History
 
+Build history endpoints return the same `BuildSummary` / `BuildListResponse` shape as the build server (`apb.models`):
+
+- Each build has `build_id`, `pkgname`, `status`, `start_time`, `end_time`, `created_at` and `duration` (seconds).
+- Farm entries add `server_arch`, `server_url` (obfuscated), `display_name` (`pkgname (epoch:pkgver-pkgrel)`) and `username` (`#anon#` for anonymous submissions).
+- Timestamps are ISO 8601 UTC strings. Fields without a value are omitted.
+- `total` is the number of builds matching the filters, not the number returned.
+- Builds are ordered newest first by `created_at`.
+
 #### GET /builds/latest
 Get the latest builds across all managed servers.
 
 **Parameters:**
-- `limit` (integer, optional): Maximum number of builds (default: 20, max: 100)
+- `limit` (integer, optional): Maximum number of builds (default: 20, min: 1, max: 100)
 - `status` (string, optional): Filter by status
 
 **Response:**
@@ -805,16 +819,17 @@ Get the latest builds across all managed servers.
 {
   "builds": [
     {
-      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-      "server_url": "ser---1",
-      "server_arch": "x86_64",
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
       "pkgname": "example-package",
       "status": "completed",
       "start_time": "2024-01-20T10:00:00Z",
       "end_time": "2024-01-20T10:05:00Z",
-      "created_at": "2024-01-20T10:00:00Z",
-      "user_id": 2,
-      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15"
+      "created_at": "2024-01-20T09:59:50Z",
+      "duration": 300.0,
+      "server_arch": "x86_64",
+      "server_url": "ser---1",
+      "display_name": "example-package (1.0.0-1)",
+      "username": "builder"
     }
   ],
   "total": 1
@@ -823,8 +838,7 @@ Get the latest builds across all managed servers.
 
 **Enhanced Features:**
 - **Multi-server Aggregation**: Combines builds from all servers
-- **User Context**: Shows user information where appropriate
-- **Submission Grouping**: Groups related builds from same submission
+- **User Context**: Shows the submitting user's name
 - **Status Filtering**: Filter by build status (queued, building, completed, failed, cancelled)
 
 #### GET /builds/pkgname/{pkgname}
@@ -832,7 +846,7 @@ Get recent builds for a specific package name as stored by the farm (`pkgbase` w
 
 **Parameters:**
 - `pkgname` (string, required): Package name
-- `limit` (integer, optional): Maximum builds to return (default: 20, max: 100)
+- `limit` (integer, optional): Maximum builds to return (default: 20, min: 1, max: 100)
 - `status` (string, optional): Filter by status
 
 **Response:**
@@ -841,16 +855,16 @@ Get recent builds for a specific package name as stored by the farm (`pkgbase` w
   "pkgname": "example-package",
   "builds": [
     {
-      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-      "server_url": "ser---1",
-      "server_arch": "x86_64",
       "pkgname": "example-package",
-      "display_name": "example-package (1.0.0-1)",
       "status": "completed",
-      "start_time": "2024-01-20T10:00:00 UTC",
-      "end_time": "2024-01-20T10:05:00 UTC",
-      "created_at": "2024-01-20T10:00:00 UTC",
+      "start_time": "2024-01-20T10:00:00Z",
+      "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T09:59:50Z",
+      "duration": 300.0,
+      "server_arch": "x86_64",
+      "server_url": "ser---1",
+      "display_name": "example-package (1.0.0-1)",
       "username": "builder"
     }
   ],
@@ -865,7 +879,7 @@ Get the latest build for a package across all architectures.
 - `pkgname` (string, required): Package name
 - `successful_only` (boolean, optional): Only completed builds (default: true)
 
-**Response:** Single build object (same fields as above). Returns 404 when none found.
+**Response:** Single build summary (same fields as above). Returns 404 when none found.
 
 #### GET /builds/pkgname/{pkgname}/arch/{arch}/latest
 Get the latest build for a package on a specific architecture.
@@ -875,7 +889,7 @@ Get the latest build for a package on a specific architecture.
 - `arch` (string, required): Target architecture. Use `any` to match the latest completed build regardless of `server_arch` (for `arch=('any')` packages)
 - `successful_only` (boolean, optional): Only completed builds (default: true)
 
-**Response:** Single build object. Returns 404 when none found.
+**Response:** Single build summary. Returns 404 when none found.
 
 #### GET /builds/pkgname/{pkgname}/latest-by-arch
 Get the latest build for each `server_arch` of a package.
@@ -884,24 +898,22 @@ Get the latest build for each `server_arch` of a package.
 - `pkgname` (string, required): Package name
 - `successful_only` (boolean, optional): Only completed builds (default: true)
 
-**Response:**
+**Response:** A build list with one entry per architecture, sorted by `server_arch`; `total` is the number of architectures.
 ```json
 {
   "pkgname": "example-package",
   "builds": [
     {
-      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-      "server_arch": "aarch64",
       "pkgname": "example-package",
-      "status": "completed"
+      "status": "completed",
+      "server_arch": "aarch64"
     },
     {
-      "id": "59fb2ef6-g8g4-588f-b8b8-47f637fb8de4",
-      "build_id": "59fb2ef6-g8g4-588f-b8b8-47f637fb8de4",
-      "server_arch": "x86_64",
+      "build_id": "59fb2ef6-a8b4-488f-b8b8-47f637fb8de4",
       "pkgname": "example-package",
-      "status": "completed"
+      "status": "completed",
+      "server_arch": "x86_64"
     }
   ],
   "total": 2
@@ -915,35 +927,33 @@ Get builds submitted by the current authenticated user.
 - `Authorization: Bearer <token>` (required)
 
 **Parameters:**
-- `limit` (integer, optional): Maximum builds to return (default: 50, max: 200)
+- `limit` (integer, optional): Maximum builds to return (default: 20, min: 1, max: 100)
+- `status` (string, optional): Filter by status
 
-**Response:**
+**Response:** A build list in the shape shown under [GET /builds/latest](#get-buildslatest), limited to the user's builds.
 ```json
 {
   "builds": [
     {
-      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-      "server_url": "ser---1",
-      "server_arch": "x86_64",
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
       "pkgname": "example-package",
       "status": "completed",
-      "start_time": 1642694400.0,
-      "end_time": 1642694500.0,
-      "created_at": 1642694400.0,
-      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
-      "build_timeout": 7200
+      "start_time": "2024-01-20T10:00:00Z",
+      "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T09:59:50Z",
+      "duration": 300.0,
+      "server_arch": "x86_64",
+      "server_url": "ser---1",
+      "display_name": "example-package (1.0.0-1)",
+      "username": "user1"
     }
   ],
-  "total": 1,
-  "user_id": 2
+  "total": 1
 }
 ```
 
 **User-specific Features:**
 - **Personal History**: Shows only builds submitted by the authenticated user
-- **Full Permissions**: User can access all details of their own builds
-- **Submission Groups**: Groups builds from same PKGBUILD submission
-- **Extended Information**: Includes build timeout and detailed timing
 
 ---
 
@@ -970,7 +980,8 @@ Authenticate user and receive access token.
     "role": "user",
     "created_at": 1642694400.0,
     "last_login": 1642694400.0,
-    "email": "user@example.com"
+    "email": "user@example.com",
+    "email_notifications_enabled": true
   },
   "expires_in_days": 10
 }
@@ -1248,24 +1259,25 @@ Get build history for a specific user.
 
 **Parameters:**
 - `user_id` (integer): User ID
-- `limit` (integer, optional): Maximum builds to return (default: 50)
+- `limit` (integer, optional): Maximum builds to return (default: 20, min: 1, max: 100)
+- `status` (string, optional): Filter by status
 
-**Response:**
+**Response:** A build list in the shape shown under [GET /builds/latest](#get-buildslatest), except that `server_url` is not obfuscated.
 ```json
 {
-  "user_id": 2,
-  "username": "user1",
   "builds": [
     {
-      "id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
-      "server_url": "http://server1.example.com:8000",
-      "server_arch": "x86_64",
+      "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
       "pkgname": "example-package",
       "status": "completed",
-      "start_time": 1642694400.0,
-      "end_time": 1642694500.0,
-      "created_at": 1642694400.0,
-      "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15"
+      "start_time": "2024-01-20T10:00:00Z",
+      "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T09:59:50Z",
+      "duration": 300.0,
+      "server_arch": "x86_64",
+      "server_url": "http://server1.example.com:8000",
+      "display_name": "example-package (1.0.0-1)",
+      "username": "user1"
     }
   ],
   "total": 1
@@ -1275,8 +1287,6 @@ Get build history for a specific user.
 **Admin Features:**
 - **Full Access**: Admins see unobfuscated server URLs
 - **Complete History**: Access to all user builds regardless of status
-- **User Context**: Includes username and user information
-- **Detailed Information**: Full build metadata and timing
 
 ### PUT /auth/change-password
 Change current user's password.
@@ -1728,22 +1738,11 @@ The farm searches for configuration files in this order:
     "aarch64": [
       "http://arm-server.example.com:8000"
     ]
-  },
-  "database": {
-    "path": "./apb-farm.db",
-    "backup_interval": 3600
-  },
-  "security": {
-    "token_expiry_days": 10,
-    "max_login_attempts": 5,
-    "require_email": false
-  },
-  "notifications": {
-    "smtp_enabled": true,
-    "admin_notifications": true
   }
 }
 ```
+
+SMTP settings are managed through the [SMTP configuration endpoints](#smtp-configuration-endpoints-admin-only) and stored in the farm database, not in `apb.json`. Artifact caching is configured under `cache` (see [Cache Configuration](#cache-configuration)).
 
 ### Command Line Options
 - `--host`: Host address to bind to (default: 0.0.0.0)

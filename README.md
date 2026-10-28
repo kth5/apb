@@ -170,12 +170,6 @@ APB requires Python 3.12+ and installs as a Python package with console scripts 
 pip install -e .
 ```
 
-Or install dependencies from `requirements.txt` first:
-
-```bash
-pip install -r requirements.txt && pip install -e .
-```
-
 On Arch Linux, APB can also be built and installed from the included `PKGBUILD` (requires `devtools` and `arch-install-scripts` on build servers).
 
 For development and unit tests:
@@ -290,6 +284,12 @@ apb-server --architecture powerpc
 # Custom file size and timeout limits
 apb-server --max-file-size 209715200 --max-request-size 1073741824 --build-timeout 7200
 
+# Alternate makepkg.conf for a second server on the same host
+apb-server --makepkg-conf /etc/apb-server2/makepkg.conf --buildroot /srv/apb2/buildroot --port 8001
+
+# Shared source directory, overriding SRCDEST from the configured makepkg.conf
+apb-server --srcdest /srv/apb/sources
+
 # Enable debug logging
 apb-server --debug
 ```
@@ -308,6 +308,10 @@ apb-server --debug
 | `--max-file-size` | `100MB` | Maximum individual upload file size |
 | `--max-request-size` | `500MB` | Maximum total request size |
 | `--build-timeout` | `7200` | Maximum build time in seconds |
+| `--makepkg-conf` | `/etc/makepkg.conf` | Host `makepkg.conf` to read and copy into the buildroot |
+| `--srcdest` | *from configured makepkg.conf* | Shared source directory, overriding `SRCDEST` |
+| `--srcdest-cleanup-interval` | `86400` | Seconds between SRCDEST cleanups (`0` disables) |
+| `--srcdest-retention-days` | `30` | Delete cached SRCDEST sources older than this many days |
 | `--debug` | `false` | Enable debug logging |
 
 ### Architecture Detection
@@ -333,7 +337,7 @@ The server uses Arch Linux's standard build tools:
 ### Server Management
 
 - **Build Monitoring**: View builds at `http://server-host:8000/`
-- **Cleanup**: Trigger cleanup at `http://server-host:8000/admin/cleanup`
+- **Cleanup**: Trigger in-memory build data cleanup at `http://server-host:8000/admin/cleanup`
 - **Health Check**: Monitor health at `http://server-host:8000/health`
 
 ## Running APB Client
@@ -443,7 +447,7 @@ apb --farm --cancel 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 |--------|-------------|
 | `--farm` | Use APB Farm instead of direct server |
 | `--list-servers` | List available servers |
-| `--cleanup` | Trigger server cleanup |
+| `--cleanup` | Trigger in-memory build data cleanup on the server |
 | `--test-arch` | Test architecture compatibility |
 
 ### Client Configuration

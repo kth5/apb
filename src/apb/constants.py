@@ -1,6 +1,13 @@
 """Shared constants across APB components."""
 
+from pathlib import Path
+
 from apb import VERSION
+
+FARM_DEFAULT_HOST = "0.0.0.0"
+FARM_DEFAULT_PORT = 8080
+DEFAULT_SERVER_URL = "http://localhost:8000"
+DEFAULT_FARM_URL = f"http://localhost:{FARM_DEFAULT_PORT}"
 
 BUILD_TIMEOUT_DEFAULT = 7200
 BUILD_TIMEOUT_MIN = 300
@@ -16,10 +23,10 @@ USER_ROLE = "user"
 GUEST_ROLE = "guest"
 
 DEFAULT_CONFIG_PATHS = [
-    __import__("pathlib").Path.cwd() / "apb.json",
-    __import__("pathlib").Path("/etc/apb/apb.json"),
-    __import__("pathlib").Path.home() / ".apb" / "apb.json",
-    __import__("pathlib").Path.home() / ".apb-farm" / "apb.json",
+    Path.cwd() / "apb.json",
+    Path("/etc/apb/apb.json"),
+    Path.home() / ".apb" / "apb.json",
+    Path.home() / ".apb-farm" / "apb.json",
 ]
 
 
@@ -29,6 +36,7 @@ class BuildStatus:
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    TERMINAL = (COMPLETED, FAILED, CANCELLED)
 
 
 def user_agent(component: str) -> str:

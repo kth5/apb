@@ -6,11 +6,10 @@ import resource
 import signal
 import sys
 
-import uvicorn
-
 from apb import VERSION
 from apb.multipart_compat import install_multipart_compat
 from apb.server import engine
+from apb.service import configure_logging, run_uvicorn
 
 install_multipart_compat()
 
@@ -37,13 +36,36 @@ def main() -> None:
     parser.add_argument("--max-file-size", type=int, default=100 * 1024 * 1024, help="Maximum file size in bytes")
     parser.add_argument("--max-request-size", type=int, default=500 * 1024 * 1024, help="Maximum total request size")
     parser.add_argument("--build-timeout", type=int, default=engine.BUILD_TIMEOUT_DEFAULT, help="Maximum build time")
+    parser.add_argument(
+        "--makepkg-conf",
+        type=engine.Path,
+        help="Host makepkg.conf to read and copy into the buildroot (default: /etc/makepkg.conf)",
+    )
+    parser.add_argument(
+        "--srcdest",
+        type=engine.Path,
+        help="Shared source directory, overriding SRCDEST from the configured makepkg.conf",
+    )
+    parser.add_argument(
+        "--srcdest-cleanup-interval",
+        type=int,
+        default=engine.DEFAULT_SRCDEST_CLEANUP_INTERVAL,
+        help="Seconds between SRCDEST cleanups (0 disables periodic cleanup)",
+    )
+    parser.add_argument(
+        "--srcdest-retention-days",
+        type=int,
+        default=engine.DEFAULT_SRCDEST_RETENTION_DAYS,
+        help="Delete SRCDEST source files and directories older than this many days",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    if args.makepkg_conf is not None and not args.makepkg_conf.is_file():
+        logger.error("makepkg.conf not found: %s", args.makepkg_conf)
+        sys.exit(1)
+
+    configure_logging(logging.DEBUG if args.debug else logging.INFO)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -63,10 +85,20 @@ def main() -> None:
         "max_file_size": args.max_file_size,
         "max_request_size": args.max_request_size,
         "build_timeout": args.build_timeout,
+        "makepkg_conf": args.makepkg_conf,
+        "srcdest": args.srcdest,
+        "srcdest_cleanup_interval": args.srcdest_cleanup_interval,
+        "srcdest_retention_days": args.srcdest_retention_days,
     }
 
     args.buildroot.mkdir(parents=True, exist_ok=True)
     args.builds_dir.mkdir(parents=True, exist_ok=True)
+    makepkg_conf_path = args.makepkg_conf or (engine.HOST_CONF_DIR / "makepkg.conf")
+    logger.info("Using makepkg.conf: %s", makepkg_conf_path)
+
+    if args.srcdest:
+        args.srcdest.mkdir(parents=True, exist_ok=True)
+        logger.info("Using SRCDEST override: %s", args.srcdest)
 
     logger.info("Starting APB Server v%s", VERSION)
     logger.info("Detected server architecture: %s", engine.get_server_architecture())
@@ -91,12 +123,11 @@ def main() -> None:
         logger.warning("Error configuring resource limits: %s", exc)
 
     try:
-        uvicorn.run(
+        run_uvicorn(
             create_app(),
             host=args.host,
             port=args.port,
             log_level="debug" if args.debug else "info",
-            workers=1,
             timeout_keep_alive=60,
             access_log=args.debug,
             limit_concurrency=100,
