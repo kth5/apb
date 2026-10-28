@@ -24,8 +24,10 @@ from apb.tarball import create_build_tarball
 from apb.client.api import APBotClient
 from apb.client.auth import APBAuthClient
 from apb.client.helpers import (
+    effective_any_server_arch,
     get_architectures_needing_build,
     parse_pkgbuild_info,
+    print_apb_arch_hint_notice,
     select_pkgbuild_architectures,
     should_skip_build,
 )
@@ -819,6 +821,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         # Parse PKGBUILD to get target architectures
         pkg_info = parse_pkgbuild_info(pkgbuild_path)
         pkgbuild_archs = pkg_info.get("arch", ["x86_64"])
+        print_apb_arch_hint_notice(pkg_info)
 
         # Filter to only include architectures we have servers for
         # Special case: "any" architecture can be built on any available server
@@ -844,14 +847,11 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
     for arch in architectures:
         # Special handling for "any" architecture
         if arch == "any":
-            # For "any" architecture, we can use any available server
-            # Pick the first available server architecture
-            available_server_archs = [k for k, v in servers.items() if v]
-            if not available_server_archs:
-                print(f"[{arch}] No servers available for any architecture")
+            pkg_info = parse_pkgbuild_info(pkgbuild_path)
+            server_arch, error = effective_any_server_arch(pkg_info, servers)
+            if error:
+                print(f"[{arch}] {error}")
                 continue
-            # Use the first available server architecture
-            server_arch = available_server_archs[0]
             server_urls = servers[server_arch]
             if verbose:
                 print(f"[{arch}] Using {server_arch} servers for 'any' architecture build")
@@ -1328,6 +1328,8 @@ def main():
                 if not args.force:
                     print("Use --force to rebuild existing packages")
                 sys.exit(0)
+
+            print_apb_arch_hint_notice(parse_pkgbuild_info(pkgbuild_path))
 
             # Show which architectures need building
             if args.verbose:

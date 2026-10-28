@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- PKGBUILD `apb_arch_hint=<arch>` for `arch=(any)` packages: farm and config-based client builds use only servers of that architecture (no cross-arch fallback); ignored for any other `arch=()` combination
 - `apb-server --makepkg-conf PATH` uses an alternate host `makepkg.conf` for `SRCDEST`, `CCACHE_DIR`, and chroot configuration so multiple servers on one host can stay isolated (default: `/etc/makepkg.conf`)
 - `apb-server --srcdest PATH` overrides `SRCDEST` from the configured `makepkg.conf`; the directory is created if missing, written into the buildroot's `makepkg.conf`, and used for source locking, bind mounting, and periodic cleanup
 - Unit tests for SRCDEST command-line precedence, `makepkg.conf` fallback, and buildroot configuration updates

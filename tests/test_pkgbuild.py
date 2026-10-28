@@ -181,6 +181,43 @@ package_foo() {
     assert info.arch == ["x86_64"]
 
 
+def test_parse_pkgbuild_apb_arch_hint():
+    content = """
+pkgname=hello
+pkgver=1.0.0
+pkgrel=1
+arch=(any)
+apb_arch_hint='powerpc'
+"""
+    info = parse_pkgbuild(content)
+    assert info.apb_arch_hint == "powerpc"
+    assert info.arch == ["any"]
+
+
+def test_parse_pkgbuild_apb_arch_hint_with_comment():
+    content = """
+arch=(any)
+apb_arch_hint=powerpc64le  # prefer LE builders
+pkgname=hello
+pkgver=1
+pkgrel=1
+"""
+    info = parse_pkgbuild(content)
+    assert info.apb_arch_hint == "powerpc64le"
+
+
+def test_parse_pkgbuild_apb_arch_hint_empty_ignored():
+    content = """
+arch=(any)
+apb_arch_hint=
+pkgname=hello
+pkgver=1
+pkgrel=1
+"""
+    info = parse_pkgbuild(content)
+    assert info.apb_arch_hint is None
+
+
 def test_parse_pkgbuild_arch_variable_from_first_only():
     content = """
 arch=('aarch64' 'x86_64')

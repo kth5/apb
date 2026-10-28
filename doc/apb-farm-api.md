@@ -456,6 +456,9 @@ Submit a build request to the farm (Authentication Required).
 **Architecture Filtering:**
 If `architectures` parameter is provided, only those architectures will be built (if they exist in the PKGBUILD and have available servers).
 
+**PKGBUILD `apb_arch_hint` (arch=(any) only):**
+When `arch=()` is exactly `(any)`, an optional `apb_arch_hint=powerpc` assignment pins server selection to that architecture. The client still submits `architectures=any`; package artifacts remain `*-any.pkg.tar.*`. If no server supports the hint, the build is not queued on another architecture. The hint is ignored (with a log warning) when `arch=()` lists anything other than `any` alone.
+
 **Error Responses:**
 - **401 Unauthorized**: Authentication required
 - **403 Forbidden**: Insufficient permissions (custom timeout without admin role)

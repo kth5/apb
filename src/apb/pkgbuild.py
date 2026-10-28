@@ -23,6 +23,7 @@ class PkgbuildInfo:
     pkgname_list: List[str] = field(default_factory=list)
     extra_repos: List[str] = field(default_factory=list)
     apb_output_timeout: Optional[int] = None
+    apb_arch_hint: Optional[str] = None
 
 
 _VAR_REF_PATTERN = re.compile(r"\$\{([^}]+)\}|\$(\w+)")
@@ -220,6 +221,10 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
                     info.apb_output_timeout = timeout_value
             except ValueError:
                 logger.warning("Invalid apb_output_timeout value '%s', ignoring", timeout_str)
+        elif key == "apb_arch_hint":
+            hint = _resolve_value(value.split("#", 1)[0], variables).strip()
+            if hint:
+                info.apb_arch_hint = hint
         elif not value.startswith("("):
             variables[key] = _resolve_value(value, variables)
 
@@ -234,6 +239,11 @@ def parse_pkgbuild(content: str) -> PkgbuildInfo:
         info.pkgname_list = [info.pkgname]
 
     return info
+
+
+def pkgbuild_arch_is_any_only(arch: List[str]) -> bool:
+    """Return True when PKGBUILD arch=() is exactly (any)."""
+    return arch == ["any"]
 
 
 def parse_pkgbuild_file(pkgbuild_path: Path) -> PkgbuildInfo:
@@ -257,4 +267,5 @@ def pkgbuild_info_to_dict(info: PkgbuildInfo) -> dict:
         "pkgname_list": info.pkgname_list,
         "extra_repos": info.extra_repos,
         "apb_output_timeout": info.apb_output_timeout,
+        "apb_arch_hint": info.apb_arch_hint,
     }

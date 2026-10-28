@@ -154,6 +154,10 @@ client.download_file(build_id, "package.pkg.tar.xz", Path("./downloads/"))
 - `--no-download`: Don't download build results
 - `--force`: Force rebuild even if package exists
 
+### PKGBUILD variables (client / farm)
+
+- **`apb_arch_hint=<arch>`**: Only when `arch=(any)`. Farm and config-based (`apb.json` servers) builds run on servers of that architecture instead of the default lowest-load or first-configured choice. Does not change the package architecture (`any`); artifacts still go under `output/any/`. Ignored with a warning for any other `arch=()` list. Does not replace `--arch`.
+
 ### Monitoring Options
 
 - `--monitor BUILD_ID`: Monitor existing build with real-time output

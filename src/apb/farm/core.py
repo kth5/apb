@@ -35,7 +35,7 @@ from pydantic import BaseModel, Field
 from apb import VERSION
 from apb.config import load_config
 from apb.constants import ADMIN_ROLE, GUEST_BUILD_LOG_TAIL_LINES, TOKEN_EXPIRY_DAYS, USER_ROLE, BuildStatus
-from apb.pkgbuild import parse_pkgbuild
+from apb.pkgbuild import parse_pkgbuild, pkgbuild_arch_is_any_only
 
 logger = logging.getLogger(__name__)
 
@@ -2131,6 +2131,62 @@ async def queue_build(build_id: str, pkgbuild_content: str, pkgname: str, target
     build_database.commit()
 
 
+async def _select_server_arch_for_any_package(
+    available_archs: Dict[str, List[str]],
+    *,
+    arch_hint: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Pick a build server architecture for an arch=(any) package.
+
+    When arch_hint is set, only servers for that architecture are considered.
+    Returns (selected_arch, lowest_avg_load_or_none).
+    """
+    candidates = available_archs
+    if arch_hint:
+        if arch_hint not in available_archs or not available_archs[arch_hint]:
+            return None, None
+        candidates = {arch_hint: available_archs[arch_hint]}
+
+    best_arch = None
+    best_load = float("inf")
+    fallback_arch = None
+
+    for avail_arch, server_urls in candidates.items():
+        if not server_urls:
+            continue
+        if fallback_arch is None:
+            fallback_arch = avail_arch
+
+        total_load = 0
+        available_servers = 0
+
+        for server_url in server_urls:
+            try:
+                server_info = await get_server_info(server_url)
+                if server_info:
+                    queue_status = server_info.get("queue_status", {})
+                    current_builds = queue_status.get("current_builds_count", 0)
+                    queued_builds_count = queue_status.get("queued_builds", 0)
+                    max_concurrent = queue_status.get("max_concurrent_builds", 3)
+
+                    if current_builds < max_concurrent:
+                        total_load += current_builds + queued_builds_count
+                        available_servers += 1
+            except Exception:
+                continue
+
+        if available_servers > 0:
+            avg_load = total_load / available_servers
+            if avg_load < best_load:
+                best_load = avg_load
+                best_arch = avail_arch
+
+    selected = best_arch or fallback_arch
+    load = best_load if best_arch else None
+    return selected, load
+
+
 async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = 7200, original_tarball: Optional[bytes] = None, extra_repos: List[Dict] = None) -> List[Dict]:
     """
     Queue builds for each architecture that has available servers.
@@ -2156,6 +2212,23 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
     available_archs = await get_available_architectures()
     logger.info(f"Available server architectures: {list(available_archs.keys())}")
 
+    pkgbuild_info = parse_pkgbuild(pkgbuild_content)
+    any_arch_hint: Optional[str] = None
+    if pkgbuild_info.apb_arch_hint:
+        if pkgbuild_arch_is_any_only(pkgbuild_info.arch):
+            any_arch_hint = pkgbuild_info.apb_arch_hint
+            logger.info(
+                "Using apb_arch_hint '%s' for arch=(any) package '%s'",
+                any_arch_hint,
+                pkgname,
+            )
+        else:
+            logger.warning(
+                "apb_arch_hint '%s' ignored (arch=%s; hint applies only to arch=(any))",
+                pkgbuild_info.apb_arch_hint,
+                pkgbuild_info.arch,
+            )
+
     # Find architectures that have available servers
     buildable_archs = []
     skipped_archs = []
@@ -2164,44 +2237,18 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         if arch == "any":
             # arch=(any) packages can run on any build server regardless of native architecture
             if available_archs:
-                best_arch = None
-                best_load = float('inf')
-                fallback_arch = None
-
-                for avail_arch, server_urls in available_archs.items():
-                    if not server_urls:
-                        continue
-                    if fallback_arch is None:
-                        fallback_arch = avail_arch
-
-                    total_load = 0
-                    available_servers = 0
-
-                    for server_url in server_urls:
-                        try:
-                            server_info = await get_server_info(server_url)
-                            if server_info:
-                                queue_status = server_info.get("queue_status", {})
-                                current_builds = queue_status.get("current_builds_count", 0)
-                                queued_builds_count = queue_status.get("queued_builds", 0)
-                                max_concurrent = queue_status.get("max_concurrent_builds", 3)
-
-                                if current_builds < max_concurrent:
-                                    total_load += current_builds + queued_builds_count
-                                    available_servers += 1
-                        except Exception:
-                            continue
-
-                    if available_servers > 0:
-                        avg_load = total_load / available_servers
-                        if avg_load < best_load:
-                            best_load = avg_load
-                            best_arch = avail_arch
-
-                selected_arch = best_arch or fallback_arch
+                selected_arch, best_load = await _select_server_arch_for_any_package(
+                    available_archs,
+                    arch_hint=any_arch_hint,
+                )
                 if selected_arch:
                     buildable_archs.append(selected_arch)
-                    if best_arch:
+                    if any_arch_hint:
+                        logger.info(
+                            f"Selected architecture '{selected_arch}' for 'any' architecture package "
+                            f"(apb_arch_hint={any_arch_hint})"
+                        )
+                    elif best_load is not None:
                         logger.info(
                             f"Selected architecture '{selected_arch}' for 'any' architecture package "
                             f"(lowest load: {best_load:.1f})"
@@ -2213,7 +2260,13 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
                         )
                 else:
                     skipped_archs.append(arch)
-                    logger.warning("No available servers for 'any' architecture")
+                    if any_arch_hint:
+                        logger.warning(
+                            "No available servers for apb_arch_hint '%s' (arch=(any) package)",
+                            any_arch_hint,
+                        )
+                    else:
+                        logger.warning("No available servers for 'any' architecture")
             else:
                 skipped_archs.append(arch)
                 logger.warning("No server architectures available for 'any' architecture")

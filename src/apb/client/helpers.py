@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from apb.arch import package_arch_suffix
-from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_info_to_dict
+from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_arch_is_any_only, pkgbuild_info_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,45 @@ def should_skip_build(output_dir: Path, pkgbuild_path: Path, arch: str, force: b
         return True, f"Package already exists: {found_filename}"
 
     return False, "Package not found, proceeding with build"
+
+
+def print_apb_arch_hint_notice(pkg_info: dict) -> None:
+    """Print how apb_arch_hint applies for this PKGBUILD (farm and config client paths)."""
+    hint = pkg_info.get("apb_arch_hint")
+    if not hint:
+        return
+    archs = pkg_info.get("arch") or []
+    if pkgbuild_arch_is_any_only(archs):
+        print(f"Using PKGBUILD apb_arch_hint: {hint}")
+    else:
+        print(
+            f"Warning: apb_arch_hint={hint} ignored (only applies when arch=(any))"
+        )
+
+
+def effective_any_server_arch(pkg_info: dict, servers: dict) -> tuple[Optional[str], Optional[str]]:
+    """
+    Resolve which configured server architecture to use for arch=(any).
+
+    Returns (server_arch, error_message). error_message is set when a hint was
+    required but no matching servers exist.
+    """
+    archs = pkg_info.get("arch") or []
+    hint = pkg_info.get("apb_arch_hint") if pkgbuild_arch_is_any_only(archs) else None
+
+    if hint:
+        server_urls = servers.get(hint) or []
+        if not server_urls:
+            return None, (
+                f"No servers configured for apb_arch_hint '{hint}' "
+                f"(available: {', '.join(sorted(servers.keys())) or 'none'})"
+            )
+        return hint, None
+
+    available_server_archs = [key for key, urls in servers.items() if urls]
+    if not available_server_archs:
+        return None, "No servers available for any architecture"
+    return available_server_archs[0], None
 
 
 def select_pkgbuild_architectures(
