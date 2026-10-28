@@ -6,11 +6,10 @@ import resource
 import signal
 import sys
 
-import uvicorn
-
 from apb import VERSION
 from apb.multipart_compat import install_multipart_compat
 from apb.server import engine
+from apb.service import configure_logging, run_uvicorn
 
 install_multipart_compat()
 
@@ -66,10 +65,7 @@ def main() -> None:
         logger.error("makepkg.conf not found: %s", args.makepkg_conf)
         sys.exit(1)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    configure_logging(logging.DEBUG if args.debug else logging.INFO)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -127,12 +123,11 @@ def main() -> None:
         logger.warning("Error configuring resource limits: %s", exc)
 
     try:
-        uvicorn.run(
+        run_uvicorn(
             create_app(),
             host=args.host,
             port=args.port,
             log_level="debug" if args.debug else "info",
-            workers=1,
             timeout_keep_alive=60,
             access_log=args.debug,
             limit_concurrency=100,

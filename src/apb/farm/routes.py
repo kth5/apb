@@ -2,26 +2,52 @@
 
 import json
 import logging
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from apb import VERSION
-from apb.constants import GUEST_BUILD_LOG_TAIL_LINES
+from apb.constants import (
+    ADMIN_ROLE,
+    GUEST_BUILD_LOG_TAIL_LINES,
+    GUEST_ROLE,
+)
 from apb.farm import core
+from apb.models import (
+    BuildListResponse,
+    BuildStatusResponse,
+    BuildSummary,
+    LoginRequest,
+    LoginResponse,
+    UserResponse,
+)
+from apb.tarball import InvalidBuildTarball, extract_build_tarball
+from apb.upstream import (
+    build_cancel_path,
+    build_output_path,
+    build_status_path,
+    build_stream_path,
+    upstream_url,
+)
+from apb.validation import validate_build_timeout
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-@router.post("/auth/login", response_model=core.LoginResponse)
-async def login(login_data: core.LoginRequest):
+
+def _build_status_json(build_status: Dict) -> Dict:
+    return BuildStatusResponse.model_validate(build_status).model_dump(exclude_none=True)
+
+
+@router.post("/auth/login", response_model=LoginResponse)
+async def login(login_data: LoginRequest) -> LoginResponse:
     """Login with username and password"""
-    global auth_manager
     user = core.auth_manager.authenticate_user(login_data.username, login_data.password)
 
     if not user:
@@ -29,17 +55,7 @@ async def login(login_data: core.LoginRequest):
 
     token = core.auth_manager.create_token(user)
 
-    return core.LoginResponse(
-        token=token,
-        user={
-            "id": user.id,
-            "username": user.username,
-            "role": user.role.value,
-            "created_at": user.created_at,
-            "last_login": user.last_login,
-            "email": user.email
-        }
-    )
+    return LoginResponse(token=token, user=core.user_response(user))
 
 
 @router.post("/auth/logout")
@@ -71,40 +87,19 @@ async def logout_get(request: Request):
     return {"message": "Use POST /auth/logout or JavaScript logout() function"}
 
 
-@router.get("/auth/me", response_model=core.UserResponse)
-async def get_current_user_info(current_user: core.User = Depends(core.require_auth)):
+@router.get("/auth/me", response_model=UserResponse)
+async def get_current_user_info(current_user: core.User = Depends(core.require_auth)) -> UserResponse:
     """Get current user information"""
-    return core.UserResponse(
-        id=current_user.id,
-        username=current_user.username,
-        role=current_user.role.value,
-        created_at=current_user.created_at,
-        last_login=current_user.last_login,
-        email=current_user.email,
-        email_notifications_enabled=current_user.email_notifications_enabled
-    )
+    return core.user_response(current_user)
 
 
-@router.get("/auth/users", response_model=List[core.UserResponse])
-async def list_users(current_user: core.User = Depends(core.require_admin)):
+@router.get("/auth/users", response_model=List[UserResponse])
+async def list_users(current_user: core.User = Depends(core.require_admin)) -> List[UserResponse]:
     """List all users (admin only)"""
-    global auth_manager
-    users = core.auth_manager.list_users()
-    return [
-        core.UserResponse(
-            id=user.id,
-            username=user.username,
-            role=user.role.value,
-            created_at=user.created_at,
-            last_login=user.last_login,
-            email=user.email,
-            email_notifications_enabled=user.email_notifications_enabled
-        )
-        for user in users
-    ]
+    return [core.user_response(user) for user in core.auth_manager.list_users()]
 
 
-@router.post("/auth/users", response_model=core.UserResponse)
+@router.post("/auth/users", response_model=UserResponse)
 async def create_user(
     user_data: core.CreateUserRequest,
     current_user: core.User = Depends(core.require_admin)
@@ -127,15 +122,7 @@ async def create_user(
             except Exception as e:
                 logger.warning(f"Failed to send user creation email to {new_user.email}: {e}")
 
-        return core.UserResponse(
-            id=new_user.id,
-            username=new_user.username,
-            role=new_user.role.value,
-            created_at=new_user.created_at,
-            last_login=new_user.last_login,
-            email=new_user.email,
-            email_notifications_enabled=new_user.email_notifications_enabled
-        )
+        return core.user_response(new_user)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -220,16 +207,15 @@ async def revoke_user_tokens(
     return {"message": f"Revoked {count} tokens for user {user_id}"}
 
 
-@router.get("/auth/users/{user_id}/builds")
+@router.get("/auth/users/{user_id}/builds", response_model=BuildListResponse, response_model_exclude_none=True)
 async def get_user_builds(
     user_id: int,
     current_user: core.User = Depends(core.require_admin),
-    limit: int = 50
-):
+    limit: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+) -> BuildListResponse:
     """Get builds for a specific user (admin only)"""
-    global auth_manager
-    builds = core.auth_manager.get_user_builds(user_id, limit)
-    return {"builds": builds}
+    return core.list_builds(user_id=user_id, status=status, limit=limit, obfuscate=False)
 
 
 @router.put("/auth/change-password")
@@ -437,9 +423,7 @@ async def test_smtp_config(
     """Test SMTP configuration by sending a test email (admin only)"""
     global auth_manager, config
 
-    # Get dashboard URL from configuration
-    farm_url = core.config.get('farm_url', 'http://localhost:8080')
-    dashboard_url = f"{farm_url.rstrip('/')}/dashboard"
+    dashboard_url = core.farm_page_url("/dashboard")
 
     subject = "APB Farm SMTP Test"
     body = f"""This is a test email from APB Farm.
@@ -537,7 +521,7 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
         "available_architectures": list(available_archs.keys()),
         "total_servers": len(servers),
         "authenticated": current_user is not None,
-        "user_role": current_user.role.value if current_user else "guest"
+        "user_role": current_user.role.value if current_user else GUEST_ROLE
     }
 
 
@@ -577,7 +561,7 @@ async def cancel_build(
         raise HTTPException(status_code=404, detail="Build not found on any server")
 
     try:
-        response = await core.http_session.post(f"{server_url}/build/{build_id}/cancel", timeout=10)
+        response = await core.http_session.post(upstream_url(server_url, build_cancel_path(build_id)), timeout=10)
         if response.status_code == 200:
             result = response.json()
 
@@ -1369,62 +1353,27 @@ async def submit_build(
 ):
     """Submit a build request (authenticated users only, supports both tarball and individual file uploads)"""
     try:
-        # Validate timeout parameter
-        if build_timeout is not None:
-            if current_user.role != core.UserRole.ADMIN:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Only admin users can specify custom build timeouts"
-                )
-            if build_timeout < 300 or build_timeout > 14400:  # 5 minutes to 4 hours
-                raise HTTPException(
-                    status_code=400,
-                    detail="Build timeout must be between 300 and 14400 seconds (5 minutes to 4 hours)"
-                )
+        if build_timeout is not None and current_user.role != core.UserRole.ADMIN:
+            raise HTTPException(
+                status_code=403,
+                detail="Only admin users can specify custom build timeouts"
+            )
+        try:
+            timeout_seconds = validate_build_timeout(build_timeout)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
-        # Use default timeout if not specified
-        timeout_seconds = build_timeout if build_timeout is not None else 7200
-
-        # Handle tarball upload (new method)
+        original_tarball = None
         if build_tarball and build_tarball.filename:
-            # Create temporary directory for extraction
-            import tempfile
-            import tarfile
-
+            # Extract only to read metadata; the original tarball is forwarded unchanged
+            original_tarball = await build_tarball.read()
             with tempfile.TemporaryDirectory() as temp_dir:
-                temp_dir_path = Path(temp_dir)
-
-                # Save tarball temporarily and keep original content
-                tarball_path = temp_dir_path / "build.tar.gz"
-                original_tarball_content = await build_tarball.read()
-                with open(tarball_path, 'wb') as f:
-                    f.write(original_tarball_content)
-
-                # Extract tarball ONLY to read metadata - don't recreate from extracted files
                 try:
-                    with tarfile.open(tarball_path, 'r:gz') as tar:
-                        # Extract all files to temp directory
-                        tar.extractall(path=temp_dir_path, filter='data')
-
-                    # Read PKGBUILD content for metadata
-                    pkgbuild_path = temp_dir_path / "PKGBUILD"
-                    if not pkgbuild_path.exists():
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Tarball must contain a PKGBUILD file"
-                        )
-
-                    with open(pkgbuild_path, 'r', encoding='utf-8') as f:
-                        pkgbuild_content = f.read()
-
-                    # For tarball submissions, source_files are not needed since we forward the original tarball
-                    source_files = []
-
-                except (tarfile.TarError, OSError) as e:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Could not extract tarball: {str(e)}"
-                    )
+                    pkgbuild_path = extract_build_tarball(original_tarball, Path(temp_dir))
+                    pkgbuild_content = pkgbuild_path.read_text(encoding="utf-8")
+                except (InvalidBuildTarball, UnicodeDecodeError) as e:
+                    raise HTTPException(status_code=400, detail=str(e))
+            source_files = []
 
         # Handle individual file uploads (legacy method for backward compatibility)
         elif pkgbuild and pkgbuild.filename:
@@ -1489,8 +1438,6 @@ async def submit_build(
                 "requested_architectures": architectures.split(',') if architectures else []
             }
 
-        # Queue builds for each architecture - pass original tarball if available
-        original_tarball = original_tarball_content if 'original_tarball_content' in locals() else None
         queued_builds = await core.queue_builds_for_architectures(
             pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds, original_tarball, valid_repos
         )
@@ -1642,7 +1589,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             **core.get_farm_queue_status_for_build(build_id),
         }
         if format == "json":
-            return queued_status
+            return _build_status_json(queued_status)
         jobs_ahead = queued_status.get("jobs_ahead", 0)
         queue_position = queued_status.get("queue_position", "?")
         farm_queue_size = queued_status.get("farm_queue_size", "?")
@@ -1757,7 +1704,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                 build_status["server_arch"] = server_arch  # Add architecture from farm database
 
                 if format == "json":
-                    return build_status
+                    return _build_status_json(build_status)
                 else:
                     status_class = build_status.get('status', 'unknown')
                     # Get detailed status information if available
@@ -1961,7 +1908,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
     if format == "json":
         try:
             response = await core.http_session.get(
-                f"{server_url}/build/{build_id}/status-api",
+                upstream_url(server_url, build_status_path(build_id)),
                 timeout=10,
             )
             if response.status_code == 200:
@@ -1979,7 +1926,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     build_status,
                 )
 
-                return build_status
+                return _build_status_json(build_status)
 
             raise HTTPException(status_code=response.status_code, detail="Build not found")
         except Exception as e:
@@ -1999,7 +1946,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
                     build_status["server_url"] = core.obfuscate_server_url(server_url)
                     build_status["server_arch"] = result[2]  # Add architecture from database result
                     build_status["error_message"] = f"Server unavailable: {str(e)}"
-                    return build_status
+                    return _build_status_json(build_status)
                 except json.JSONDecodeError:
                     pass
 
@@ -2008,7 +1955,7 @@ async def get_build_status(build_id: str, format: str = Query("html")):
         # Generate farm's own HTML page instead of forwarding to server
         try:
             response = await core.http_session.get(
-                f"{server_url}/build/{build_id}/status-api",
+                upstream_url(server_url, build_status_path(build_id)),
                 timeout=10,
             )
             if response.status_code == 200:
@@ -2246,8 +2193,8 @@ async def get_build_status(build_id: str, format: str = Query("html")):
             raise HTTPException(status_code=503, detail=f"Server unavailable: {str(e)}")
 
 
-@router.get("/build/{build_id}/status-api")
-async def get_build_status_api(build_id: str):
+@router.get("/build/{build_id}/status-api", response_model=BuildStatusResponse, response_model_exclude_none=True)
+async def get_build_status_api(build_id: str) -> Dict:
     """Get build status as JSON"""
     return await get_build_status(build_id, format="json")
 
@@ -2263,7 +2210,7 @@ async def get_build_output(build_id: str, start_index: int = Query(0, ge=0), lim
     try:
         params = {"start_index": start_index, "limit": limit}
         response = await core.http_session.get(
-            f"{server_url}/build/{build_id}/output",
+            upstream_url(server_url, build_output_path(build_id)),
             params=params,
             timeout=10,
         )
@@ -2308,7 +2255,7 @@ async def stream_build_output(build_id: str):
         async def event_generator():
             async with core.http_session.stream(
                 "GET",
-                f"{server_url}/build/{build_id}/stream",
+                upstream_url(server_url, build_stream_path(build_id)),
                 timeout=None,
             ) as response:
                 if response.status_code == 200:
@@ -2459,22 +2406,21 @@ async def download_file(
     )
 
 
-@router.get("/builds/pkgname/{pkgname}")
+@router.get("/builds/pkgname/{pkgname}", response_model=BuildListResponse, response_model_exclude_none=True)
 async def get_builds_for_package(
     pkgname: str,
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = Query(None),
-):
+) -> BuildListResponse:
     """Get recent builds for a specific package name known to the farm."""
-    builds = core.get_builds_for_pkgname(pkgname, limit=limit, status=status)
-    return {"pkgname": pkgname, "builds": builds, "total": len(builds)}
+    return core.list_builds(pkgname=pkgname, status=status, limit=limit)
 
 
-@router.get("/builds/pkgname/{pkgname}/latest")
+@router.get("/builds/pkgname/{pkgname}/latest", response_model=BuildSummary, response_model_exclude_none=True)
 async def get_latest_build_for_package(
     pkgname: str,
     successful_only: bool = Query(True),
-):
+) -> BuildSummary:
     """Get the latest build for a package across all architectures."""
     build = core.get_latest_build_for_pkgname(pkgname, successful_only=successful_only)
     if not build:
@@ -2482,12 +2428,12 @@ async def get_latest_build_for_package(
     return build
 
 
-@router.get("/builds/pkgname/{pkgname}/arch/{arch}/latest")
+@router.get("/builds/pkgname/{pkgname}/arch/{arch}/latest", response_model=BuildSummary, response_model_exclude_none=True)
 async def get_latest_build_for_package_arch(
     pkgname: str,
     arch: str,
     successful_only: bool = Query(True),
-):
+) -> BuildSummary:
     """Get the latest build for a package on a specific architecture.
 
     Use arch `any` to match the latest successful build regardless of server_arch
@@ -2502,80 +2448,32 @@ async def get_latest_build_for_package_arch(
     return build
 
 
-@router.get("/builds/pkgname/{pkgname}/latest-by-arch")
+@router.get("/builds/pkgname/{pkgname}/latest-by-arch", response_model=BuildListResponse, response_model_exclude_none=True)
 async def get_latest_builds_by_arch_for_package(
     pkgname: str,
     successful_only: bool = Query(True),
-):
+) -> BuildListResponse:
     """Get the latest build for each architecture of a package."""
-    builds = core.get_latest_builds_by_arch_for_pkgname(pkgname, successful_only=successful_only)
-    return {"pkgname": pkgname, "builds": builds, "total": len(builds)}
+    return core.get_latest_builds_by_arch_for_pkgname(pkgname, successful_only=successful_only)
 
 
-@router.get("/builds/latest")
-async def get_latest_builds(limit: int = Query(20, ge=1, le=100), status: Optional[str] = Query(None)):
+@router.get("/builds/latest", response_model=BuildListResponse, response_model_exclude_none=True)
+async def get_latest_builds(
+    limit: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+) -> BuildListResponse:
     """Get latest builds across all servers"""
-    cursor = core.build_database.cursor()
-
-    if status:
-        cursor.execute('''
-            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
-            FROM builds b
-            LEFT JOIN users u ON b.user_id = u.id
-            WHERE b.status = ? ORDER BY b.created_at DESC LIMIT ?
-        ''', (status, limit))
-    else:
-        cursor.execute('''
-            SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
-            FROM builds b
-            LEFT JOIN users u ON b.user_id = u.id
-            ORDER BY b.created_at DESC LIMIT ?
-        ''', (limit,))
-
-    builds = []
-    for row in cursor.fetchall():
-        start_time_str = core.safe_timestamp_to_datetime(row[5])
-        end_time_str = core.safe_timestamp_to_datetime(row[6])
-        created_at_str = core.safe_timestamp_to_datetime(row[7])
-
-        # Format package name with version
-        pkgname = row[3]
-        epoch = row[9]
-        pkgver = row[10]
-        pkgrel = row[11]
-        display_name = core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
-
-        builds.append({
-            "id": row[0],
-            "server_url": core.obfuscate_server_url(row[1]) if row[1] else "unknown",
-            "server_arch": row[2],
-            "pkgname": pkgname,
-            "display_name": display_name,
-            "status": row[4],
-            "start_time": f"{start_time_str} UTC" if start_time_str else None,
-            "end_time": f"{end_time_str} UTC" if end_time_str else None,
-            "created_at": f"{created_at_str} UTC" if created_at_str else "unknown",
-            "username": row[8] if row[8] else "#anon#"
-        })
-
-    return {"builds": builds}
+    return core.list_builds(status=status, limit=limit)
 
 
-@router.get("/my/builds")
+@router.get("/my/builds", response_model=BuildListResponse, response_model_exclude_none=True)
 async def get_my_builds(
     current_user: core.User = Depends(core.require_auth),
-    limit: int = Query(50, ge=1, le=200)
-):
+    limit: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+) -> BuildListResponse:
     """Get builds submitted by current user"""
-    global auth_manager
-    builds = core.auth_manager.get_user_builds(current_user.id, limit)
-
-    # Add obfuscated server URLs for user display
-    for build in builds:
-        if build["server_url"]:
-            build["server_url"] = core.obfuscate_server_url(build["server_url"])
-
-    return {"builds": builds}
+    return core.list_builds(user_id=current_user.id, status=status, limit=limit)
 
 
 @router.get("/admin/cache")
@@ -3083,7 +2981,7 @@ async def get_admin_panel(
     """
 
     for user in users_data:
-        role_badge = f'<span class="admin-badge">ADMIN</span>' if user["role"] == "admin" else f'<span class="user-badge">USER</span>'
+        role_badge = f'<span class="admin-badge">ADMIN</span>' if user["role"] == ADMIN_ROLE else f'<span class="user-badge">USER</span>'
         delete_disabled = 'disabled title="Cannot delete yourself"' if user["id"] == current_user.id else ''
         email_display = user["email"] if user["email"] != "none" else '<em>none</em>'
         notifications_display = '✓ Enabled' if user.get("email_notifications_enabled", True) else '✗ Disabled'
@@ -3668,45 +3566,4 @@ async def get_admin_panel(
     """
 
     return HTMLResponse(content=html)
-
-
-async def setup_http_session():
-    """Setup HTTP session with optimized timeouts and connection pooling for farm responsiveness"""
-    global http_session
-
-    # Optimize connector for farm use case - many short requests to potentially slow servers
-    connector = aiohttp.TCPConnector(
-        limit=50,  # Reduced total connection pool size to prevent resource exhaustion
-        limit_per_host=5,  # Reduced per-host limit to prevent single slow server from hogging connections
-        ttl_dns_cache=300,  # DNS cache TTL
-        use_dns_cache=True,
-        keepalive_timeout=15,  # Reduced keepalive to free up connections faster
-        enable_cleanup_closed=True
-    )
-
-    # Use conservative default timeout - individual operations will override as needed
-    timeout = aiohttp.ClientTimeout(
-        total=30,  # Reduced default timeout to prevent blocking
-        connect=5,  # Faster connection timeout
-        sock_read=15   # Faster socket read timeout
-    )
-
-    core.http_session = aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-        trust_env=True
-    )
-
-
-async def cleanup_http_session():
-    """Cleanup HTTP session"""
-    global http_session
-    if core.http_session:
-        await core.http_session.close()
-
-
-def signal_handler(signum, frame):
-    """Handle shutdown signals"""
-    logger.info(f"Received signal {signum}, shutting down...")
-    sys.exit(0)
 

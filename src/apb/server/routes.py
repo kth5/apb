@@ -4,24 +4,56 @@ import json
 import logging
 import platform
 import queue
-import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import psutil
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from apb import VERSION
-from apb.constants import BUILD_TIMEOUT_MAX, BUILD_TIMEOUT_MIN, BuildStatus
-from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_info_to_dict
+from apb.constants import BuildStatus
+from apb.models import BuildListResponse, BuildStatusResponse, BuildSummary
 from apb.server import engine
+from apb.tarball import InvalidBuildTarball, extract_build_tarball
+from apb.upstream import build_download_path
+from apb.validation import validate_build_timeout
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _build_summary(build: Dict, *, with_packages: bool = False) -> BuildSummary:
+    summary = BuildSummary.model_validate(build)
+    return summary if with_packages else summary.model_copy(update={"packages": None})
+
+
+def _find_builds(*, pkgname: Optional[str] = None, status: Optional[str] = None) -> List[Dict]:
+    """Matching in-memory builds, newest first; active entries win over their history copy."""
+    builds = [
+        build for build in {**engine.build_history, **engine.active_builds}.values()
+        if (pkgname is None or build["pkgname"] == pkgname) and (status is None or build["status"] == status)
+    ]
+    return sorted(builds, key=lambda build: build.get("created_at", 0), reverse=True)
+
+
+def _latest_build(pkgname: str, successful_only: bool) -> Dict:
+    builds = _find_builds(pkgname=pkgname, status=BuildStatus.COMPLETED if successful_only else None)
+    if not builds:
+        raise HTTPException(status_code=404, detail="No builds found for package")
+    return builds[0]
+
+
+def _build_list_response(builds: List[Dict], limit: int, pkgname: Optional[str] = None) -> BuildListResponse:
+    return BuildListResponse(
+        pkgname=pkgname,
+        builds=[_build_summary(build) for build in builds[:limit]],
+        total=len(builds),
+    )
+
 
 @router.get("/")
 async def get_server_info():
@@ -162,15 +194,11 @@ async def submit_build(
                 detail={"error": "Build ID already exists", "detail": f"Build with ID '{build_id}' already exists"}
             )
 
-        # Validate and set build timeout
-        timeout_seconds = engine.BUILD_TIMEOUT  # Default timeout
+        try:
+            timeout_seconds = validate_build_timeout(build_timeout, default=engine.BUILD_TIMEOUT)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": "Invalid timeout", "detail": str(exc)})
         if build_timeout is not None:
-            if build_timeout < 300 or build_timeout > 14400:  # 5 minutes to 4 hours
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": "Invalid timeout", "detail": "Build timeout must be between 300 and 14400 seconds"}
-                )
-            timeout_seconds = build_timeout
             logger.info(f"Build {build_id} using custom timeout: {timeout_seconds} seconds")
 
         # Create build directory
@@ -210,30 +238,12 @@ async def submit_build(
 
                         f.write(chunk)
 
-                # Extract tarball
                 try:
-                    with tarfile.open(tarball_path, 'r:gz') as tar:
-                        # Extract all files to build directory
-                        tar.extractall(path=build_dir, filter='data')
-
-                    # Remove the tarball after extraction
+                    extract_build_tarball(tarball_path, build_dir)
+                except InvalidBuildTarball as e:
+                    raise HTTPException(status_code=400, detail={"error": "Invalid tarball", "detail": str(e)})
+                finally:
                     tarball_path.unlink(missing_ok=True)
-
-                    # Verify PKGBUILD exists
-                    pkgbuild_path = build_dir / "PKGBUILD"
-                    if not pkgbuild_path.exists():
-                        raise HTTPException(
-                            status_code=400,
-                            detail={"error": "Invalid tarball", "detail": "Tarball must contain a PKGBUILD file"}
-                        )
-
-                except (tarfile.TarError, OSError) as e:
-                    # Clean up on extraction error
-                    tarball_path.unlink(missing_ok=True)
-                    raise HTTPException(
-                        status_code=400,
-                        detail={"error": "Invalid tarball", "detail": f"Could not extract tarball: {str(e)}"}
-                    )
 
             except HTTPException:
                 raise
@@ -355,7 +365,6 @@ async def submit_build(
         extra_repos_list = []
         if extra_repos:
             try:
-                import json
                 extra_repos_list = json.loads(extra_repos)
             except (json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"Invalid extra_repos JSON: {e}")
@@ -401,15 +410,15 @@ async def submit_build(
         )
 
 
-@router.get("/build/{build_id}/status-api")
-async def get_build_status(build_id: str):
+@router.get("/build/{build_id}/status-api", response_model=BuildStatusResponse, response_model_exclude_none=True)
+async def get_build_status(build_id: str) -> BuildStatusResponse:
     """Get build status as JSON"""
     build_info = engine.active_builds.get(build_id) or engine.build_history.get(build_id)
 
     if not build_info:
         raise HTTPException(status_code=404, detail="Build not found")
 
-    return build_info
+    return BuildStatusResponse.model_validate(build_info)
 
 
 @router.get("/build/{build_id}/output")
@@ -585,95 +594,35 @@ async def download_file(build_id: str, filename: str):
     )
 
 
-@router.get("/builds/latest")
-async def get_latest_builds(limit: int = 10, status: Optional[str] = None):
+@router.get("/builds/latest", response_model=BuildListResponse, response_model_exclude_none=True)
+async def get_latest_builds(
+    limit: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+) -> BuildListResponse:
     """Get latest builds"""
-    all_builds = list(engine.build_history.values()) + list(engine.active_builds.values())
-
-    if status:
-        all_builds = [b for b in all_builds if b["status"] == status]
-
-    # Sort by creation time (newest first)
-    all_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-
-    builds = []
-    for build in all_builds[:limit]:
-        builds.append({
-            "build_id": build["build_id"],
-            "pkgname": build["pkgname"],
-            "status": build["status"],
-            "start_time": datetime.fromtimestamp(build.get("start_time", build.get("created_at", 0)), timezone.utc).isoformat(),
-            "end_time": datetime.fromtimestamp(build["end_time"], timezone.utc).isoformat() if build.get("end_time") else None,
-            "duration": build.get("duration", 0)
-        })
-
-    return {"builds": builds, "total": len(all_builds)}
+    return _build_list_response(_find_builds(status=status), limit)
 
 
-@router.get("/builds/pkgname/{pkgname}")
-async def get_builds_for_package(pkgname: str, limit: int = 5):
+@router.get("/builds/pkgname/{pkgname}", response_model=BuildListResponse, response_model_exclude_none=True)
+async def get_builds_for_package(
+    pkgname: str,
+    limit: int = Query(20, ge=1, le=100),
+    status: Optional[str] = Query(None),
+) -> BuildListResponse:
     """Get builds for a specific package"""
-    all_builds = list(engine.build_history.values()) + list(engine.active_builds.values())
-    pkg_builds = [b for b in all_builds if b["pkgname"] == pkgname]
-
-    # Sort by creation time (newest first)
-    pkg_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-
-    builds = []
-    for build in pkg_builds[:limit]:
-        builds.append({
-            "build_id": build["build_id"],
-            "status": build["status"],
-            "start_time": datetime.fromtimestamp(build.get("start_time", build.get("created_at", 0)), timezone.utc).isoformat(),
-            "end_time": datetime.fromtimestamp(build["end_time"], timezone.utc).isoformat() if build.get("end_time") else None,
-            "duration": build.get("duration", 0)
-        })
-
-    return {"pkgname": pkgname, "builds": builds, "total": len(pkg_builds)}
+    return _build_list_response(_find_builds(pkgname=pkgname, status=status), limit, pkgname)
 
 
-@router.get("/builds/pkgname/{pkgname}/latest")
-async def get_latest_build_for_package(pkgname: str, successful_only: bool = True):
+@router.get("/builds/pkgname/{pkgname}/latest", response_model=BuildSummary, response_model_exclude_none=True)
+async def get_latest_build_for_package(pkgname: str, successful_only: bool = True) -> BuildSummary:
     """Get the latest build for a specific package"""
-    all_builds = list(engine.build_history.values()) + list(engine.active_builds.values())
-    pkg_builds = [b for b in all_builds if b["pkgname"] == pkgname]
-
-    if successful_only:
-        pkg_builds = [b for b in pkg_builds if b["status"] == BuildStatus.COMPLETED]
-
-    if not pkg_builds:
-        raise HTTPException(status_code=404, detail="No builds found for package")
-
-    # Sort by creation time (newest first)
-    pkg_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-    latest_build = pkg_builds[0]
-
-    return {
-        "build_id": latest_build["build_id"],
-        "pkgname": latest_build["pkgname"],
-        "status": latest_build["status"],
-        "start_time": datetime.fromtimestamp(latest_build.get("start_time", latest_build.get("created_at", 0)), timezone.utc).isoformat(),
-        "end_time": datetime.fromtimestamp(latest_build["end_time"], timezone.utc).isoformat() if latest_build.get("end_time") else None,
-        "duration": latest_build.get("duration", 0),
-        "packages": latest_build.get("packages", [])
-    }
+    return _build_summary(_latest_build(pkgname, successful_only), with_packages=True)
 
 
 @router.get("/builds/pkgname/{pkgname}/latest/download/{file_type}")
 async def download_latest_build_file(pkgname: str, file_type: str, successful_only: bool = True):
     """Download the latest build file for a package"""
-    all_builds = list(engine.build_history.values()) + list(engine.active_builds.values())
-    pkg_builds = [b for b in all_builds if b["pkgname"] == pkgname]
-
-    if successful_only:
-        pkg_builds = [b for b in pkg_builds if b["status"] == BuildStatus.COMPLETED]
-
-    if not pkg_builds:
-        raise HTTPException(status_code=404, detail="No builds found for package")
-
-    # Sort by creation time (newest first)
-    pkg_builds.sort(key=lambda x: x.get("created_at", 0), reverse=True)
-    latest_build = pkg_builds[0]
+    latest_build = _latest_build(pkgname, successful_only)
 
     builds_dir = Path(engine.server_config["builds_dir"])
     build_dir = builds_dir / latest_build["build_id"]
@@ -738,7 +687,7 @@ async def get_build_details(build_id: str, request: Request):
                 sources.append({
                     "filename": src_file.name,
                     "size": src_file.stat().st_size,
-                    "download_url": f"/build/{build_id}/download/{src_file.name}"
+                    "download_url": build_download_path(build_id, src_file.name)
                 })
 
         return {

@@ -227,7 +227,7 @@ Get comprehensive server information and status.
 ```json
 {
   "status": "running",
-  "version": "2026-06-30",
+  "version": "2026.10.28",
   "supported_architecture": "x86_64",
   "system_info": {
     "architecture": "x86_64",
@@ -284,7 +284,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "healthy",
-  "version": "2026-06-30",
+  "version": "2026.10.28",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 45.2,
   "checks": {
@@ -319,7 +319,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "degraded",
-  "version": "2026-06-30",
+  "version": "2026.10.28",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 2500.1,
   "warning": "High response time",
@@ -451,6 +451,8 @@ Get build status as JSON.
   ]
 }
 ```
+
+The response is the shared `BuildStatusResponse` model (`apb.models`), the same shape the farm returns. Fields without a value (for example `start_time` while queued) are omitted. Internal build records such as `extra_repos` are not exposed. Times are epoch seconds.
 
 **Status Values:**
 - `queued`: Build is waiting in queue
@@ -666,11 +668,18 @@ List packages produced by a build.
 
 ### Build History
 
+Build history endpoints share their response shape with the farm (`BuildSummary` and `BuildListResponse` in `apb.models`):
+
+- Each build has `build_id`, `pkgname`, `status`, `start_time`, `end_time`, `created_at` and `duration` (seconds). Fields without a value are omitted, for example `end_time` while a build is running.
+- Timestamps are ISO 8601 UTC strings.
+- `total` is the number of builds matching the filters, not the number returned.
+- Builds are ordered newest first by `created_at`.
+
 #### GET /builds/latest
 Get the latest builds with filtering support.
 
 **Parameters:**
-- `limit` (integer, optional): Maximum number of builds (default: 10, max: 100)
+- `limit` (integer, optional): Maximum number of builds (default: 20, min: 1, max: 100)
 - `status` (string, optional): Filter by status
 
 **Response:**
@@ -683,6 +692,7 @@ Get the latest builds with filtering support.
       "status": "completed",
       "start_time": "2024-01-20T10:00:00Z",
       "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T09:59:50Z",
       "duration": 300.0
     }
   ],
@@ -695,7 +705,8 @@ Get builds for a specific package.
 
 **Parameters:**
 - `pkgname` (string, required): The package name
-- `limit` (integer, optional): Maximum number of builds (default: 5, max: 50)
+- `limit` (integer, optional): Maximum number of builds (default: 20, min: 1, max: 100)
+- `status` (string, optional): Filter by status
 
 **Response:**
 ```json
@@ -704,9 +715,11 @@ Get builds for a specific package.
   "builds": [
     {
       "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
+      "pkgname": "example-package",
       "status": "completed",
       "start_time": "2024-01-20T10:00:00Z",
       "end_time": "2024-01-20T10:05:00Z",
+      "created_at": "2024-01-20T09:59:50Z",
       "duration": 300.0
     }
   ],
@@ -715,13 +728,13 @@ Get builds for a specific package.
 ```
 
 #### GET /builds/pkgname/{pkgname}/latest
-Get the latest build for a specific package.
+Get the latest build for a specific package. Returns 404 when none is found.
 
 **Parameters:**
 - `pkgname` (string, required): The package name
 - `successful_only` (boolean, optional): Only return successful builds (default: true)
 
-**Response:**
+**Response:** A single build summary that also includes `packages`:
 ```json
 {
   "build_id": "48ea1df5-f7f3-477e-a7a7-36e526ea7cd3",
@@ -729,6 +742,7 @@ Get the latest build for a specific package.
   "status": "completed",
   "start_time": "2024-01-20T10:00:00Z",
   "end_time": "2024-01-20T10:05:00Z",
+  "created_at": "2024-01-20T09:59:50Z",
   "duration": 300.0,
   "packages": [
     {

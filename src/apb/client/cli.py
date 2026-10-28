@@ -2,26 +2,27 @@
 
 import argparse
 import getpass
-import json
 import logging
-import os
-import queue
 import re
 import sys
-import tempfile
 import threading
-import time
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
-from urllib.parse import urljoin
+from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 import httpx
 
 from apb.config import load_config
-from apb.tarball import create_build_tarball
+from apb.constants import (
+    BUILD_TIMEOUT_MAX,
+    BUILD_TIMEOUT_MIN,
+    DEFAULT_FARM_URL,
+    DEFAULT_SERVER_URL,
+    BuildStatus,
+)
+from apb.models import BuildStatusResponse, BuildSubmitResponse, FarmBuildSubmitResponse
+from apb.upstream import upstream_url
 
-from apb.client.api import APBotClient
+from apb.client.api import APBotClient, BuildRejectedError
 from apb.client.auth import APBAuthClient
 from apb.client.helpers import (
     effective_any_server_arch,
@@ -39,17 +40,40 @@ _BUILD_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+POLL_INTERVAL = 5
+ERROR_RETRY_INTERVAL = 10
+MAX_STATUS_ERRORS = 5
+MAX_SERVER_UNAVAILABLE = 8
+STATUS_SKIPPED = "skipped"
+STATUS_SUBMITTED = "submitted"
+STATUS_SERVER_UNAVAILABLE = "failed_server_unavailable"
+STATUS_INTERRUPTED = "interrupted"
+PKGBUILD_DOWNLOAD = "__PKGBUILD__"
 
-def _format_farm_queue_message(status: Dict, *, arch_prefix: str = "") -> Optional[str]:
-    if status.get("status") != "queued" or status.get("queue_state") != "farm":
+
+class MonitorTarget(NamedTuple):
+    """A submitted build to monitor; downloads are skipped when output_dir is None."""
+
+    build_id: str
+    client: APBotClient
+    output_dir: Optional[Path] = None
+    arch: Optional[str] = None
+
+
+def _arch_prefix(arch: Optional[str]) -> str:
+    return f"[{arch}] " if arch else ""
+
+
+def _format_farm_queue_message(status: BuildStatusResponse, *, arch_prefix: str = "") -> Optional[str]:
+    if status.status != BuildStatus.QUEUED or status.queue_state != "farm":
         return None
 
-    queue_position = status.get("queue_position")
+    queue_position = status.queue_position
     if not queue_position:
         return None
 
-    jobs_ahead = status.get("jobs_ahead", max(queue_position - 1, 0))
-    farm_queue_size = status.get("farm_queue_size", queue_position)
+    jobs_ahead = status.jobs_ahead if status.jobs_ahead is not None else max(queue_position - 1, 0)
+    farm_queue_size = status.farm_queue_size or queue_position
     if jobs_ahead == 0:
         return (
             f"{arch_prefix}Queued on farm (position {queue_position}/{farm_queue_size}, "
@@ -61,26 +85,25 @@ def _format_farm_queue_message(status: Dict, *, arch_prefix: str = "") -> Option
     )
 
 
-def _print_submitted_build_queue_info(builds: List[Dict], queue_status: Optional[Dict] = None) -> None:
-    if queue_status and queue_status.get("message"):
-        print(queue_status["message"])
+def _print_submitted_build_queue_info(response: FarmBuildSubmitResponse) -> None:
+    print("\n=== Build Summary ===")
+    if response.queue_status and response.queue_status.message:
+        print(response.queue_status.message)
 
-    for build in builds:
-        arch = build.get("arch", "?")
-        build_id = build["build_id"]
-        queue_position = build.get("queue_position")
-        if queue_position is not None:
-            jobs_ahead = build.get("jobs_ahead", max(queue_position - 1, 0))
+    for build in response.builds:
+        if build.queue_position is not None:
+            jobs_ahead = build.jobs_ahead if build.jobs_ahead is not None else max(build.queue_position - 1, 0)
             print(
-                f"[{arch}] Build queued at farm position {queue_position} "
-                f"({jobs_ahead} job(s) ahead): {build_id}"
+                f"[{build.arch}] Build queued at farm position {build.queue_position} "
+                f"({jobs_ahead} job(s) ahead): {build.build_id}"
             )
         else:
-            print(f"[{arch}] Build ID: {build_id}")
+            print(f"[{build.arch}] Build ID: {build.build_id}")
+    print("====================\n")
 
 
 def _maybe_print_farm_queue_status(
-    status: Dict,
+    status: BuildStatusResponse,
     *,
     arch_prefix: str = "",
     last_message: Optional[str],
@@ -100,38 +123,28 @@ def _download_build_artifacts(
     arch_prefix: str = "",
 ) -> bool:
     """Wait for the farm to cache artifacts, then download packages and logs."""
-    if not client.wait_for_farm_artifacts(build_id):
-        print(f"{arch_prefix}Timed out waiting for the farm to cache build artifacts")
-        return False
-
     try:
-        final_status = client.get_build_status(build_id)
+        final_status = client.wait_for_farm_artifacts(build_id)
     except httpx.HTTPError as exc:
         print(f"{arch_prefix}Error getting build status for download: {exc}")
         return False
 
-    if final_status.get("server_unavailable"):
+    if not final_status:
+        print(f"{arch_prefix}Build artifacts are not ready for download")
+        return False
+
+    if final_status.server_unavailable:
         print(f"{arch_prefix}Server unavailable - cannot download build artifacts")
         print(f"{arch_prefix}You may need to download files manually when server recovers")
         return False
 
     downloaded_files = []
-
-    if final_status.get("packages"):
-        for package in final_status["packages"]:
-            if client.download_file(build_id, package["filename"], output_dir):
-                print(f"{arch_prefix}Downloaded: {package['filename']}")
-                downloaded_files.append(package["filename"])
-            else:
-                print(f"{arch_prefix}Failed to download: {package['filename']}")
-
-    if final_status.get("logs"):
-        for log in final_status["logs"]:
-            if client.download_file(build_id, log["filename"], output_dir):
-                print(f"{arch_prefix}Downloaded: {log['filename']}")
-                downloaded_files.append(log["filename"])
-            else:
-                print(f"{arch_prefix}Failed to download: {log['filename']}")
+    for artifact in [*final_status.packages, *final_status.logs]:
+        if client.download_file(build_id, artifact.filename, output_dir):
+            print(f"{arch_prefix}Downloaded: {artifact.filename}")
+            downloaded_files.append(artifact.filename)
+        else:
+            print(f"{arch_prefix}Failed to download: {artifact.filename}")
 
     if downloaded_files:
         print(f"{arch_prefix}Downloaded {len(downloaded_files)} files")
@@ -143,6 +156,23 @@ def _download_build_artifacts(
 
 def _is_build_id(value: str) -> bool:
     return bool(_BUILD_ID_RE.match(value.strip()))
+
+
+def parse_arch_list(value: Optional[str]) -> List[str]:
+    """Split a comma-separated --arch value into unique architecture names."""
+    if not value:
+        return []
+    return list(dict.fromkeys(arch.strip() for arch in value.split(",") if arch.strip()))
+
+
+def _select_requested_archs(pkgbuild_archs: List[str], arch_filter: Optional[List[str]]) -> List[str]:
+    """Intersect PKGBUILD arch=() with --arch, printing what does not match."""
+    selected, missing = select_pkgbuild_architectures(pkgbuild_archs, arch_filter)
+    if missing:
+        print(f"Warning: architectures not in PKGBUILD arch=(): {', '.join(missing)}")
+    if not selected:
+        print("Error: No matching architectures between --arch and PKGBUILD arch=()")
+    return selected
 
 
 def _resolve_pkgbuild_dir(path: Optional[Path]) -> Path:
@@ -182,16 +212,9 @@ def download_latest_from_pkgbuild(
         print(f"Error: Could not determine pkgname from {pkgbuild_path}")
         return False
 
-    target_archs = list(pkgbuild_archs)
-    if arch_filter:
-        requested = set(arch_filter)
-        target_archs = [arch for arch in pkgbuild_archs if arch in requested]
-        missing = requested - set(pkgbuild_archs)
-        if missing:
-            print(f"Warning: architectures not in PKGBUILD arch=(): {', '.join(sorted(missing))}")
-        if not target_archs:
-            print("Error: No matching architectures between --arch and PKGBUILD arch=()")
-            return False
+    target_archs = _select_requested_archs(pkgbuild_archs, arch_filter)
+    if not target_archs:
+        return False
 
     print(f"Package: {pkgname}")
     print(f"Architectures: {', '.join(target_archs)}")
@@ -205,18 +228,12 @@ def download_latest_from_pkgbuild(
             results.append(False)
             continue
 
-        build_id = latest.get("build_id") or latest.get("id")
-        if not build_id:
-            print(f"{arch_prefix}Latest build response missing build id")
-            results.append(False)
-            continue
-
-        display_name = latest.get("display_name") or pkgname
-        server_arch = latest.get("server_arch") or arch
-        print(f"{arch_prefix}Latest build: {build_id} ({display_name}, server_arch={server_arch})")
+        display_name = latest.display_name or pkgname
+        server_arch = latest.server_arch or arch
+        print(f"{arch_prefix}Latest build: {latest.build_id} ({display_name}, server_arch={server_arch})")
 
         arch_output_dir = output_dir / ("any" if arch == "any" else arch)
-        success = _download_build_artifacts(client, build_id, arch_output_dir, arch_prefix=arch_prefix)
+        success = _download_build_artifacts(client, latest.build_id, arch_output_dir, arch_prefix=arch_prefix)
         results.append(success)
 
     if not results:
@@ -224,576 +241,432 @@ def download_latest_from_pkgbuild(
     return all(results)
 
 
+def _print_submit_http_error(server_url: str, exc: httpx.HTTPError) -> None:
+    print(f"Error submitting build to {server_url}: {exc}")
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return
+
+    try:
+        print(f"Error response: {exc.response.json()}")
+    except ValueError:
+        print(f"HTTP {exc.response.status_code} response: {exc.response.text}")
+    if exc.response.status_code == 401:
+        print("Authentication required. Please login first using: apb --farm --login")
+    elif exc.response.status_code == 403:
+        print("Access denied. You may not have permission to submit builds.")
+
+
+def _print_build_rejected(exc: BuildRejectedError) -> None:
+    print(f"Error: {exc}")
+    for key, label in (
+        ("available_architectures", "Available architectures"),
+        ("target_architectures", "Requested architectures"),
+        ("pkgbuild_architectures", "PKGBUILD architectures"),
+        ("invalid_repositories", "Invalid repositories"),
+    ):
+        if exc.detail.get(key):
+            print(f"{label}: {', '.join(exc.detail[key])}")
+
+
 def submit_build(
     server_url: str,
     build_path: Path,
     auth_client: Optional[APBAuthClient] = None,
     exclude_paths: Optional[List[Path]] = None,
-) -> Optional[str]:
-    """
-    Submit a build to a server using a tarball of the build directory.
-
-    Args:
-        server_url: Server URL
-        build_path: Path to directory containing PKGBUILD and source files
-        auth_client: Optional authentication client
-
-    Returns:
-        Build ID if successful, None otherwise
-    """
-    try:
-        client = APBotClient(server_url, auth_client)
-        return client.build_package(build_path, exclude_paths=exclude_paths)
-    except httpx.HTTPError:
-        return None
-
-
-def submit_build_to_farm(
-    server_url: str,
-    build_path: Path,
-    architectures: List[str] = None,
-    auth_client: Optional[APBAuthClient] = None,
+    architectures: Optional[List[str]] = None,
     build_timeout: Optional[int] = None,
-    exclude_paths: Optional[List[Path]] = None,
-) -> Optional[Dict]:
+) -> Optional[BuildSubmitResponse]:
     """
-    Submit a build to a farm server using a tarball and return the full response.
+    Submit a tarball of the build directory to a server or farm.
 
     Args:
-        server_url: Farm server URL
+        server_url: Server or farm URL
         build_path: Path to directory containing PKGBUILD and source files
-        architectures: Optional list of architectures to build for
         auth_client: Optional authentication client for farm access
-        build_timeout: Optional build timeout in seconds (admin only)
+        exclude_paths: Paths left out of the tarball
+        architectures: PKGBUILD architectures the farm should queue (farm only)
+        build_timeout: Optional build timeout in seconds (admin only on the farm)
 
     Returns:
-        Full response dictionary if successful, None otherwise
+        Submit response (FarmBuildSubmitResponse for farms), or None after printing the error
     """
+    client = APBotClient(server_url, auth_client)
     try:
-        # Validate timeout parameter if provided
-        if build_timeout is not None:
-            if build_timeout < 300 or build_timeout > 14400:
-                raise ValueError("Build timeout must be between 300 and 14400 seconds (5 minutes to 4 hours)")
-
-        # Ensure we have a PKGBUILD
-        pkgbuild_path = build_path / "PKGBUILD"
-        if not pkgbuild_path.exists():
-            raise ValueError(f"PKGBUILD not found in {build_path}")
-
-        client = APBotClient(server_url, auth_client)
-
-        with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_tarball:
-            try:
-                create_build_tarball(build_path, Path(temp_tarball.name), exclude_paths=exclude_paths)
-
-                # Prepare form data
-                form_data = {}
-                if architectures:
-                    # Include architectures list as form data to tell farm which architectures to build
-                    form_data['architectures'] = ','.join(architectures)
-                if build_timeout is not None:
-                    # Include build timeout (only allowed for admin users)
-                    form_data['build_timeout'] = str(build_timeout)
-
-                # Submit the tarball using streaming to avoid memory issues
-                with open(temp_tarball.name, 'rb') as f:
-                    files_data = [('build_tarball', ('build.tar.gz', f, 'application/gzip'))]
-
-                    # Submit build request
-                    url = urljoin(server_url, '/build')
-                    response = client.session.post(url, files=files_data, data=form_data)
-                    response.raise_for_status()
-
-                return response.json()
-
-            finally:
-                # Clean up temporary file
-                try:
-                    os.unlink(temp_tarball.name)
-                except OSError:
-                    pass
-
-    except httpx.HTTPError as e:
-        print(f"Error submitting build to farm: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_detail = e.response.json()
-                print(f"Farm error response: {error_detail}")
-                # Handle authentication errors specifically
-                if e.response.status_code == 401:
-                    print("Authentication required. Please login first using: apb --farm --login")
-                elif e.response.status_code == 403:
-                    print("Access denied. You may not have permission to submit builds.")
-            except:
-                print(f"Farm HTTP {e.response.status_code} response: {e.response.text}")
-                if e.response.status_code == 401:
-                    print("Authentication required. Please login first using: apb --farm --login")
-        return None
+        return client.build_package(
+            build_path,
+            exclude_paths=exclude_paths,
+            architectures=architectures,
+            build_timeout=build_timeout,
+        )
+    except BuildRejectedError as exc:
+        _print_build_rejected(exc)
+    except httpx.HTTPError as exc:
+        _print_submit_http_error(server_url, exc)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+    return None
 
 
-def monitor_farm_builds(builds: List[Dict], client: APBotClient, output_dir: Path = None,
-                       verbose: bool = False, pkgbuild_path: Path = None, auth_client: Optional[APBAuthClient] = None) -> bool:
+def _status_error_code(exc: httpx.HTTPError) -> Optional[int]:
+    return exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+
+
+def _poll_build(target: MonitorTarget, stop_event: threading.Event) -> str:
+    """Poll a build until it reaches a terminal state and return the final status.
+
+    Returns STATUS_SERVER_UNAVAILABLE when the server stays unreachable, and the last
+    seen status (or STATUS_INTERRUPTED) when stop_event is set.
     """
-    Monitor multiple builds from a farm submission.
+    arch_prefix = _arch_prefix(target.arch)
+    last_status: Optional[str] = None
+    last_queue_message: Optional[str] = None
+    status_errors = 0
+    server_unavailable_count = 0
+
+    while not stop_event.is_set():
+        try:
+            status = target.client.get_build_status(target.build_id)
+        except httpx.HTTPError as exc:
+            if _status_error_code(exc) in (502, 503):
+                server_unavailable_count += 1
+                if server_unavailable_count >= MAX_SERVER_UNAVAILABLE:
+                    print(f"{arch_prefix}Server has been unavailable for {server_unavailable_count} consecutive attempts")
+                    print(f"{arch_prefix}Build may be running but server is unreachable")
+                    return STATUS_SERVER_UNAVAILABLE
+                print(f"{arch_prefix}Server unavailable (attempt {server_unavailable_count}/{MAX_SERVER_UNAVAILABLE}), retrying...")
+            else:
+                status_errors += 1
+                reason = "Build not found (404)" if _status_error_code(exc) == 404 else f"Error getting build status: {exc}"
+                if status_errors >= MAX_STATUS_ERRORS:
+                    print(f"{arch_prefix}{reason}, giving up after {status_errors} attempts")
+                    return BuildStatus.FAILED
+                print(f"{arch_prefix}{reason}, retrying (attempt {status_errors}/{MAX_STATUS_ERRORS})")
+            stop_event.wait(ERROR_RETRY_INTERVAL)
+            continue
+
+        status_errors = 0
+        if status.server_unavailable:
+            server_unavailable_count += 1
+            if server_unavailable_count >= MAX_SERVER_UNAVAILABLE:
+                print(f"{arch_prefix}Server has been unavailable for {server_unavailable_count} consecutive checks")
+                print(f"{arch_prefix}Last known status: {status.status}")
+                if status.status in BuildStatus.TERMINAL:
+                    return status.status
+                print(f"{arch_prefix}Giving up monitoring due to prolonged server unavailability")
+                return STATUS_SERVER_UNAVAILABLE
+            print(
+                f"{arch_prefix}Server unavailable ({server_unavailable_count}/{MAX_SERVER_UNAVAILABLE}), "
+                f"cached status: {status.status}"
+            )
+        else:
+            server_unavailable_count = 0
+
+        if status.status != last_status:
+            print(f"{arch_prefix}Status: {status.status}")
+            last_status = status.status
+
+        last_queue_message = _maybe_print_farm_queue_status(
+            status,
+            arch_prefix=arch_prefix,
+            last_message=last_queue_message,
+        )
+
+        if status.status in BuildStatus.TERMINAL:
+            return status.status
+
+        stop_event.wait(POLL_INTERVAL)
+
+    return last_status or STATUS_INTERRUPTED
+
+
+def _monitor_target(target: MonitorTarget, stop_event: threading.Event, *, verbose: bool) -> Tuple[str, bool]:
+    """Monitor one build, download its artifacts, and return (final status, is_successful)."""
+    arch_prefix = _arch_prefix(target.arch)
+    if verbose:
+        print(f"{arch_prefix}Monitoring build: {target.build_id}")
+
+    final_status = _poll_build(target, stop_event)
+    if stop_event.is_set():
+        return final_status, False
+
+    is_downloaded = True
+    if target.output_dir and final_status in (BuildStatus.COMPLETED, BuildStatus.FAILED):
+        is_downloaded = _download_build_artifacts(
+            target.client,
+            target.build_id,
+            target.output_dir,
+            arch_prefix=arch_prefix,
+        )
+
+    is_completed = final_status == BuildStatus.COMPLETED
+    print(f"{arch_prefix}Build {'SUCCESS' if is_completed else 'FAILED'}")
+    return final_status, is_completed and is_downloaded
+
+
+def monitor_builds(targets: List[MonitorTarget], *, verbose: bool = False) -> Dict[str, Tuple[str, bool]]:
+    """
+    Monitor submitted builds in parallel and download their artifacts.
+
+    On Ctrl-C every unfinished build is cancelled.
 
     Args:
-        builds: List of build information dictionaries
-        client: Client instance
-        output_dir: Base output directory
+        targets: Builds to monitor
         verbose: Enable verbose output
-        pkgbuild_path: Path to PKGBUILD file (to check original architecture)
 
     Returns:
-        True if all builds were successful
+        Mapping of build ID to (final status, is_successful)
     """
-    print(f"Monitoring {len(builds)} build(s)...")
-
-    build_results = {}
-    arch_build_info = {}
-
-    # Set up build tracking
-    for build in builds:
-        arch = build['arch']
-        build_id = build['build_id']
-        arch_build_info[arch] = {
-            'build_id': build_id,
-            'status': 'submitted'
-        }
-
-    # Show summary of submitted builds
-    print("\n=== Build Summary ===")
-    _print_submitted_build_queue_info(builds)
-    print("====================\n")
-
-    # Thread-safe queue for results
-    result_queue = queue.Queue()
-
-    # Event to signal all threads to stop
+    results: Dict[str, Tuple[str, bool]] = {}
     stop_event = threading.Event()
 
-    # Thread function to monitor a single build
-    def monitor_build_thread(build_info):
-        arch = build_info['arch']
-        build_id = build_info['build_id']
-
+    def run(target: MonitorTarget) -> None:
         try:
-            # Check if original package had arch=(any) to determine output folder
-            is_any_arch_package = False
-            if pkgbuild_path and pkgbuild_path.exists():
-                pkg_info = parse_pkgbuild_info(pkgbuild_path)
-                original_archs = pkg_info.get("arch", [])
-                is_any_arch_package = "any" in original_archs
+            outcome = _monitor_target(target, stop_event, verbose=verbose)
+        except Exception as exc:
+            print(f"{_arch_prefix(target.arch)}Error monitoring build: {exc}")
+            outcome = (BuildStatus.FAILED, False)
+        results.setdefault(target.build_id, outcome)
 
-            if output_dir:
-                if is_any_arch_package:
-                    arch_output_dir = output_dir / "any"
-                else:
-                    arch_output_dir = output_dir / arch
-            else:
-                arch_output_dir = None
-
-            print(f"[{arch}] Starting monitoring...")
-
-            # Monitor with enhanced error handling for server unavailability
-            last_status = None
-            last_queue_message = None
-            consecutive_errors = 0
-            max_consecutive_errors = 5
-            server_unavailable_count = 0
-            max_server_unavailable = 8  # More lenient for farm builds
-
-            while not stop_event.is_set():
-                try:
-                    status = client.get_build_status(build_id)
-
-                    # Check if server is unavailable but we have cached data
-                    if status.get('server_unavailable'):
-                        server_unavailable_count += 1
-                        if server_unavailable_count >= max_server_unavailable:
-                            print(f"[{arch}] Server has been unavailable for {server_unavailable_count} consecutive checks")
-                            cached_status = status.get('status', 'unknown')
-                            print(f"[{arch}] Last known status: {cached_status}")
-
-                            # If we have a final status, use it
-                            if cached_status in ['completed', 'failed', 'cancelled']:
-                                success = cached_status == 'completed'
-                                print(f"[{arch}] Build appears to be {'SUCCESS' if success else 'FAILED'} based on cached data")
-                                result_queue.put((arch, success))
-                                arch_build_info[arch]['status'] = cached_status
-                                break
-                            else:
-                                print(f"[{arch}] Giving up monitoring due to prolonged server unavailability")
-                                result_queue.put((arch, False))
-                                arch_build_info[arch]['status'] = 'failed_server_unavailable'
-                                break
-                        else:
-                            print(f"[{arch}] Server unavailable ({server_unavailable_count}/{max_server_unavailable}), using cached data")
-                            if verbose:
-                                print(f"[{arch}] Cached status: {status.get('status', 'unknown')}")
-                    else:
-                        server_unavailable_count = 0  # Reset counter on successful response
-
-                    consecutive_errors = 0  # Reset error count on success
-
-                    if status['status'] != last_status:
-                        print(f"[{arch}] Status: {status['status']}")
-                        last_status = status['status']
-                        arch_build_info[arch]['status'] = status['status']
-
-                    last_queue_message = _maybe_print_farm_queue_status(
-                        status,
-                        arch_prefix=f"[{arch}] ",
-                        last_message=last_queue_message,
-                    )
-
-                    if status['status'] in ['completed', 'failed', 'cancelled']:
-                        # Download results if output_dir provided
-                        if arch_output_dir and status['status'] in ['completed', 'failed']:
-                            _download_build_artifacts(
-                                client,
-                                build_id,
-                                arch_output_dir,
-                                arch_prefix=f"[{arch}] ",
-                            )
-
-                        # Build finished
-                        success = status['status'] == 'completed'
-                        print(f"[{arch}] Build {'SUCCESS' if success else 'FAILED'}")
-                        result_queue.put((arch, success))
-                        arch_build_info[arch]['status'] = 'completed' if success else 'failed'
-                        break
-
-                    # Wait before next status check
-                    stop_event.wait(5)
-
-                except httpx.HTTPError as e:
-                    if "503" in str(e) or "502" in str(e):
-                        # Server unavailable - these are expected during outages
-                        server_unavailable_count += 1
-                        if server_unavailable_count >= max_server_unavailable:
-                            print(f"[{arch}] Server has been unavailable for {server_unavailable_count} consecutive attempts")
-                            print(f"[{arch}] Build may be running but server is unreachable")
-                            result_queue.put((arch, False))
-                            arch_build_info[arch]['status'] = 'failed_server_unavailable'
-                            break
-                        else:
-                            print(f"[{arch}] Server unavailable (attempt {server_unavailable_count}/{max_server_unavailable}), retrying...")
-                    elif "404" in str(e):
-                        # Build not found - could be because server is unavailable or build was never submitted
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            print(f"[{arch}] Build not found (404) after {max_consecutive_errors} attempts")
-                            print(f"[{arch}] Server may be unavailable or build was not submitted")
-                            result_queue.put((arch, False))
-                            arch_build_info[arch]['status'] = 'failed'
-                            break
-                        else:
-                            print(f"[{arch}] Build not found (404), retrying... (attempt {consecutive_errors}/{max_consecutive_errors})")
-                    else:
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            print(f"[{arch}] Error monitoring build after {max_consecutive_errors} attempts: {e}")
-                            result_queue.put((arch, False))
-                            arch_build_info[arch]['status'] = 'failed'
-                            break
-
-                    # Wait longer before retrying on error
-                    stop_event.wait(10)
-
-        except Exception as e:
-            print(f"[{arch}] Error in build thread: {e}")
-            result_queue.put((arch, False))
-            arch_build_info[arch]['status'] = 'failed'
-
-    # Start monitoring threads
-    threads = []
-    for build in builds:
-        thread = threading.Thread(target=monitor_build_thread, args=(build,))
-        thread.daemon = True
+    threads = [threading.Thread(target=run, args=(target,), daemon=True) for target in targets]
+    for thread in threads:
         thread.start()
-        threads.append(thread)
-
-    cancelled_by_user = False
 
     try:
-        # Wait for all builds to complete
-        completed_builds = 0
-        while completed_builds < len(builds):
-            try:
-                # Wait for a build to complete
-                arch, success = result_queue.get(timeout=1)
-                build_results[arch] = success
-                completed_builds += 1
-            except queue.Empty:
-                # Check if any threads are still alive
-                alive_threads = [t for t in threads if t.is_alive()]
-                if not alive_threads:
-                    # All threads finished but we didn't get all results
-                    break
-                continue
-
+        for thread in threads:
+            while thread.is_alive():
+                thread.join(timeout=1)
     except KeyboardInterrupt:
         print("\n--- Build monitoring interrupted by user ---")
-        cancelled_by_user = True
-
-        # Signal all threads to stop
         stop_event.set()
+        print("Cancelling unfinished builds...")
+        for target in targets:
+            if results.get(target.build_id, ("", False))[0] in BuildStatus.TERMINAL:
+                continue
+            arch_prefix = _arch_prefix(target.arch)
+            if target.client.cancel_build(target.build_id):
+                print(f"{arch_prefix}Build cancelled successfully")
+                results[target.build_id] = (BuildStatus.CANCELLED, False)
+            else:
+                print(f"{arch_prefix}Failed to cancel build - it may continue running")
+        for thread in threads:
+            thread.join(timeout=1)
 
-        # Cancel all builds
-        print("\nCancelling all builds...")
-        for build in builds:
-            arch = build['arch']
-            build_id = build['build_id']
-            if arch_build_info.get(arch, {}).get('status') not in ['completed', 'failed', 'cancelled']:
-                try:
-                    if client.cancel_build(build_id):
-                        print(f"[{arch}] Build cancelled successfully")
-                        arch_build_info[arch]['status'] = 'cancelled'
-                    else:
-                        print(f"[{arch}] Failed to cancel build")
-                except Exception as cancel_error:
-                    print(f"[{arch}] Error cancelling build: {cancel_error}")
+    for target in targets:
+        results.setdefault(target.build_id, (STATUS_INTERRUPTED, False))
+    return results
 
-        # Fill in results for builds that didn't complete
-        for build in builds:
-            arch = build['arch']
-            if arch not in build_results:
-                build_results[arch] = False
 
-    # Wait for all threads to finish
-    for thread in threads:
-        thread.join(timeout=1)
-
-    # Show final summary
+def _print_final_results(rows: Iterable[Tuple[str, Optional[str], str, bool]]) -> None:
+    """Print one line per architecture: (arch, build_id, status, is_successful)."""
+    rows = list(rows)
     print("\n=== Final Results ===")
-    for build in builds:
-        arch = build['arch']
-        build_id = build['build_id']
-        status = arch_build_info[arch]['status'].upper()
-        print(f"[{arch}] {status} (Build ID: {build_id})")
+    for arch, build_id, status, _is_successful in rows:
+        suffix = f" (Build ID: {build_id})" if build_id else ""
+        print(f"[{arch}] {status.upper()}{suffix}")
     print("====================")
 
-    successful_builds = sum(1 for success in build_results.values() if success)
-    total_builds = len(build_results)
-    cancelled_builds = sum(1 for info in arch_build_info.values() if info.get('status') == 'cancelled')
+    successful_count = sum(1 for row in rows if row[3])
+    skipped_count = sum(1 for row in rows if row[2] == STATUS_SKIPPED)
+    cancelled_count = sum(1 for row in rows if row[2] == BuildStatus.CANCELLED)
+    notes = [
+        note for count, note in (
+            (skipped_count, f"{skipped_count} skipped"),
+            (cancelled_count, f"{cancelled_count} cancelled by user"),
+        ) if count
+    ]
+    notes_suffix = f" ({', '.join(notes)})" if notes else ""
+    print(f"Overall result: {successful_count}/{len(rows)} builds successful{notes_suffix}")
 
-    if cancelled_by_user:
-        print(f"Overall result: {successful_builds}/{total_builds} builds successful ({cancelled_builds} cancelled by user)")
-    else:
-        print(f"Overall result: {successful_builds}/{total_builds} builds successful")
 
-    return all(build_results.values())
-
-
-def monitor_build(build_id: str, client: APBotClient, output_dir: Path = None,
-                 verbose: bool = False, allow_toggle: bool = True,
-                 status_callback = None, pkgname: str = None, arch: str = None) -> bool:
+def monitor_build(build_id: str, client: APBotClient, output_dir: Optional[Path] = None,
+                  verbose: bool = False, arch: Optional[str] = None) -> bool:
     """
-    Monitor a build with optional real-time output and automatic downloading.
+    Monitor a single build and download its artifacts into output_dir.
 
     Args:
         build_id: Build ID to monitor
         client: Client instance
-        output_dir: Directory to download results
+        output_dir: Directory to download results (None disables downloads)
         verbose: Enable verbose output
-        allow_toggle: Allow toggling output display
-        status_callback: Callback for status updates
-        pkgname: Package name to display
         arch: Architecture being built (for display purposes)
 
     Returns:
-        True if build was successful
+        True if the build completed and its artifacts were downloaded
     """
-    arch_prefix = f"[{arch}] " if arch else ""
+    target = MonitorTarget(build_id, client, output_dir, arch)
+    _status, is_successful = monitor_builds([target], verbose=verbose)[build_id]
+    return is_successful
 
-    if verbose:
-        print(f"{arch_prefix}Monitoring build: {build_id}")
 
-    # Get initial build info with retry logic
-    max_retries = 10
-    retry_delay = 1.0
-    server_unavailable_count = 0
-    max_server_unavailable = 5  # Maximum consecutive server unavailable responses
-    last_queue_message = None
+def _arch_output_dir(output_dir: Optional[Path], arch: Optional[str]) -> Optional[Path]:
+    if output_dir is None:
+        return None
+    return output_dir / arch if arch else output_dir
 
-    for attempt in range(max_retries):
-        try:
-            initial_status = client.get_build_status(build_id)
 
-            # Check if server is unavailable but we have cached data
-            if initial_status.get('server_unavailable'):
-                server_unavailable_count += 1
-                if server_unavailable_count >= max_server_unavailable:
-                    print(f"{arch_prefix}Server has been unavailable for {server_unavailable_count} consecutive checks")
-                    print(f"{arch_prefix}Last known status: {initial_status.get('status', 'unknown')}")
-                    last_update = initial_status.get('last_status_update')
-                    if last_update:
-                        try:
-                            last_update_str = datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S')
-                            print(f"{arch_prefix}Last status update: {last_update_str}")
-                        except:
-                            print(f"{arch_prefix}Last status update: {last_update}")
+def _status_output_arch(status: Optional[BuildStatusResponse], fallback_arch: Optional[str]) -> Optional[str]:
+    """Pick the output subdirectory architecture from a build status, else fallback_arch."""
+    if status and status.server_arch:
+        return status.server_arch
+    if status and status.arch:
+        return status.arch[0]
+    return fallback_arch
 
-                    # Check if build might be completed based on cached data
-                    cached_status = initial_status.get('status', 'unknown')
-                    if cached_status in ['completed', 'failed', 'cancelled']:
-                        print(f"{arch_prefix}Build appears to be {cached_status} based on cached data")
-                        return cached_status == 'completed'
-                    else:
-                        print(f"{arch_prefix}Build status unclear due to server unavailability")
-                        return False
-                else:
-                    print(f"{arch_prefix}Server unavailable (attempt {server_unavailable_count}/{max_server_unavailable}), using cached data")
-                    if verbose:
-                        print(f"{arch_prefix}Cached status: {initial_status.get('status', 'unknown')}")
-            else:
-                server_unavailable_count = 0  # Reset counter on successful response
 
-            if not pkgname:
-                pkgname = initial_status.get('pkgname', 'unknown')
+def _monitor_submission(
+    response: BuildSubmitResponse,
+    client: APBotClient,
+    *,
+    output_dir: Optional[Path],
+    arch: Optional[str],
+    is_any_package: bool = False,
+    verbose: bool = False,
+    detach: bool = False,
+) -> bool:
+    """Report a farm or server submission, then monitor it unless detached.
 
-            if verbose:
-                print(f"{arch_prefix}Package: {pkgname}")
-                print(f"{arch_prefix}Initial status: {initial_status['status']}")
+    Farm submissions fan out into one build per architecture; arch=(any) packages
+    download into output_dir/any. A server submission is one build for ``arch``.
+    """
+    if isinstance(response, FarmBuildSubmitResponse) and response.builds:
+        print(f"Monitoring {len(response.builds)} build(s): {response.message}")
+        _print_submitted_build_queue_info(response)
+        builds = [(build.arch, build.build_id) for build in response.builds]
+    else:
+        print(f"Build submitted: {response.build_id}")
+        builds = [(arch, response.build_id)]
 
-            last_queue_message = _maybe_print_farm_queue_status(
-                initial_status,
-                arch_prefix=arch_prefix,
-                last_message=None,
-            )
-            break
-        except httpx.HTTPError as e:
-            if "503" in str(e) or "502" in str(e):
-                # Server unavailable - these are expected during outages
-                server_unavailable_count += 1
-                if server_unavailable_count >= max_server_unavailable:
-                    print(f"{arch_prefix}Server has been unavailable for {server_unavailable_count} consecutive attempts")
-                    print(f"{arch_prefix}Build may be running but server is unreachable")
-                    return False
-                else:
-                    print(f"{arch_prefix}Server unavailable (attempt {server_unavailable_count}/{max_server_unavailable}), retrying...")
-            elif "404" in str(e):
-                # Build not found - could be because server is unavailable or build was never submitted
-                print(f"{arch_prefix}Build not found (404). Server may be unavailable or build was not submitted.")
-                if attempt < max_retries - 1:
-                    print(f"{arch_prefix}Retrying in {retry_delay:.1f} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 1.5, 10.0)
-                    continue
-                else:
-                    print(f"{arch_prefix}Build not found after {max_retries} attempts")
-                    return False
-            else:
-                if attempt < max_retries - 1:
-                    if verbose:
-                        print(f"{arch_prefix}Waiting for build to be available (attempt {attempt + 1}/{max_retries}): {e}")
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 1.5, 5.0)
-                else:
-                    print(f"{arch_prefix}Error getting build status after {max_retries} attempts: {e}")
-                    return False
+    if detach:
+        return True
 
-    # Monitor build progress
-    last_status = None
-    consecutive_server_errors = 0
-    max_consecutive_server_errors = 10
-
-    try:
-        for update in client.stream_build_updates(build_id):
-            # Check if server is unavailable
-            if update.get('server_unavailable'):
-                consecutive_server_errors += 1
-                if consecutive_server_errors >= max_consecutive_server_errors:
-                    print(f"{arch_prefix}Server has been unavailable for {consecutive_server_errors} consecutive status checks")
-                    print(f"{arch_prefix}Last known status: {update.get('status', 'unknown')}")
-
-                    # If we have a final status, use it
-                    cached_status = update.get('status', 'unknown')
-                    if cached_status in ['completed', 'failed', 'cancelled']:
-                        print(f"{arch_prefix}Build appears to be {cached_status} based on cached data")
-                        last_status = cached_status
-                        break
-                    else:
-                        print(f"{arch_prefix}Giving up monitoring due to prolonged server unavailability")
-                        return False
-                else:
-                    if verbose:
-                        print(f"{arch_prefix}Server unavailable ({consecutive_server_errors}/{max_consecutive_server_errors}), status: {update.get('status', 'unknown')}")
-            else:
-                consecutive_server_errors = 0  # Reset on successful response
-
-            if update['status'] != last_status:
-                print(f"{arch_prefix}Status: {update['status']}")
-                last_status = update['status']
-
-                if status_callback:
-                    status_callback(update)
-
-            last_queue_message = _maybe_print_farm_queue_status(
-                update,
-                arch_prefix=arch_prefix,
-                last_message=last_queue_message,
-            )
-
-            if update['status'] in ['completed', 'failed', 'cancelled']:
-                break
-    except KeyboardInterrupt:
-        print(f"\n{arch_prefix}Build interrupted by user. Cancelling build...")
-        try:
-            if client.cancel_build(build_id):
-                print(f"{arch_prefix}Build cancelled successfully")
-                last_status = 'cancelled'
-            else:
-                print(f"{arch_prefix}Failed to cancel build - it may continue running")
-        except Exception as e:
-            print(f"{arch_prefix}Error cancelling build: {e}")
-
-        # Re-raise the KeyboardInterrupt to allow calling code to handle it
-        raise
-    except httpx.HTTPError as e:
-        if "503" in str(e) or "502" in str(e):
-            print(f"{arch_prefix}Server became unavailable during monitoring: {e}")
-            # Try to get final status
-            try:
-                final_status = client.get_build_status(build_id)
-                if final_status.get('server_unavailable'):
-                    cached_status = final_status.get('status', 'unknown')
-                    print(f"{arch_prefix}Using cached status: {cached_status}")
-                    last_status = cached_status
-                else:
-                    last_status = final_status['status']
-                    print(f"{arch_prefix}Final status: {last_status}")
-            except httpx.HTTPError:
-                print(f"{arch_prefix}Unable to get final status due to server unavailability")
-                return False
-        else:
-            print(f"{arch_prefix}Error monitoring build: {e}")
-            # Try to get final status
-            try:
-                final_status = client.get_build_status(build_id)
-                last_status = final_status['status']
-                print(f"{arch_prefix}Final status: {last_status}")
-            except httpx.HTTPError:
-                print(f"{arch_prefix}Unable to get final status")
-                return False
-
-    if output_dir and last_status in ['completed', 'failed']:
-        if not _download_build_artifacts(
-            client,
+    targets = [
+        MonitorTarget(
             build_id,
-            output_dir,
-            arch_prefix=arch_prefix,
-        ):
-            return False
+            client,
+            _arch_output_dir(output_dir, "any" if is_any_package else build_arch),
+            build_arch,
+        )
+        for build_arch, build_id in builds
+    ]
+    results = monitor_builds(targets, verbose=verbose)
 
-    return last_status == 'completed'
+    if isinstance(response, FarmBuildSubmitResponse):
+        _print_final_results(
+            (target.arch, target.build_id, *results[target.build_id]) for target in targets
+        )
+    return all(is_successful for _status, is_successful in results.values())
+
+
+class ArchSubmission(NamedTuple):
+    """Outcome of submitting one architecture of a config-based build."""
+
+    arch: str
+    status: str
+    build_id: Optional[str] = None
+    server_url: Optional[str] = None
+
+
+def _skip_existing_build(
+    output_dir: Path,
+    pkgbuild_path: Path,
+    arch: str,
+    *,
+    force: bool,
+    verbose: bool,
+    arch_prefix: str = "",
+) -> bool:
+    """Return True (after explaining why) when the package already exists in output_dir."""
+    should_skip, reason = should_skip_build(output_dir, pkgbuild_path, arch, force)
+    if should_skip:
+        print(f"{arch_prefix}Skipping build: {reason}")
+        if not force:
+            print(f"{arch_prefix}Use --force to rebuild existing packages")
+        return True
+    if verbose and not force:
+        print(f"{arch_prefix}{reason}")
+    return False
+
+
+def _resolve_config_architectures(pkg_info: dict, servers: Dict, specific_arch: Optional[str]) -> List[str]:
+    """Pick the architectures to build: the requested ones, else PKGBUILD arch=() entries with servers."""
+    requested = parse_arch_list(specific_arch)
+    if requested:
+        return requested
+
+    pkgbuild_archs = pkg_info.get("arch") or ["x86_64"]
+    print_apb_arch_hint_notice(pkg_info)
+    if "any" in pkgbuild_archs:
+        return ["any"]
+
+    architectures = [arch for arch in pkgbuild_archs if arch in servers]
+    if not architectures:
+        print(f"Error: No servers configured for PKGBUILD architectures: {pkgbuild_archs}")
+        print(f"Available server architectures: {list(servers.keys())}")
+    return architectures
+
+
+def _config_server_urls(arch: str, pkg_info: dict, servers: Dict, *, verbose: bool) -> List[str]:
+    """Return the configured servers for arch; arch=(any) uses the apb_arch_hint or first available arch."""
+    if arch == "any":
+        server_arch, error = effective_any_server_arch(pkg_info, servers)
+        if error:
+            print(f"[{arch}] {error}")
+            return []
+        if verbose:
+            print(f"[{arch}] Using {server_arch} servers for 'any' architecture build")
+        return servers[server_arch]
+
+    server_urls = servers.get(arch) or []
+    if not server_urls:
+        print(f"[{arch}] No servers configured for architecture: {arch}")
+    return server_urls
+
+
+def _submit_config_build(
+    arch: str,
+    *,
+    build_path: Path,
+    pkg_info: dict,
+    servers: Dict,
+    output_dir: Path,
+    auth_client: Optional[APBAuthClient],
+    build_timeout: Optional[int],
+    force: bool,
+    verbose: bool,
+) -> ArchSubmission:
+    """Submit one architecture to the first configured server that accepts it."""
+    server_urls = _config_server_urls(arch, pkg_info, servers, verbose=verbose)
+    if not server_urls:
+        return ArchSubmission(arch, BuildStatus.FAILED)
+
+    arch_prefix = _arch_prefix(arch)
+    if _skip_existing_build(
+        output_dir, build_path / "PKGBUILD", arch, force=force, verbose=verbose, arch_prefix=arch_prefix
+    ):
+        return ArchSubmission(arch, STATUS_SKIPPED)
+
+    for server_url in server_urls:
+        if verbose:
+            print(f"{arch_prefix}Submitting build to {server_url}...")
+        response = submit_build(
+            server_url, build_path, auth_client, exclude_paths=[output_dir], build_timeout=build_timeout
+        )
+        if response:
+            print(f"{arch_prefix}Build submitted: {response.build_id}")
+            return ArchSubmission(arch, STATUS_SUBMITTED, response.build_id, server_url)
+
+    print(f"{arch_prefix}Failed to submit build")
+    return ArchSubmission(arch, BuildStatus.FAILED)
 
 
 def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
-                            verbose: bool = False, detach: bool = False,
-                            specific_arch: str = None, force: bool = False, auth_client: Optional[APBAuthClient] = None) -> bool:
+                              verbose: bool = False, detach: bool = False,
+                              specific_arch: Optional[str] = None, force: bool = False,
+                              auth_client: Optional[APBAuthClient] = None,
+                              build_timeout: Optional[int] = None,
+                              download: bool = True) -> bool:
     """
-    Build a package for multiple architectures using available servers.
+    Build a package for multiple architectures using the servers in the configuration.
 
     Args:
         build_path: Path to package directory
@@ -801,11 +674,14 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         config: Configuration dictionary
         verbose: Enable verbose output
         detach: Don't wait for completion
-        specific_arch: Build for specific architecture only
+        specific_arch: Comma-separated architectures to build (default: PKGBUILD arch=())
         force: Force rebuild even if package exists
+        auth_client: Optional authentication client
+        build_timeout: Optional build timeout in seconds
+        download: Download build results into output_dir/<arch>
 
     Returns:
-        True if all builds were successful
+        True if all builds were submitted (detach) or completed successfully
     """
     pkgbuild_path = build_path / "PKGBUILD"
     if not pkgbuild_path.exists():
@@ -813,215 +689,67 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         return False
 
     servers = config.get("servers", {})
+    pkg_info = parse_pkgbuild_info(pkgbuild_path)
+    architectures = _resolve_config_architectures(pkg_info, servers, specific_arch)
+    if not architectures:
+        return False
 
-    # Use architectures from PKGBUILD if no specific architecture is requested
-    if specific_arch:
-        architectures = [specific_arch]
-    else:
-        # Parse PKGBUILD to get target architectures
-        pkg_info = parse_pkgbuild_info(pkgbuild_path)
-        pkgbuild_archs = pkg_info.get("arch", ["x86_64"])
-        print_apb_arch_hint_notice(pkg_info)
-
-        # Filter to only include architectures we have servers for
-        # Special case: "any" architecture can be built on any available server
-        if "any" in pkgbuild_archs:
-            # For "any" architecture, we can use any available server
-            architectures = ["any"]
-        else:
-            # For specific architectures, only use those we have servers for
-            architectures = [arch for arch in pkgbuild_archs if arch in servers]
-
-        if not architectures:
-            print(f"Error: No servers configured for PKGBUILD architectures: {pkgbuild_archs}")
-            print(f"Available server architectures: {list(servers.keys())}")
-            return False
-
-    # Show which architectures will be built
     print(f"Building for architectures: {', '.join(architectures)}")
+    submissions = [
+        _submit_config_build(
+            arch,
+            build_path=build_path,
+            pkg_info=pkg_info,
+            servers=servers,
+            output_dir=output_dir,
+            auth_client=auth_client,
+            build_timeout=build_timeout,
+            force=force,
+            verbose=verbose,
+        )
+        for arch in architectures
+    ]
 
-    build_results = []
-    arch_build_info = {}  # Track build info for each architecture
-
-    # Submit builds for all architectures
-    for arch in architectures:
-        # Special handling for "any" architecture
-        if arch == "any":
-            pkg_info = parse_pkgbuild_info(pkgbuild_path)
-            server_arch, error = effective_any_server_arch(pkg_info, servers)
-            if error:
-                print(f"[{arch}] {error}")
-                continue
-            server_urls = servers[server_arch]
-            if verbose:
-                print(f"[{arch}] Using {server_arch} servers for 'any' architecture build")
-        else:
-            if arch not in servers:
-                print(f"[{arch}] No servers configured for architecture: {arch}")
-                continue
-
-            server_urls = servers[arch]
-            if not server_urls:
-                print(f"[{arch}] No servers available for architecture: {arch}")
-                continue
-
-        # Check if package already exists (unless force is specified)
-        should_skip, reason = should_skip_build(output_dir, pkgbuild_path, arch, force)
-        if should_skip:
-            print(f"[{arch}] Skipping build: {reason}")
-            if not force:
-                print(f"[{arch}] Use --force to rebuild existing packages")
-            arch_build_info[arch] = {
-                'build_id': None,
-                'server_url': None,
-                'status': 'skipped'
-            }
-            continue
-
-        if verbose and not force:
-            print(f"[{arch}] {reason}")
-
-        # Try each server for this architecture
-        build_successful = False
-        for server_url in server_urls:
-            try:
-                if verbose:
-                    print(f"[{arch}] Submitting build to {server_url}...")
-
-                build_id = submit_build(
-                    server_url, build_path, auth_client, exclude_paths=[output_dir]
-                )
-                if build_id:
-                    print(f"[{arch}] Build submitted: {build_id}")
-                    arch_build_info[arch] = {
-                        'build_id': build_id,
-                        'server_url': server_url,
-                        'status': 'submitted'
-                    }
-                    build_successful = True
-                    break
-
-            except Exception as e:
-                if verbose:
-                    print(f"[{arch}] Error with server {server_url}: {e}")
-                continue
-
-        if not build_successful:
-            print(f"[{arch}] Failed to submit build")
-            arch_build_info[arch] = {
-                'build_id': None,
-                'server_url': None,
-                'status': 'failed'
-            }
-
-    # Show summary of submitted builds
     print("\n=== Build Summary ===")
-    for arch, info in arch_build_info.items():
-        if info['build_id']:
-            print(f"[{arch}] Build ID: {info['build_id']}")
+    for submission in submissions:
+        if submission.build_id:
+            print(f"[{submission.arch}] Build ID: {submission.build_id}")
+        elif submission.status == STATUS_SKIPPED:
+            print(f"[{submission.arch}] Skipped")
         else:
-            print(f"[{arch}] Build submission failed")
+            print(f"[{submission.arch}] Build submission failed")
     print("====================\n")
 
     if detach:
         print("Builds submitted. Exiting without waiting for completion.")
-        return True
+        return all(submission.status != BuildStatus.FAILED for submission in submissions)
 
-    # Monitor all builds
-    builds_to_monitor = {arch: info for arch, info in arch_build_info.items()
-                        if info['build_id'] and info['status'] != 'skipped'}
-
-    if builds_to_monitor:
+    targets = [
+        MonitorTarget(
+            submission.build_id,
+            APBotClient(submission.server_url, auth_client),
+            output_dir / submission.arch if download else None,
+            submission.arch,
+        )
+        for submission in submissions
+        if submission.build_id
+    ]
+    if targets:
         print("Monitoring build progress...")
-    cancelled_by_user = False
+    results = monitor_builds(targets, verbose=verbose)
 
-    for arch, info in arch_build_info.items():
-        if not info['build_id']:
-            if info['status'] == 'skipped':
-                build_results.append(True)  # Treat skipped as successful
-            else:
-                build_results.append(False)
-            continue
-
-        try:
-            client = APBotClient(info['server_url'], auth_client)
-            # For "any" architecture, download to "any" subdirectory
-            if arch == "any":
-                arch_output_dir = output_dir / "any"
-            else:
-                arch_output_dir = output_dir / arch
-
-            print(f"\n--- Starting monitoring for {arch} ---")
-            success = monitor_build(
-                info['build_id'],
-                client,
-                arch_output_dir,
-                verbose,
-                arch=arch
-            )
-            print(f"--- Finished monitoring for {arch}: {'SUCCESS' if success else 'FAILED'} ---\n")
-
-            build_results.append(success)
-            arch_build_info[arch]['status'] = 'completed' if success else 'failed'
-
-        except KeyboardInterrupt:
-            print(f"\n--- Build monitoring interrupted for {arch} ---")
-            cancelled_by_user = True
-            build_results.append(False)
-            arch_build_info[arch]['status'] = 'cancelled'
-
-            # Cancel all remaining builds
-            print("\nCancelling all remaining builds...")
-            for remaining_arch, remaining_info in arch_build_info.items():
-                if remaining_info['build_id'] and remaining_info.get('status') not in ['completed', 'failed', 'cancelled']:
-                    try:
-                        remaining_client = APBotClient(remaining_info['server_url'], auth_client)
-                        if remaining_client.cancel_build(remaining_info['build_id']):
-                            print(f"[{remaining_arch}] Build cancelled successfully")
-                            arch_build_info[remaining_arch]['status'] = 'cancelled'
-                        else:
-                            print(f"[{remaining_arch}] Failed to cancel build")
-                    except Exception as cancel_error:
-                        print(f"[{remaining_arch}] Error cancelling build: {cancel_error}")
-            break
-
-        except Exception as e:
-            print(f"[{arch}] Error monitoring build: {e}")
-            build_results.append(False)
-            arch_build_info[arch]['status'] = 'failed'
-
-    # Show final summary
-    print("\n=== Final Results ===")
-    for arch, info in arch_build_info.items():
-        status_display = info['status'].upper()
-        if info['build_id']:
-            print(f"[{arch}] {status_display} (Build ID: {info['build_id']})")
-        else:
-            print(f"[{arch}] {status_display}")
-    print("====================")
-
-    successful_builds = sum(1 for result in build_results if result)
-    total_builds = len(build_results)
-    skipped_builds = sum(1 for info in arch_build_info.values() if info.get('status') == 'skipped')
-    cancelled_builds = sum(1 for info in arch_build_info.values() if info.get('status') == 'cancelled')
-
-    if skipped_builds > 0:
-        if cancelled_by_user:
-            print(f"Overall result: {successful_builds}/{total_builds} builds successful ({skipped_builds} skipped, {cancelled_builds} cancelled by user)")
-        else:
-            print(f"Overall result: {successful_builds}/{total_builds} builds successful ({skipped_builds} skipped)")
-    else:
-        if cancelled_by_user:
-            print(f"Overall result: {successful_builds}/{total_builds} builds successful ({cancelled_builds} cancelled by user)")
-        else:
-            print(f"Overall result: {successful_builds}/{total_builds} builds successful")
-
-    return all(build_results)
+    rows = [
+        (submission.arch, submission.build_id, *results[submission.build_id])
+        if submission.build_id
+        else (submission.arch, None, submission.status, submission.status == STATUS_SKIPPED)
+        for submission in submissions
+    ]
+    _print_final_results(rows)
+    return all(row[3] for row in rows)
 
 
-
-def main():
-    """Main command-line interface."""
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse the apb command line."""
     parser = argparse.ArgumentParser(description="APB Client - Build packages using APB servers")
 
     # Basic options
@@ -1053,11 +781,11 @@ def main():
     parser.add_argument("--force", action="store_true",
                        help="Force rebuild even if package exists")
     parser.add_argument("--build-timeout", type=int,
-                       help="Build timeout in seconds (300-14400, admin only)")
+                       help=f"Build timeout in seconds ({BUILD_TIMEOUT_MIN}-{BUILD_TIMEOUT_MAX}, admin only)")
 
     # Monitoring options
     parser.add_argument("--monitor", type=str, help="Monitor existing build")
-    parser.add_argument("--download", nargs="?", const="__PKGBUILD__", metavar="BUILD_ID_OR_PATH",
+    parser.add_argument("--download", nargs="?", const=PKGBUILD_DOWNLOAD, metavar="BUILD_ID_OR_PATH",
                        help="Download build results by build ID, or latest builds from PKGBUILD (with --farm)")
     parser.add_argument("--status", type=str, help="Check build status")
     parser.add_argument("--cancel", type=str, help="Cancel running build")
@@ -1068,460 +796,369 @@ def main():
     parser.add_argument("--cleanup", action="store_true", help="Trigger in-memory build data cleanup on the server")
     parser.add_argument("--test-arch", action="store_true", help="Test architecture compatibility")
 
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
-    # Load configuration
+
+class CliContext(NamedTuple):
+    """Parsed arguments plus the connection they resolve to."""
+
+    args: argparse.Namespace
+    config: Dict
+    server_url: str
+    auth_client: Optional[APBAuthClient]
+    client: APBotClient
+
+    @property
+    def fallback_arch(self) -> Optional[str]:
+        requested = parse_arch_list(self.args.arch)
+        return requested[0] if requested else self.config.get("default_arch")
+
+
+def resolve_context(args: argparse.Namespace) -> CliContext:
+    """Load the configuration and pick the server or farm to talk to.
+
+    Auth commands fall back to the configured farm_url when neither --server nor --farm points at a farm.
+    """
     config = load_config(args.config)
+    farm_url = config.get("farm_url")
 
-    # Determine server URL
     if args.server:
         server_url = args.server
     elif args.farm:
-        server_url = config.get("farm_url", "http://localhost:8080")
+        server_url = farm_url or DEFAULT_FARM_URL
     else:
-        server_url = config.get("default_server", "http://localhost:8000")
+        server_url = config.get("default_server", DEFAULT_SERVER_URL)
 
-    # Setup authentication for farm connections
-    auth_client = None
-    if args.farm or server_url == config.get("farm_url"):
-        auth_client = APBAuthClient(server_url)
-    elif any([args.login, args.logout, args.auth_status]) and config.get("farm_url"):
-        # For auth operations, automatically use farm_url from config even if --farm wasn't specified
-        farm_url = config.get("farm_url")
-        auth_client = APBAuthClient(farm_url)
-        # Update server_url to match for consistency in auth operations
+    is_farm = args.farm or server_url == farm_url
+    is_auth_command = args.login or args.logout or args.auth_status
+    if not is_farm and is_auth_command and farm_url:
         server_url = farm_url
+        is_farm = True
 
-    # Handle authentication operations
-    if args.login:
-        if not auth_client:
-            print("Error: Login is only supported for farm connections.")
-            print("Either use --farm flag or configure farm_url in your apb.json file.")
-            sys.exit(1)
-
-        username = args.username or input("Username: ")
-        password = getpass.getpass("Password: ")
-
-        if auth_client.login(username, password):
-            print("Login successful!")
-            # Show user info
-            user_info = auth_client.get_user_info()
-            if user_info:
-                print(f"Logged in as: {user_info['username']} ({user_info['role']})")
-        else:
-            print("Login failed!")
-            sys.exit(1)
-        sys.exit(0)
-
-    if args.logout:
-        if not auth_client:
-            print("Error: Logout is only supported for farm connections.")
-            print("Either use --farm flag or configure farm_url in your apb.json file.")
-            sys.exit(1)
-
-        if auth_client.logout():
-            print("Logout successful!")
-        else:
-            print("Logout failed!")
-        sys.exit(0)
-
-    if args.auth_status:
-        if not auth_client:
-            print("Authentication is only supported for farm connections.")
-            print("Either use --farm flag or configure farm_url in your apb.json file.")
-            sys.exit(0)
-
-        if auth_client.is_authenticated():
-            user_info = auth_client.get_user_info()
-            if user_info:
-                print(f"Authenticated as: {user_info['username']} ({user_info['role']})")
-                print(f"Farm URL: {server_url}")
-            else:
-                print("Authentication token is invalid")
-        else:
-            print("Not authenticated")
-            print(f"Farm URL: {server_url}")
-            print("Use --login to authenticate")
-        sys.exit(0)
-
-    client = APBotClient(server_url, auth_client)
-
-    # Handle monitoring operations
-    if args.monitor:
-        # Create architecture-specific output directory if downloads are enabled
-        output_dir = None
-        if not args.no_download:
-            # Try to get architecture from build status or use command line arg or default
-            try:
-                status = client.get_build_status(args.monitor)
-                status_arch = status.get('server_arch') or status.get('arch')
-                if isinstance(status_arch, list):
-                    status_arch = status_arch[0] if status_arch else None
-                build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch", "powerpc64le")
-            except:
-                build_arch = (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch", "powerpc64le")
-            output_dir = args.output_dir / build_arch
-
-        try:
-            success = monitor_build(args.monitor, client, output_dir,
-                                  args.verbose, allow_toggle=True)
-            sys.exit(0 if success else 1)
-        except KeyboardInterrupt:
-            print("\nBuild monitoring interrupted by user")
-            sys.exit(1)
-
-    if args.download is not None:
-        download_target = args.download
-        is_pkgbuild_download = (
-            download_target == "__PKGBUILD__"
-            or (download_target and not _is_build_id(download_target))
-        )
-
-        if is_pkgbuild_download:
-            if not args.farm and server_url != config.get("farm_url"):
-                print("Error: PKGBUILD-based download requires --farm (or farm_url as the active server)")
-                sys.exit(1)
-
-            try:
-                if download_target == "__PKGBUILD__":
-                    pkgbuild_dir = _resolve_pkgbuild_dir(args.pkgbuild_path)
-                else:
-                    pkgbuild_dir = _resolve_pkgbuild_dir(Path(download_target))
-            except ValueError as exc:
-                print(f"Error: {exc}")
-                sys.exit(1)
-
-            arch_filter = [a.strip() for a in args.arch.split(",") if a.strip()] if args.arch else None
-            try:
-                success = download_latest_from_pkgbuild(
-                    client, pkgbuild_dir, args.output_dir, arch_filter=arch_filter
-                )
-                sys.exit(0 if success else 1)
-            except httpx.HTTPError as e:
-                print(f"Error: {e}")
-                sys.exit(1)
-
-        try:
-            status = client.get_build_status(download_target)
-
-            # Determine architecture for output directory
-            status_arch = status.get('server_arch') or status.get('arch')
-            if isinstance(status_arch, list):
-                status_arch = status_arch[0] if status_arch else None
-
-            build_arch = status_arch or (args.arch.split(',')[0] if args.arch else None) or config.get("default_arch")
-            arch_output_dir = args.output_dir / build_arch
-
-            if not _download_build_artifacts(client, download_target, arch_output_dir):
-                sys.exit(1)
-
-            sys.exit(0)
-        except httpx.HTTPError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    if args.status:
-        try:
-            status = client.get_build_status(args.status)
-            print(f"Build ID: {status['build_id']}")
-            print(f"Package: {status.get('pkgname', 'unknown')}")
-            print(f"Status: {status['status']}")
-            if 'duration' in status:
-                print(f"Duration: {status['duration']:.1f}s")
-            sys.exit(0)
-        except httpx.HTTPError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    if args.cancel:
-        if client.cancel_build(args.cancel):
-            print("Build cancelled successfully")
-            sys.exit(0)
-        else:
-            print("Failed to cancel build")
-            sys.exit(1)
-
-    if args.list_servers:
-        if args.server or args.farm:
-            print(f"Testing server: {server_url}")
-            try:
-                # Try to get server info
-                response = client.session.get(urljoin(server_url, '/farm'))
-                if response.status_code == 200:
-                    farm_info = response.json()
-                    print(f"  Status: {farm_info.get('status', 'unknown')}")
-                    print(f"  Version: {farm_info.get('version', 'unknown')}")
-                    if 'servers' in farm_info:
-                        print(f"  Managed servers: {len(farm_info['servers'])}")
-                        for server in farm_info['servers']:
-                            print(f"    {server.get('arch', 'unknown')}: {server.get('status', 'unknown')}")
-                else:
-                    # Try direct server endpoint
-                    response = client.session.get(urljoin(server_url, '/'))
-                    if response.status_code == 200:
-                        print(f"  Status: Server accessible (HTTP {response.status_code})")
-                    else:
-                        print(f"  Status: Server returned HTTP {response.status_code}")
-            except Exception as e:
-                print(f"  Status: Error - {e}")
-        else:
-            print("Configured servers:")
-            for arch, servers in config.get("servers", {}).items():
-                print(f"  {arch}:")
-                for server in servers:
-                    print(f"    {server}")
-        sys.exit(0)
-
-    if args.cleanup:
-        if client.cleanup_server():
-            print("In-memory build data cleanup triggered")
-            sys.exit(0)
-        else:
-            print("Failed to trigger cleanup")
-            sys.exit(1)
-
-    # Handle build submission
-    if not args.pkgbuild_path:
-        # Try to find PKGBUILD in current directory
-        current_pkgbuild = Path("./PKGBUILD")
-        if current_pkgbuild.exists():
-            args.pkgbuild_path = Path(".")
-        else:
-            print("Error: No PKGBUILD path provided and none found in current directory")
-            sys.exit(1)
-
-    build_path = args.pkgbuild_path
-    if build_path.is_file():
-        build_path = build_path.parent
-
-    # If --server or --farm is specified, use that server directly
-    if args.server or args.farm:
-        pkgbuild_path = build_path / "PKGBUILD"
-        if not pkgbuild_path.exists():
-            print(f"Error: PKGBUILD not found in {build_path}")
-            sys.exit(1)
+    auth_client = APBAuthClient(server_url) if is_farm else None
+    return CliContext(args, config, server_url, auth_client, APBotClient(server_url, auth_client))
 
 
+def _print_farm_only(message: str) -> None:
+    print(message)
+    print("Either use --farm flag or configure farm_url in your apb.json file.")
 
-        # For farm submissions, check which architectures need building
-        if args.farm:
-            arch_filter = [a.strip() for a in args.arch.split(",") if a.strip()] if args.arch else None
-            if arch_filter:
-                pkg_info = parse_pkgbuild_info(pkgbuild_path)
-                pkgbuild_archs = pkg_info.get("arch") or []
-                _selected, missing_archs = select_pkgbuild_architectures(pkgbuild_archs, arch_filter)
-                if missing_archs:
-                    print(
-                        "Warning: architectures not in PKGBUILD arch=(): "
-                        f"{', '.join(missing_archs)}"
-                    )
-                if not _selected:
-                    print("Error: No matching architectures between --arch and PKGBUILD arch=()")
-                    sys.exit(1)
 
-            architectures_needing_build = get_architectures_needing_build(
-                pkgbuild_path, args.output_dir, args.force, arch_filter=arch_filter
-            )
+def _print_user(prefix: str, user_info: Dict) -> None:
+    print(f"{prefix}: {user_info['username']} ({user_info['role']})")
 
-            if not architectures_needing_build:
-                print("All packages already exist in output directory")
-                if not args.force:
-                    print("Use --force to rebuild existing packages")
-                sys.exit(0)
 
-            print_apb_arch_hint_notice(parse_pkgbuild_info(pkgbuild_path))
+def run_login(ctx: CliContext) -> int:
+    if not ctx.auth_client:
+        _print_farm_only("Error: Login is only supported for farm connections.")
+        return 1
 
-            # Show which architectures need building
-            if args.verbose:
-                pkg_info = parse_pkgbuild_info(pkgbuild_path)
-                all_archs = pkg_info.get("arch", ["x86_64"])
-                skipped_archs = [arch for arch in all_archs if arch not in architectures_needing_build]
+    username = ctx.args.username or input("Username: ")
+    password = getpass.getpass("Password: ")
+    if not ctx.auth_client.login(username, password):
+        print("Login failed!")
+        return 1
 
-                if skipped_archs:
-                    print(f"Skipping existing packages for architectures: {', '.join(skipped_archs)}")
-                print(f"Building for architectures: {', '.join(architectures_needing_build)}")
-        else:
-            # For direct server submissions, use original logic
-            target_arch = args.arch if args.arch and ',' not in args.arch else None
-            if not target_arch:
-                target_arch = config.get("default_arch")
+    print("Login successful!")
+    user_info = ctx.auth_client.get_user_info()
+    if user_info:
+        _print_user("Logged in as", user_info)
+    return 0
 
-            # Check if package already exists (unless force is specified)
-            should_skip, reason = should_skip_build(args.output_dir, pkgbuild_path, target_arch, args.force)
-            if should_skip:
-                print(f"Skipping build: {reason}")
-                if not args.force:
-                    print("Use --force to rebuild existing packages")
-                sys.exit(0)
 
-            if args.verbose and not args.force:
-                print(reason)
+def run_logout(ctx: CliContext) -> int:
+    if not ctx.auth_client:
+        _print_farm_only("Error: Logout is only supported for farm connections.")
+        return 1
 
-        try:
-            if args.verbose:
-                print(f"Submitting build to {server_url}...")
-                if not args.farm and target_arch:
-                    print(f"Target architecture: {target_arch}")
+    print("Logout successful!" if ctx.auth_client.logout() else "Logout failed!")
+    return 0
 
-            if args.farm:
-                # Handle farm submission with multiple architectures
-                response = submit_build_to_farm(
-                    server_url,
-                    build_path,
-                    architectures_needing_build,
-                    auth_client,
-                    args.build_timeout,
-                    exclude_paths=[args.output_dir],
-                )
-                if response:
-                    if 'builds' in response and response['builds']:
-                        # Multi-architecture farm response
-                        builds = response['builds']
 
-                        if builds:
-                            print(f"Monitoring {len(builds)} build(s): {response['message']}")
-                            _print_submitted_build_queue_info(
-                                builds,
-                                response.get("queue_status"),
-                            )
-                        else:
-                            print("No builds to monitor (all packages already exist)")
-                            sys.exit(0)
+def run_auth_status(ctx: CliContext) -> int:
+    if not ctx.auth_client:
+        _print_farm_only("Authentication is only supported for farm connections.")
+        return 0
 
-                        if not args.detach and builds:
-                            # Give the farm a moment to process the builds
-                            time.sleep(0.5)
+    if not ctx.auth_client.is_authenticated():
+        print("Not authenticated")
+        print(f"Farm URL: {ctx.server_url}")
+        print("Use --login to authenticate")
+        return 0
 
-                            # Create base output directory if downloads are enabled
-                            output_dir = None
-                            if not args.no_download:
-                                output_dir = args.output_dir
+    user_info = ctx.auth_client.get_user_info()
+    if not user_info:
+        print("Authentication token is invalid")
+        return 0
+    _print_user("Authenticated as", user_info)
+    print(f"Farm URL: {ctx.server_url}")
+    return 0
 
-                            try:
-                                success = monitor_farm_builds(builds, client, output_dir, args.verbose, pkgbuild_path, auth_client)
-                                sys.exit(0 if success else 1)
-                            except KeyboardInterrupt:
-                                print("\nBuilds interrupted by user")
-                                sys.exit(1)
-                        else:
-                            # Show submitted builds and exit
-                            for build in builds:
-                                print(f"[{build['arch']}] Build ID: {build['build_id']}")
-                            sys.exit(0)
-                    elif 'error' in response:
-                        print(f"Error: {response['message']}")
-                        if 'available_architectures' in response:
-                            print(f"Available architectures: {', '.join(response['available_architectures'])}")
-                        if 'target_architectures' in response:
-                            print(f"Requested architectures: {', '.join(response['target_architectures'])}")
-                        if 'pkgbuild_architectures' in response:
-                            print(f"PKGBUILD architectures: {', '.join(response['pkgbuild_architectures'])}")
-                        sys.exit(1)
-                    else:
-                        # Single build or legacy response
-                        build_id = response.get('build_id')
-                        if build_id:
-                            print(f"Build submitted: {build_id}")
 
-                            if not args.detach:
-                                # Give the farm a moment to process the build
-                                time.sleep(0.5)
-
-                                # Create architecture-specific output directory if downloads are enabled
-                                output_dir = None
-                                if not args.no_download:
-                                    # Determine architecture for output directory (use first needed architecture)
-                                    build_arch = architectures_needing_build[0] if architectures_needing_build else config.get("default_arch")
-                                    output_dir = args.output_dir / build_arch
-
-                                try:
-                                    # Use first needed architecture for display
-                                    display_arch = architectures_needing_build[0] if architectures_needing_build else None
-                                    success = monitor_build(build_id, client, output_dir,
-                                                          args.verbose, allow_toggle=True, arch=display_arch)
-                                    sys.exit(0 if success else 1)
-                                except KeyboardInterrupt:
-                                    print("\nBuild interrupted by user")
-                                    sys.exit(1)
-                            else:
-                                print(f"Build submitted: {build_id}")
-                                sys.exit(0)
-                        else:
-                            print("Failed to submit build")
-                            sys.exit(1)
-                else:
-                    print("Failed to submit build")
-                    sys.exit(1)
-            else:
-                # Handle direct server submission (single architecture)
-                build_id = submit_build(
-                    server_url, build_path, auth_client, exclude_paths=[args.output_dir]
-                )
-                if build_id:
-                    print(f"Build submitted: {build_id}")
-
-                    if not args.detach:
-                        # Give the farm a moment to process the build
-                        time.sleep(0.5)
-
-                        # Create architecture-specific output directory if downloads are enabled
-                        output_dir = None
-                        if not args.no_download:
-                            # Determine architecture for output directory
-                            build_arch = target_arch or config.get("default_arch")
-                            output_dir = args.output_dir / build_arch
-
-                        try:
-                            success = monitor_build(build_id, client, output_dir,
-                                                  args.verbose, allow_toggle=True, arch=target_arch)
-                            sys.exit(0 if success else 1)
-                        except KeyboardInterrupt:
-                            print("\nBuild interrupted by user")
-                            sys.exit(1)
-                    else:
-                        print(f"Build submitted: {build_id}")
-                        sys.exit(0)
-                else:
-                    print("Failed to submit build")
-                    sys.exit(1)
-        except Exception as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-
-    # Build for multiple architectures or specific architecture using config
+def _build_output_dir(ctx: CliContext, build_id: str) -> Path:
+    """Output directory for a build: output_dir/<arch> when the build's architecture is known."""
     try:
-        if args.arch:
-            architectures = [arch.strip() for arch in args.arch.split(",")]
-            if len(architectures) == 1:
-                # Single architecture build
-                success = build_for_multiple_arches(
-                    build_path, args.output_dir, config,
-                    args.verbose, args.detach, architectures[0], args.force, auth_client
-                )
-            else:
-                # Multiple architectures - build sequentially
-                success = True
-                for arch in architectures:
-                    print(f"\n{'='*50}")
-                    print(f"Building for architecture: {arch}")
-                    print(f"{'='*50}")
-                    arch_success = build_for_multiple_arches(
-                        build_path, args.output_dir, config,
-                        args.verbose, args.detach, arch, args.force, auth_client
-                    )
-                    success = success and arch_success
-                    if not arch_success:
-                        print(f"Build failed for architecture: {arch}")
+        status = ctx.client.get_build_status(build_id)
+    except httpx.HTTPError:
+        status = None
+    return _arch_output_dir(ctx.args.output_dir, _status_output_arch(status, ctx.fallback_arch))
+
+
+def run_monitor(ctx: CliContext) -> int:
+    build_id = ctx.args.monitor
+    output_dir = None if ctx.args.no_download else _build_output_dir(ctx, build_id)
+    return 0 if monitor_build(build_id, ctx.client, output_dir, ctx.args.verbose) else 1
+
+
+def _run_pkgbuild_download(ctx: CliContext) -> int:
+    if not ctx.auth_client:
+        print("Error: PKGBUILD-based download requires --farm (or farm_url as the active server)")
+        return 1
+
+    target = ctx.args.download
+    try:
+        pkgbuild_dir = _resolve_pkgbuild_dir(ctx.args.pkgbuild_path if target == PKGBUILD_DOWNLOAD else Path(target))
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    try:
+        is_successful = download_latest_from_pkgbuild(
+            ctx.client, pkgbuild_dir, ctx.args.output_dir, arch_filter=parse_arch_list(ctx.args.arch) or None
+        )
+    except httpx.HTTPError as exc:
+        print(f"Error: {exc}")
+        return 1
+    return 0 if is_successful else 1
+
+
+def run_download(ctx: CliContext) -> int:
+    target = ctx.args.download
+    if target == PKGBUILD_DOWNLOAD or (target and not _is_build_id(target)):
+        return _run_pkgbuild_download(ctx)
+
+    try:
+        is_downloaded = _download_build_artifacts(ctx.client, target, _build_output_dir(ctx, target))
+    except httpx.HTTPError as exc:
+        print(f"Error: {exc}")
+        return 1
+    return 0 if is_downloaded else 1
+
+
+def run_status(ctx: CliContext) -> int:
+    try:
+        status = ctx.client.get_build_status(ctx.args.status)
+    except httpx.HTTPError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    print(f"Build ID: {status.build_id}")
+    print(f"Package: {status.pkgname}")
+    print(f"Status: {status.status}")
+    if status.duration is not None:
+        print(f"Duration: {status.duration:.1f}s")
+    return 0
+
+
+def run_cancel(ctx: CliContext) -> int:
+    if ctx.client.cancel_build(ctx.args.cancel):
+        print("Build cancelled successfully")
+        return 0
+    print("Failed to cancel build")
+    return 1
+
+
+def _print_server_reachability(ctx: CliContext) -> None:
+    print(f"Testing server: {ctx.server_url}")
+    try:
+        response = ctx.client.session.get(upstream_url(ctx.server_url, "/farm"))
+        if response.status_code == 200:
+            farm_info = response.json()
+            print(f"  Status: {farm_info.get('status', 'unknown')}")
+            print(f"  Version: {farm_info.get('version', 'unknown')}")
+            if "servers" in farm_info:
+                print(f"  Managed servers: {len(farm_info['servers'])}")
+                for server in farm_info["servers"]:
+                    print(f"    {server.get('arch', 'unknown')}: {server.get('status', 'unknown')}")
+            return
+
+        response = ctx.client.session.get(upstream_url(ctx.server_url, "/"))
+        if response.status_code == 200:
+            print(f"  Status: Server accessible (HTTP {response.status_code})")
         else:
-            success = build_for_multiple_arches(
-                build_path, args.output_dir, config,
-                args.verbose, args.detach, None, args.force, auth_client
-            )
+            print(f"  Status: Server returned HTTP {response.status_code}")
+    except (httpx.HTTPError, ValueError) as exc:
+        print(f"  Status: Error - {exc}")
+
+
+def run_list_servers(ctx: CliContext) -> int:
+    if ctx.args.server or ctx.args.farm:
+        _print_server_reachability(ctx)
+        return 0
+
+    print("Configured servers:")
+    for arch, servers in ctx.config.get("servers", {}).items():
+        print(f"  {arch}:")
+        for server in servers:
+            print(f"    {server}")
+    return 0
+
+
+def run_cleanup(ctx: CliContext) -> int:
+    if ctx.client.cleanup_server():
+        print("In-memory build data cleanup triggered")
+        return 0
+    print("Failed to trigger cleanup")
+    return 1
+
+def _submit_and_monitor(
+    ctx: CliContext,
+    build_path: Path,
+    *,
+    arch: str,
+    architectures: Optional[List[str]] = None,
+    is_any_package: bool = False,
+) -> int:
+    """Submit build_path to the active server or farm, then monitor and download unless detached."""
+    args = ctx.args
+    if args.verbose:
+        print(f"Submitting build to {ctx.server_url}...")
+
+    response = submit_build(
+        ctx.server_url,
+        build_path,
+        ctx.auth_client,
+        exclude_paths=[args.output_dir],
+        architectures=architectures,
+        build_timeout=args.build_timeout,
+    )
+    if not response:
+        print("Failed to submit build")
+        return 1
+
+    is_successful = _monitor_submission(
+        response,
+        ctx.client,
+        output_dir=None if args.no_download else args.output_dir,
+        arch=arch,
+        is_any_package=is_any_package,
+        verbose=args.verbose,
+        detach=args.detach,
+    )
+    return 0 if is_successful else 1
+
+
+def run_farm_build(ctx: CliContext, build_path: Path) -> int:
+    """Queue the PKGBUILD architectures that are missing from output_dir on the farm."""
+    args = ctx.args
+    pkgbuild_path = build_path / "PKGBUILD"
+    pkg_info = parse_pkgbuild_info(pkgbuild_path)
+    pkgbuild_archs = pkg_info.get("arch") or []
+    arch_filter = parse_arch_list(args.arch) or None
+    if arch_filter and not _select_requested_archs(pkgbuild_archs, arch_filter):
+        return 1
+
+    architectures = get_architectures_needing_build(pkgbuild_path, args.output_dir, args.force, arch_filter=arch_filter)
+    if not architectures:
+        print("All packages already exist in output directory")
+        if not args.force:
+            print("Use --force to rebuild existing packages")
+        return 0
+
+    print_apb_arch_hint_notice(pkg_info)
+    if args.verbose:
+        skipped_archs = [arch for arch in pkgbuild_archs or ["x86_64"] if arch not in architectures]
+        if skipped_archs:
+            print(f"Skipping existing packages for architectures: {', '.join(skipped_archs)}")
+        print(f"Building for architectures: {', '.join(architectures)}")
+
+    return _submit_and_monitor(
+        ctx,
+        build_path,
+        arch=architectures[0],
+        architectures=architectures,
+        is_any_package="any" in pkgbuild_archs,
+    )
+
+
+def run_direct_build(ctx: CliContext, build_path: Path) -> int:
+    """Build a single architecture on the --server given on the command line."""
+    args = ctx.args
+    requested = parse_arch_list(args.arch)
+    target_arch = requested[0] if len(requested) == 1 else ctx.config.get("default_arch")
+    if not target_arch:
+        print("Error: direct server builds need --arch or default_arch in the configuration")
+        return 1
+
+    if _skip_existing_build(
+        args.output_dir, build_path / "PKGBUILD", target_arch, force=args.force, verbose=args.verbose
+    ):
+        return 0
+
+    if args.verbose:
+        print(f"Target architecture: {target_arch}")
+    return _submit_and_monitor(ctx, build_path, arch=target_arch)
+
+
+def run_config_build(ctx: CliContext, build_path: Path) -> int:
+    """Build on the per-architecture servers from the configuration."""
+    args = ctx.args
+    try:
+        is_successful = build_for_multiple_arches(
+            build_path,
+            args.output_dir,
+            ctx.config,
+            verbose=args.verbose,
+            detach=args.detach,
+            specific_arch=args.arch,
+            force=args.force,
+            auth_client=ctx.auth_client,
+            build_timeout=args.build_timeout,
+            download=not args.no_download,
+        )
     except KeyboardInterrupt:
         print("\nBuilds interrupted by user")
-        sys.exit(1)
+        return 1
+    return 0 if is_successful else 1
 
-    sys.exit(0 if success else 1)
+
+def run_build(ctx: CliContext) -> int:
+    try:
+        build_path = _resolve_pkgbuild_dir(ctx.args.pkgbuild_path)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    if ctx.args.farm:
+        return run_farm_build(ctx, build_path)
+    if ctx.args.server:
+        return run_direct_build(ctx, build_path)
+    return run_config_build(ctx, build_path)
+
+
+def run(ctx: CliContext) -> int:
+    """Run the command selected by the arguments and return the process exit code."""
+    args = ctx.args
+    commands = (
+        (args.login, run_login),
+        (args.logout, run_logout),
+        (args.auth_status, run_auth_status),
+        (args.monitor, run_monitor),
+        (args.download is not None, run_download),
+        (args.status, run_status),
+        (args.cancel, run_cancel),
+        (args.list_servers, run_list_servers),
+        (args.cleanup, run_cleanup),
+    )
+    for is_requested, command in commands:
+        if is_requested:
+            return command(ctx)
+    return run_build(ctx)
+
+
+def main() -> None:
+    """Main command-line interface."""
+    sys.exit(run(resolve_context(parse_args())))
 
 
 if __name__ == "__main__":

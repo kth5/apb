@@ -170,12 +170,6 @@ APB requires Python 3.12+ and installs as a Python package with console scripts 
 pip install -e .
 ```
 
-Or install dependencies from `requirements.txt` first:
-
-```bash
-pip install -r requirements.txt && pip install -e .
-```
-
 On Arch Linux, APB can also be built and installed from the included `PKGBUILD` (requires `devtools` and `arch-install-scripts` on build servers).
 
 For development and unit tests:

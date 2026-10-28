@@ -18,7 +18,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 import uuid
@@ -38,6 +37,7 @@ from apb.constants import (
     BuildStatus,
 )
 from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_info_to_dict
+from apb.upstream import build_download_path
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +134,7 @@ def register_build_log_artifact(build_id: str, build_dir: Path) -> Path:
     active_builds[build_id]["logs"] = [{
         "filename": "build.log",
         "size": log_file.stat().st_size,
-        "download_url": f"/build/{build_id}/download/build.log"
+        "download_url": build_download_path(build_id, "build.log")
     }]
     return log_file
 
@@ -1345,7 +1345,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     packages.append({
                         "filename": pkg_file.name,
                         "size": pkg_file.stat().st_size,
-                        "download_url": f"/build/{build_id}/download/{pkg_file.name}"
+                        "download_url": build_download_path(build_id, pkg_file.name)
                     })
 
                 active_builds[build_id]["packages"] = packages

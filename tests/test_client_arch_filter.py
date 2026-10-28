@@ -9,6 +9,7 @@ from apb.client.helpers import (
     get_architectures_needing_build,
     select_pkgbuild_architectures,
 )
+from apb.models import FarmBuildSubmitResponse, QueuedBuildInfo
 
 
 def test_select_pkgbuild_architectures_no_filter():
@@ -107,25 +108,22 @@ def test_farm_submission_passes_arch_filter_to_form_data(tmp_path: Path):
             return None
 
         def json(self):
-            return {"build_id": "test-id", "builds": []}
+            return {"build_id": "test-id", "status": "queued"}
 
-    class FakeSession:
-        def post(self, url, files=None, data=None):
-            captured_form.update(data or {})
-            return FakeResponse()
+    def fake_post(url, files=None, data=None):
+        captured_form.update(data or {})
+        return FakeResponse()
 
-    class FakeClient:
-        session = FakeSession()
+    from apb.client.cli import submit_build
 
-    with patch("apb.client.cli.APBotClient", return_value=FakeClient()):
-        from apb.client.cli import submit_build_to_farm
-
-        submit_build_to_farm(
+    with patch("httpx.Client.post", side_effect=fake_post):
+        response = submit_build(
             "http://farm.example/",
             pkg_dir,
             architectures=["powerpc"],
         )
 
+    assert response.build_id == "test-id"
     assert captured_form.get("architectures") == "powerpc"
 
 
@@ -145,15 +143,30 @@ def test_farm_cli_arch_filter_limits_needing_build(tmp_path: Path, monkeypatch):
 
     submitted_architectures: list = []
 
-    def fake_submit(*args, architectures=None, **_kwargs):
-        archs = architectures if architectures is not None else (args[2] if len(args) > 2 else [])
-        submitted_architectures.extend(archs or [])
-        return {
-            "message": "Queued 1 build(s) for processing",
-            "builds": [{"build_id": "b1", "arch": "powerpc"}],
-        }
+    def fake_submit(*_args, architectures=None, **_kwargs):
+        submitted_architectures.extend(architectures or [])
+        return FarmBuildSubmitResponse(
+            build_id="b1",
+            status="queued",
+            message="Queued 1 build(s) for processing",
+            pkgname="test",
+            target_architectures=["powerpc"],
+            pkgbuild_architectures=["x86_64", "powerpc"],
+            builds=[
+                QueuedBuildInfo(
+                    build_id="b1",
+                    arch="powerpc",
+                    status="queued",
+                    pkgname="test",
+                    submission_group="g1",
+                    created_at=0.0,
+                )
+            ],
+            submission_group="g1",
+            created_at=0.0,
+        )
 
-    monkeypatch.setattr("apb.client.cli.submit_build_to_farm", fake_submit)
+    monkeypatch.setattr("apb.client.cli.submit_build", fake_submit)
     monkeypatch.setattr("apb.client.cli.load_config", lambda _c: {"farm_url": "http://farm/"})
     monkeypatch.setattr(
         "apb.client.cli.sys.argv",

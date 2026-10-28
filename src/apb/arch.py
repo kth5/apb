@@ -3,7 +3,7 @@
 import logging
 import platform
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,11 @@ POWERPC_ARCHES = frozenset({"powerpc", "espresso"})
 
 def package_arch_suffix(arch: str) -> str:
     return ARCH_SUFFIX_MAP.get(arch, arch)
+
+
+KNOWN_PACKAGE_ARCH_SUFFIXES: List[str] = list(dict.fromkeys(
+    [package_arch_suffix(arch) for arch in [*MACHINE_ARCH_MAPPING.values(), *ARCH_SUFFIX_MAP]] + ["any"]
+))
 
 
 def resolve_server_architecture(*, architecture_override: Optional[str] = None) -> str:

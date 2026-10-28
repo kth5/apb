@@ -1,18 +1,19 @@
 """APB farm authentication client."""
 
-import getpass
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
 
-from apb import VERSION
 from apb.http import create_sync_client
+from apb.models import LoginResponse, UserResponse
+from apb.upstream import upstream_url
 
 logger = logging.getLogger(__name__)
+
+AUTH_TIMEOUT = 30.0
 
 class APBAuthClient:
     """Handles authentication for APB client"""
@@ -77,29 +78,29 @@ class APBAuthClient:
         except Exception as e:
             print(f"Warning: Could not clear token: {e}")
 
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        with create_sync_client(timeout=AUTH_TIMEOUT) as client:
+            return client.request(method, upstream_url(self.farm_url, path), **kwargs)
+
     def login(self, username: str, password: str) -> bool:
         """Login with username and password"""
         try:
-            response = httpx.post(
-                f"{self.farm_url}/auth/login",
+            response = self._request(
+                "POST",
+                "/auth/login",
                 json={"username": username, "password": password},
-                timeout=30,
             )
 
             if response.status_code == 200:
-                data = response.json()
-                token = data.get('token')
-                if token:
-                    self._save_token(token)
-                    print(f"Successfully logged in as {username}")
-                    return True
-            else:
-                try:
-                    error_data = response.json()
-                    print(f"Login failed: {error_data.get('detail', 'Unknown error')}")
-                except:
-                    print(f"Login failed: HTTP {response.status_code}")
-                return False
+                login_response = LoginResponse.model_validate(response.json())
+                self._save_token(login_response.token)
+                print(f"Successfully logged in as {login_response.user.username}")
+                return True
+            try:
+                print(f"Login failed: {response.json().get('detail', 'Unknown error')}")
+            except ValueError:
+                print(f"Login failed: HTTP {response.status_code}")
+            return False
 
         except Exception as e:
             print(f"Login error: {e}")
@@ -111,11 +112,7 @@ class APBAuthClient:
             return True
 
         try:
-            response = httpx.post(
-                f"{self.farm_url}/auth/logout",
-                headers={"Authorization": f"Bearer {self._token}"},
-                timeout=30,
-            )
+            response = self._request("POST", "/auth/logout", headers=self.get_auth_headers())
 
             # Clear token regardless of response
             self._clear_token()
@@ -148,14 +145,10 @@ class APBAuthClient:
             return None
 
         try:
-            response = httpx.get(
-                f"{self.farm_url}/auth/me",
-                headers=self.get_auth_headers(),
-                timeout=30,
-            )
+            response = self._request("GET", "/auth/me", headers=self.get_auth_headers())
 
             if response.status_code == 200:
-                return response.json()
+                return UserResponse.model_validate(response.json()).model_dump()
             elif response.status_code == 401:
                 # Token is invalid, clear it
                 self._clear_token()

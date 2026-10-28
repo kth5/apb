@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from apb.client.api import APBotClient
-from apb.client.cli import monitor_build, submit_build_to_farm
+from apb.client.cli import monitor_build, submit_build
 from apb.pkgbuild import parse_pkgbuild_file
 
 
@@ -74,17 +74,16 @@ def test_build_test_package_via_farm(apb_integration) -> None:
     pkgbuild_info = parse_pkgbuild_file(apb_integration.build_path / "PKGBUILD")
     assert pkgbuild_info.pkgname == "apb-test-package"
 
-    response = submit_build_to_farm(
+    response = submit_build(
         apb_integration.farm_url,
         apb_integration.build_path,
-        architectures=["any"],
         auth_client=apb_integration.auth_client,
+        architectures=["any"],
     )
     assert response is not None, "Farm did not accept the build submission"
-    assert "error" not in response, response.get("message", response)
-    assert response.get("build_id"), response
+    assert response.build_id, response
 
-    build_id = response["build_id"]
+    build_id = response.build_id
     client = APBotClient(apb_integration.farm_url, apb_integration.auth_client)
     arch_output_dir = apb_integration.output_dir / "any"
 
@@ -94,7 +93,6 @@ def test_build_test_package_via_farm(apb_integration) -> None:
         output_dir=arch_output_dir,
         verbose=False,
         arch="any",
-        pkgname=pkgbuild_info.pkgname,
     )
     assert success, _format_build_failure(
         build_id,

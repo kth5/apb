@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from apb.arch import package_arch_suffix
+from apb.arch import KNOWN_PACKAGE_ARCH_SUFFIXES, package_arch_suffix
 from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_arch_is_any_only, pkgbuild_info_to_dict
 
 logger = logging.getLogger(__name__)
@@ -30,14 +30,10 @@ def check_package_exists(output_dir: Path, pkgname_list: List[str], pkgver: str,
     Returns:
         Tuple of (exists, found_filename_or_summary)
     """
-    # Use PKGBUILD architectures or fallback to common ones
     if pkgbuild_archs:
-        potential_suffixes = [package_arch_suffix(a) for a in pkgbuild_archs]
-        # Remove duplicates while preserving order
-        potential_suffixes = list(dict.fromkeys(potential_suffixes))
+        potential_suffixes = list(dict.fromkeys(package_arch_suffix(a) for a in pkgbuild_archs))
     else:
-        # Fallback to common architectures if PKGBUILD archs not provided
-        potential_suffixes = ['x86_64', 'aarch64', 'armv7h', 'armv6h', 'powerpc', 'powerpc64le', 'powerpc64', 'espresso', 'any']
+        potential_suffixes = KNOWN_PACKAGE_ARCH_SUFFIXES
 
     # Helper function to construct version string with epoch
     def construct_version_string():

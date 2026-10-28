@@ -1,4 +1,4 @@
-"""Unit tests for farm pkgname / architecture latest-build lookups."""
+"""Unit tests for farm pkgname / architecture latest-build lookups and unified build list shapes."""
 
 from __future__ import annotations
 
@@ -8,47 +8,33 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from apb.multipart_compat import install_multipart_compat
+
+install_multipart_compat()
 
 from apb.constants import BuildStatus
 from apb.farm import core
+from apb.farm import routes as farm_routes
 from apb.client.cli import (
     _is_build_id,
     _resolve_pkgbuild_dir,
     download_latest_from_pkgbuild,
 )
+from apb.models import BuildListResponse, BuildSummary
+from apb.server import routes as server_routes
 
 
-def _init_pkgname_database() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    conn.execute(
-        """
-        CREATE TABLE users (
-            id INTEGER PRIMARY KEY,
-            username TEXT
-        )
-        """
+def _summary(build_id: str, server_arch: str) -> BuildSummary:
+    return BuildSummary(
+        build_id=build_id,
+        pkgname="hello",
+        status=BuildStatus.COMPLETED,
+        display_name="hello (1.0.0-1)",
+        server_arch=server_arch,
     )
-    conn.execute(
-        """
-        CREATE TABLE builds (
-            id TEXT PRIMARY KEY,
-            server_url TEXT,
-            server_arch TEXT,
-            pkgname TEXT,
-            status TEXT,
-            start_time REAL,
-            end_time REAL,
-            created_at REAL,
-            user_id INTEGER,
-            epoch TEXT,
-            pkgver TEXT,
-            pkgrel TEXT
-        )
-        """
-    )
-    conn.execute("INSERT INTO users (id, username) VALUES (1, 'builder')")
-    conn.commit()
-    return conn
 
 
 def _insert_build(
@@ -88,11 +74,11 @@ def _insert_build(
 
 
 @pytest.fixture
-def pkgname_db(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
-    db = _init_pkgname_database()
-    monkeypatch.setattr(core, "build_database", db)
+def pkgname_db(farm_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    farm_db.execute("INSERT INTO users (id, username) VALUES (1, 'builder')")
+    farm_db.commit()
     monkeypatch.setattr(core, "obfuscate_server_url", lambda url: "ser---1")
-    return db
+    return farm_db
 
 
 def test_get_latest_build_for_pkgname_per_arch(pkgname_db: sqlite3.Connection) -> None:
@@ -109,10 +95,11 @@ def test_get_latest_build_for_pkgname_per_arch(pkgname_db: sqlite3.Connection) -
 
     latest = core.get_latest_build_for_pkgname("hello", arch="x86_64")
     assert latest is not None
-    assert latest["build_id"] == "new-x86"
+    assert latest.build_id == "new-x86"
 
     by_arch = core.get_latest_builds_by_arch_for_pkgname("hello")
-    assert {b["server_arch"]: b["build_id"] for b in by_arch} == {
+    assert by_arch.total == 2
+    assert {b.server_arch: b.build_id for b in by_arch.builds} == {
         "aarch64": "arm-build",
         "x86_64": "new-x86",
     }
@@ -124,7 +111,96 @@ def test_get_latest_build_for_any_arch(pkgname_db: sqlite3.Connection) -> None:
 
     latest = core.get_latest_build_for_pkgname("hello", arch="any")
     assert latest is not None
-    assert latest["build_id"] == "newer"
+    assert latest.build_id == "newer"
+
+
+def test_list_builds_total_counts_all_matches(pkgname_db: sqlite3.Connection) -> None:
+    for index in range(5):
+        _insert_build(pkgname_db, f"build-{index}", created_at=100.0 + index)
+    _insert_build(pkgname_db, "failed", status=BuildStatus.FAILED, created_at=200.0)
+    _insert_build(pkgname_db, "other", pkgname="other", created_at=300.0)
+
+    listing = core.list_builds(pkgname="hello", status=BuildStatus.COMPLETED, limit=2)
+    assert listing.pkgname == "hello"
+    assert listing.total == 5
+    assert [b.build_id for b in listing.builds] == ["build-4", "build-3"]
+    assert core.list_builds(limit=1).total == 7
+
+
+def test_list_builds_summary_shape(pkgname_db: sqlite3.Connection) -> None:
+    _insert_build(pkgname_db, "b1", created_at=1_700_000_000.0)
+
+    data = core.list_builds().model_dump(mode="json", exclude_none=True)
+    build = data["builds"][0]
+    assert "id" not in build
+    assert build["build_id"] == "b1"
+    assert build["created_at"] == "2023-11-14T22:13:20Z"
+    assert build["server_url"] == "ser---1"
+    assert build["display_name"] == "hello (1.0.0-1)"
+    assert build["username"] == "builder"
+
+
+def _route_client(router) -> TestClient:
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app)
+
+
+def test_builds_latest_shape_matches_on_server_and_farm(
+    pkgname_db: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _insert_build(pkgname_db, "b1", created_at=1_700_000_000.0)
+    monkeypatch.setattr(server_routes.engine, "active_builds", {})
+    monkeypatch.setattr(server_routes.engine, "build_history", {
+        "b1": {
+            "build_id": "b1",
+            "pkgname": "hello",
+            "status": BuildStatus.COMPLETED,
+            "created_at": 1_700_000_000.0,
+            "start_time": 1_700_000_000.0,
+            "end_time": 1_700_000_000.0,
+            "duration": 0.0,
+            "arch": ["x86_64"],
+            "extra_repos": [],
+        },
+    })
+
+    server_data = _route_client(server_routes.router).get("/builds/latest").json()
+    farm_data = _route_client(farm_routes.router).get("/builds/latest").json()
+
+    assert server_data.keys() == farm_data.keys() == {"builds", "total"}
+    assert server_data["total"] == farm_data["total"] == 1
+    server_build, farm_build = server_data["builds"][0], farm_data["builds"][0]
+    common = {"build_id", "pkgname", "status", "start_time", "end_time", "created_at", "duration"}
+    assert common <= server_build.keys()
+    assert common <= farm_build.keys()
+    assert {key: server_build[key] for key in common} == {key: farm_build[key] for key in common}
+    assert BuildListResponse.model_validate(server_data) == BuildListResponse.model_validate(
+        {**farm_data, "builds": [{key: farm_build[key] for key in common}]}
+    )
+
+
+def test_server_status_api_hides_internal_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(server_routes.engine, "active_builds", {
+        "b1": {
+            "build_id": "b1",
+            "pkgname": "hello",
+            "status": BuildStatus.QUEUED,
+            "created_at": 1_700_000_000.0,
+            "arch": ["x86_64"],
+            "packages": [],
+            "logs": [],
+            "build_timeout": 7200,
+            "extra_repos": [{"name": "internal", "server": "http://repo"}],
+        },
+    })
+
+    data = _route_client(server_routes.router).get("/build/b1/status-api").json()
+    assert data["build_id"] == "b1"
+    assert data["arch"] == ["x86_64"]
+    assert "extra_repos" not in data
+    assert "artifacts_ready" not in data
 
 
 def test_is_build_id() -> None:
@@ -156,9 +232,9 @@ def test_download_latest_from_pkgbuild(tmp_path: Path, monkeypatch: pytest.Monke
 
     client = MagicMock()
     client.get_latest_build_by_pkgname.side_effect = lambda pkgname, successful_only=True, arch=None: {
-        "x86_64": {"build_id": "build-x86", "display_name": "hello (1.0.0-1)", "server_arch": "x86_64"},
-        "aarch64": {"build_id": "build-arm", "display_name": "hello (1.0.0-1)", "server_arch": "aarch64"},
-    }.get(arch, {})
+        "x86_64": _summary("build-x86", "x86_64"),
+        "aarch64": _summary("build-arm", "aarch64"),
+    }.get(arch)
 
     downloaded = []
 
@@ -182,11 +258,7 @@ def test_download_latest_from_pkgbuild_any(tmp_path: Path, monkeypatch: pytest.M
     )
 
     client = MagicMock()
-    client.get_latest_build_by_pkgname.return_value = {
-        "build_id": "build-any",
-        "display_name": "hello (1.0.0-1)",
-        "server_arch": "x86_64",
-    }
+    client.get_latest_build_by_pkgname.return_value = _summary("build-any", "x86_64")
 
     downloaded = []
 

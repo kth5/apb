@@ -16,29 +16,6 @@ from apb.farm import core
 pytestmark = pytest.mark.anyio
 
 
-def _init_test_database() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    conn.execute(
-        """
-        CREATE TABLE builds (
-            id TEXT PRIMARY KEY,
-            server_url TEXT,
-            server_arch TEXT,
-            pkgname TEXT,
-            status TEXT,
-            start_time REAL,
-            end_time REAL,
-            created_at REAL,
-            queue_position INTEGER,
-            submission_group TEXT,
-            user_id INTEGER
-        )
-        """
-    )
-    conn.commit()
-    return conn
-
-
 def _insert_build(
     conn: sqlite3.Connection,
     build_id: str,
@@ -70,17 +47,6 @@ def _make_build_info(build_id: str, arch: str = "x86_64") -> dict[str, Any]:
         "status": BuildStatus.QUEUED,
         "arch": arch,
     }
-
-
-@pytest.fixture
-def farm_queue_state(monkeypatch: pytest.MonkeyPatch):
-    db = _init_test_database()
-    monkeypatch.setattr(core, "build_database", db)
-    monkeypatch.setattr(core, "build_queue", [])
-    monkeypatch.setattr(core, "shutdown_event", asyncio.Event())
-    yield db
-    core.shutdown_event.set()
-    core.build_queue.clear()
 
 
 def test_get_farm_queue_position_and_removal(farm_queue_state: sqlite3.Connection) -> None:
