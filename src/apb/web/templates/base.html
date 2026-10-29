@@ -1,8 +1,37 @@
 <!DOCTYPE html>
-<html>
-<head><title>{{ title }}</title><link rel="stylesheet" href="/static/style.css"></head>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+{% if csrf_token %}
+<meta name="csrf-token" content="{{ csrf_token }}">
+{% endif %}
+{% if refresh_seconds %}
+<noscript><meta http-equiv="refresh" content="{{ refresh_seconds }}"></noscript>
+{% endif %}
+<title>{{ title }} - {{ app_name | default("APB") }}</title>
+<link rel="stylesheet" href="{{ static_url('style.css') }}">
+</head>
 <body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+<div class="wrap">
+<a class="brand" href="{{ home_url | default('/') }}">{{ app_name | default("APB") }}</a>
+{% block nav %}{% endblock %}
+</div>
+</header>
+<main id="main" class="wrap"{% if poll_seconds or refresh_seconds %} data-poll="{{ poll_seconds or refresh_seconds }}"{% endif %}>
+{% block main %}
 <h1>{{ title }}</h1>
-{{ content | safe }}
+{% block content %}{% endblock %}
+{% endblock %}
+</main>
+<footer class="site-footer">
+<div class="wrap">{{ app_name | default("APB") }} {{ version }}</div>
+</footer>
+<script src="{{ static_url('apb.js') }}"></script>
+{% block scripts %}{% endblock %}
 </body>
 </html>

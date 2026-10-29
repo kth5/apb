@@ -1,0 +1,9 @@
+{% extends "server/layout.html" %}
+{% block content %}
+<p class="muted">Build <code class="build-id">{{ build_id }}</code></p>
+<p class="actions">
+<a href="/build/{{ build_id }}">Back to build</a>
+<a href="/build/{{ build_id }}/download/{{ filename | urlencode }}">Download</a>
+</p>
+<pre>{{ content }}</pre>
+{% endblock %}

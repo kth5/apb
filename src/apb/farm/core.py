@@ -906,31 +906,79 @@ async def send_build_completion_email(build_id: str, status: str, build_status: 
         logger.error(f"Error sending build completion email for build {build_id}: {e}")
 
 
+AUTH_COOKIE_NAME = "authToken"
+CSRF_FORM_FIELD = "csrf_token"
+CSRF_HEADER = "X-CSRF-Token"
+CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+FORM_CONTENT_TYPES = ("application/x-www-form-urlencoded", "multipart/form-data")
+
+
+def session_token(request: Optional[Request]) -> Optional[str]:
+    """Web session token from the auth cookie, if any."""
+    return request.cookies.get(AUTH_COOKIE_NAME) if request else None
+
+
+def csrf_token_for(token: Optional[str]) -> str:
+    """CSRF token bound to a session token; unguessable without the (HttpOnly) cookie."""
+    if not token:
+        return ""
+    return hashlib.sha256(f"apb-csrf:{token}".encode()).hexdigest()
+
+
+def is_form_submission(request: Request) -> bool:
+    return request.headers.get("content-type", "").lower().startswith(FORM_CONTENT_TYPES)
+
+
+async def has_valid_csrf_token(request: Request, token: Optional[str]) -> bool:
+    expected = csrf_token_for(token)
+    if not expected:
+        return False
+    supplied = request.headers.get(CSRF_HEADER)
+    if not supplied and is_form_submission(request):
+        supplied = (await request.form()).get(CSRF_FORM_FIELD)
+    return isinstance(supplied, str) and secrets.compare_digest(supplied, expected)
+
+
+async def require_csrf(request: Request, token: Optional[str]) -> None:
+    if not await has_valid_csrf_token(request, token):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+
+
+def change_user_password(user: User, current_password: str, new_password: str, confirm_password: str) -> None:
+    """Change a user's password and revoke all their tokens; raises ValueError with a user-facing message."""
+    if new_password != confirm_password:
+        raise ValueError("New password and confirmation do not match")
+    if len(new_password) < 8:
+        raise ValueError("New password must be at least 8 characters long")
+    if not auth_manager.change_password(user.id, current_password, new_password):
+        raise ValueError("Current password is incorrect")
+    auth_manager.revoke_user_tokens(user.id)
+
+
 # FastAPI Dependencies
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
     request: Request = None
 ) -> Optional[User]:
-    """Get current authenticated user from token (header or cookie)"""
+    """Get current authenticated user from token (header or cookie).
+
+    Cookie-authenticated requests that change state must carry a CSRF token.
+    """
     global auth_manager
     if not auth_manager:
         return None
 
-    token = None
+    if credentials and credentials.credentials:
+        return auth_manager.validate_token(credentials.credentials)
 
-    # Try to get token from Authorization header first
-    if credentials:
-        token = credentials.credentials
+    token = session_token(request)
+    if not token:
+        return None
 
-    # If no header token, try to get from cookie
-    if not token and request:
-        token = request.cookies.get("authToken")
-
-    if token:
-        user = auth_manager.validate_token(token)
-        return user
-
-    return None
+    user = auth_manager.validate_token(token)
+    if user and request.method not in CSRF_SAFE_METHODS:
+        await require_csrf(request, token)
+    return user
 
 
 async def require_auth(

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% from "macros.html" import csrf_field %}
+{% set app_name = "APB Farm" %}
+{% set home_url = "/dashboard" %}
+{% block nav %}
+<nav class="site-nav" aria-label="Main">
+<ul>
+<li><a href="/dashboard"{% if nav == "servers" %} aria-current="page"{% endif %}>Servers</a></li>
+<li><a href="/dashboard/builds"{% if nav == "builds" %} aria-current="page"{% endif %}>Builds</a></li>
+{% if current_user %}
+<li><a href="/dashboard/statistics"{% if nav == "statistics" %} aria-current="page"{% endif %}>Statistics</a></li>
+{% if current_user.role.value == "admin" %}
+<li><a href="/admin"{% if nav == "admin" %} aria-current="page"{% endif %}>Admin</a></li>
+{% endif %}
+<li><a href="/account"{% if nav == "account" %} aria-current="page"{% endif %}>{{ current_user.username }}</a></li>
+<li>
+<form class="inline" method="post" action="/logout">
+{{ csrf_field(csrf_token) }}
+<button type="submit" class="link-button">Log out</button>
+</form>
+</li>
+{% else %}
+<li><a href="/login"{% if nav == "login" %} aria-current="page"{% endif %}>Log in</a></li>
+{% endif %}
+</ul>
+</nav>
+{% endblock %}

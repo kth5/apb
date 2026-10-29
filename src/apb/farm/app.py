@@ -11,6 +11,7 @@ from apb.config import load_config
 from apb.farm import core
 from apb.farm.routes import router
 from apb.service import add_default_cors
+from apb.web import mount_static
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="APB Farm", version=VERSION, lifespan=lifespan)
     add_default_cors(app)
+    mount_static(app)
     app.include_router(router)
     return app
 

@@ -1,0 +1,24 @@
+{% extends "server/layout.html" %}
+{% from "macros.html" import file_list, status_badge %}
+{% block content %}
+<div data-poll-region>
+<div class="card">
+<dl class="details">
+<dt>Package</dt><dd>{{ build.pkgname }}</dd>
+<dt>Status</dt><dd>{{ status_badge(build.status) }}</dd>
+<dt>Build ID</dt><dd><code class="build-id">{{ build_id }}</code></dd>
+<dt>Started</dt><dd>{{ (build.start_time or build.created_at) | timestamp }}</dd>
+<dt>Finished</dt><dd>{{ build.end_time | timestamp }}</dd>
+<dt>Duration</dt><dd>{{ build.duration | duration }}</dd>
+<dt>Exit code</dt><dd>{{ build.exit_code if build.exit_code is not none else "-" }}</dd>
+</dl>
+</div>
+{{ file_list("Packages", build.packages) }}
+{{ file_list("Logs", build.logs) }}
+<p class="actions">
+<a href="/build/{{ build_id }}/output">Output (JSON)</a>
+<a href="/build/{{ build_id }}/stream">Stream output</a>
+{% if is_active %}<a href="/build/{{ build_id }}/confirm-cancel">Cancel build</a>{% endif %}
+</p>
+</div>
+{% endblock %}

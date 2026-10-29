@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 import psutil
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from apb import VERSION
 from apb.constants import BuildStatus
@@ -21,9 +21,11 @@ from apb.server import engine
 from apb.tarball import InvalidBuildTarball, extract_build_tarball
 from apb.upstream import build_download_path
 from apb.validation import validate_build_timeout
+from apb.web import render_page
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+SERVER_BUILD_REFRESH_SECONDS = 30
 
 
 def _build_summary(build: Dict, *, with_packages: bool = False) -> BuildSummary:
@@ -526,21 +528,12 @@ async def confirm_cancel_build(build_id: str):
     if not build_info:
         raise HTTPException(status_code=404, detail="Build not found")
 
-    return HTMLResponse(f"""
-    <html>
-    <head><title>Cancel Build - {build_info['pkgname']}</title></head>
-    <body>
-        <h1>Cancel Build Confirmation</h1>
-        <p>Are you sure you want to cancel the build for <strong>{build_info['pkgname']}</strong>?</p>
-        <p>Build ID: {build_id}</p>
-        <p>Status: {build_info['status']}</p>
-        <form method="post" action="/build/{build_id}/cancel">
-            <button type="submit" style="background-color: #ff4444; color: white; padding: 10px 20px; border: none; cursor: pointer;">Cancel Build</button>
-            <a href="/build/{build_id}" style="margin-left: 10px; text-decoration: none; background-color: #ccc; color: black; padding: 10px 20px; display: inline-block;">Go Back</a>
-        </form>
-    </body>
-    </html>
-    """)
+    return render_page(
+        "server/confirm_cancel.html",
+        title=f"Cancel build: {build_info['pkgname']}",
+        build_id=build_id,
+        build=build_info,
+    )
 
 
 @router.get("/build/{build_id}/view/{filename}")
@@ -557,17 +550,13 @@ async def view_file(build_id: str, filename: str):
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        return HTMLResponse(f"""
-        <html>
-        <head><title>View File - {filename}</title></head>
-        <body>
-            <h1>File: {filename}</h1>
-            <p>Build ID: {build_id}</p>
-            <pre style="background-color: #f5f5f5; padding: 10px; border: 1px solid #ddd; overflow-x: auto;">{content}</pre>
-            <a href="/build/{build_id}">Back to Build</a>
-        </body>
-        </html>
-        """)
+        return render_page(
+            "server/file_view.html",
+            title=f"File: {filename}",
+            build_id=build_id,
+            filename=filename,
+            content=content,
+        )
     except UnicodeDecodeError:
         # If file is not text, redirect to download
         return FileResponse(
@@ -702,41 +691,15 @@ async def get_build_details(build_id: str, request: Request):
             "logs": build_info.get("logs", []),
             "sources": sources
         }
-    else:
-        # Return HTML response
-        packages_html = ""
-        for pkg in build_info.get("packages", []):
-            packages_html += f'<li><a href="{pkg["download_url"]}">{pkg["filename"]}</a> ({pkg["size"]} bytes)</li>'
-
-        logs_html = ""
-        for log in build_info.get("logs", []):
-            logs_html += f'<li><a href="{log["download_url"]}">{log["filename"]}</a> ({log["size"]} bytes)</li>'
-
-        return HTMLResponse(f"""
-        <html>
-        <head><title>Build Details - {build_info['pkgname']}</title></head>
-        <body>
-            <h1>Build Details: {build_info['pkgname']}</h1>
-            <p><strong>Build ID:</strong> {build_id}</p>
-            <p><strong>Status:</strong> {build_info['status']}</p>
-            <p><strong>Start Time:</strong> {datetime.fromtimestamp(build_info.get("start_time", build_info.get("created_at", 0)), timezone.utc).isoformat()}</p>
-            <p><strong>End Time:</strong> {datetime.fromtimestamp(build_info["end_time"], timezone.utc).isoformat() if build_info.get("end_time") else "N/A"}</p>
-            <p><strong>Duration:</strong> {build_info.get("duration", 0):.2f} seconds</p>
-            <p><strong>Exit Code:</strong> {build_info.get("exit_code", 0)}</p>
-
-            <h2>Packages</h2>
-            <ul>{packages_html}</ul>
-
-            <h2>Logs</h2>
-            <ul>{logs_html}</ul>
-
-            <h2>Actions</h2>
-            <a href="/build/{build_id}/stream">Stream Output</a> |
-            <a href="/build/{build_id}/output">View Output</a> |
-            <a href="/build/{build_id}/confirm-cancel">Cancel Build</a>
-        </body>
-        </html>
-        """)
+    is_active = build_info["status"] not in BuildStatus.TERMINAL
+    return render_page(
+        "server/build.html",
+        title=f"Build: {build_info['pkgname']}",
+        build_id=build_id,
+        build=build_info,
+        is_active=is_active,
+        refresh_seconds=SERVER_BUILD_REFRESH_SECONDS if is_active else None,
+    )
 
 
 @router.get("/build/{build_id}/packages")
@@ -765,18 +728,7 @@ async def get_build_packages(build_id: str):
 @router.get("/admin/cleanup")
 async def admin_cleanup_page():
     """Get cleanup administration page"""
-    return HTMLResponse("""
-    <html>
-    <head><title>APB Server Admin - Cleanup</title></head>
-    <body>
-        <h1>APB Server Administration - Cleanup</h1>
-        <p>Use this page to free in-memory build outputs, streams, and trim build history.</p>
-        <form method="post" action="/admin/cleanup">
-            <button type="submit">Start Cleanup</button>
-        </form>
-    </body>
-    </html>
-    """)
+    return render_page("server/admin_cleanup.html", title="Cleanup", nav="admin")
 
 
 @router.post("/admin/cleanup")

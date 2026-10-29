@@ -1,0 +1,21 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import details %}
+{% block content %}
+<p class="alert alert-error" role="alert">{{ message }}</p>
+{% if rows %}
+<div class="card">{{ details(rows) }}</div>
+{% endif %}
+{% if hints %}
+<h2>What to check</h2>
+<ul>
+{% for hint in hints %}
+<li>{{ hint }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+<p class="actions">
+{% if build_id %}<a href="/build/{{ build_id }}/status">Build status</a>{% endif %}
+<a href="/dashboard">Dashboard</a>
+<a href="/dashboard/builds">Recent builds</a>
+</p>
+{% endblock %}

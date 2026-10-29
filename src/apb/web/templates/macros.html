@@ -1,0 +1,76 @@
+{% macro status_badge(status) -%}
+{% set label = (status or "unknown") | string %}
+<span class="badge badge-{{ label.split(' ')[0] | lower }}">{{ label }}</span>
+{%- endmacro %}
+
+{% macro csrf_field(token) -%}
+{% if token %}<input type="hidden" name="csrf_token" value="{{ token }}">{% endif %}
+{%- endmacro %}
+
+{% macro messages(error=None, success=None) -%}
+{% if error %}<p class="alert alert-error" role="alert">{{ error }}</p>{% endif %}
+{% if success %}<p class="alert alert-success" role="status">{{ success }}</p>{% endif %}
+{%- endmacro %}
+
+{% macro pagination(page, prev_url, next_url) -%}
+<nav class="pagination" aria-label="Pagination">
+{% if prev_url %}<a href="{{ prev_url }}" rel="prev">&laquo; Previous</a>{% else %}<span class="disabled">&laquo; Previous</span>{% endif %}
+<span class="current">Page {{ page }}</span>
+{% if next_url %}<a href="{{ next_url }}" rel="next">Next &raquo;</a>{% else %}<span class="disabled">Next &raquo;</span>{% endif %}
+</nav>
+{%- endmacro %}
+
+{% macro build_table(builds, show_server=True) -%}
+{% if builds %}
+<table class="data-table stack">
+<thead>
+<tr>
+<th scope="col">Package</th>
+<th scope="col">Status</th>
+<th scope="col">Arch</th>
+{% if show_server %}<th scope="col">Server</th>{% endif %}
+<th scope="col">Created</th>
+<th scope="col">User</th>
+<th scope="col">Build ID</th>
+</tr>
+</thead>
+<tbody>
+{% for build in builds %}
+<tr>
+<td data-label="Package"><a href="/build/{{ build.id }}/status">{{ build.display_name }}</a></td>
+<td data-label="Status">{{ status_badge(build.status) }}</td>
+<td data-label="Arch">{{ build.server_arch or "-" }}</td>
+{% if show_server %}<td data-label="Server">{{ build.server_url }}</td>{% endif %}
+<td data-label="Created">{{ build.created_at | timestamp }}</td>
+<td data-label="User">{{ build.username }}</td>
+<td data-label="Build ID"><code class="build-id">{{ build.id }}</code></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p class="muted">No builds on this page.</p>
+{% endif %}
+{%- endmacro %}
+
+{% macro file_list(title, files) -%}
+{% if files %}
+<section>
+<h2>{{ title }}</h2>
+<ul class="file-list">
+{% for item in files %}
+<li><a href="{{ item.download_url or '#' }}">{{ item.filename or "unknown" }}</a> <span class="muted">({{ item.size | filesize }})</span></li>
+{% endfor %}
+</ul>
+</section>
+{% endif %}
+{%- endmacro %}
+
+{% macro details(rows) -%}
+<dl class="details">
+{% for label, value in rows if value is not none and value != "" %}
+<dt>{{ label }}</dt>
+<dd>{{ value }}</dd>
+{% endfor %}
+</dl>
+{%- endmacro %}

@@ -1,0 +1,15 @@
+{% extends "server/layout.html" %}
+{% from "macros.html" import status_badge %}
+{% block content %}
+<p>Are you sure you want to cancel the build for <strong>{{ build.pkgname }}</strong>?</p>
+<div class="card">
+<dl class="details">
+<dt>Build ID</dt><dd><code class="build-id">{{ build_id }}</code></dd>
+<dt>Status</dt><dd>{{ status_badge(build.status) }}</dd>
+</dl>
+</div>
+<form class="actions" method="post" action="/build/{{ build_id }}/cancel">
+<button type="submit" class="button-danger">Cancel build</button>
+<a class="button" href="/build/{{ build_id }}">Go back</a>
+</form>
+{% endblock %}

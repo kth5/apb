@@ -18,8 +18,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Unit tests for model round-trips and timestamp normalisation
 - Unit tests for client CLI dispatch, config-based multi-architecture builds, auth client URL handling, and farm database creation and migration
 - Shared `farm_db` and `farm_queue_state` pytest fixtures in `tests/conftest.py`, built from the real farm schema via `core.init_database(":memory:")` instead of per-file hand-written tables
+- Farm web form endpoints that work without JavaScript (lynx, w3m, very old browsers): `GET`/`POST /login`, `POST /logout`, `GET /account` and `POST /account/password`; the build status page has a plain HTML cancel form, and `POST /build/{build_id}/cancel` answers form submissions with `303 See Other` back to the status page
+- CSRF protection for cookie-authenticated non-GET requests (`csrf_token` form field or `X-CSRF-Token` header); Bearer-token requests from the APB client are unaffected
+- Shared web UI stylesheet and scripts served from `GET /static/{path}` on farm and server, with versioned URLs and long-lived `Cache-Control`
+- Dark color scheme via `prefers-color-scheme`, a print stylesheet, and tables that stack on narrow screens
+- Progressive live updates (`/static/apb.js`, ES5): unfinished build status pages and the dashboard servers tab reload only their status section in place, one request at a time, paused while the browser tab is hidden and backing off after errors; without JavaScript, build status pages fall back to a `<noscript>` meta refresh
+- Admin panel can edit and enable/disable custom repositories (the edit button used to call an undefined function)
+- `tests/test_web_ui.py` covering page rendering, HTML escaping, the no-JS login, logout and password change flows, and CSRF rejection
 
 ### Changed
+
+- All farm and server HTML pages (dashboard, build status, download error, admin, login and account on the farm; build details, cancel confirmation, file view and cleanup on the server) are rendered from autoescaped Jinja templates in `apb.web` with one shared layout and stylesheet instead of inline f-strings with per-page CSS; emoji icons replaced by text labels and status badges
+- Dashboard tabs are plain links to `/dashboard`, `/dashboard/builds/{page}` and `/dashboard/statistics`; only the requested tab's data is queried, builds are shown in a table, "Next" only appears when another page exists, and server info lookups run concurrently
+- The 6 build status page variants (not found, queued, submission failed, server unavailable with and without cached status, connection failed, live) are one template
+- Admin panel sections are reachable through in-page links instead of JS tabs; `/static/admin.js` is ES5 (`XMLHttpRequest`, event delegation, `textContent`) and authenticates with the session cookie plus CSRF header
+- Web login sets the `authToken` cookie server-side with `HttpOnly`, `SameSite=Lax` and `Secure` on HTTPS
+- `PUT /auth/change-password` and `POST /account/password` share one `core.change_user_password` helper
 
 - Farm default host, port and config search paths now come from `apb.constants` (`FARM_DEFAULT_HOST`, `FARM_DEFAULT_PORT`, `DEFAULT_CONFIG_PATHS`) instead of duplicated definitions in `farm/core.py`
 - Build timeout bounds and default (300, 14400 and 7200 seconds) come from `BUILD_TIMEOUT_MIN`, `BUILD_TIMEOUT_MAX` and `BUILD_TIMEOUT_DEFAULT` in `apb.constants` on server, farm and client
@@ -56,9 +70,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Duplicate `load_config` in `apb.client.api` (use `apb.config.load_config`) and the unimplemented `APBotClient.get_latest_successful_build_id` stub
 - `requirements.txt`; dependencies are declared only in `pyproject.toml` (install with `pip install -e .` or `pip install -e '.[dev]'`)
 - `submit_build_to_farm` and `monitor_farm_builds` in `apb.client.cli` (use `submit_build` and `monitor_builds`), and the unused `allow_toggle`, `status_callback` and `pkgname` parameters of `monitor_build`
+- Dashboard JavaScript login and password dialogs, `localStorage` token storage, client-side `authToken` cookie writes and the global `window.fetch` monkeypatch that added the token to every request
 
 ### Fixed
 
+- `GET /farm` used to fail with a `NameError` (`running_builds_by_server`) when listing running builds per server
 - Client `get_build_status` queries `/build/{build_id}/status-api`, which both server and farm serve. It used to query `/build/{build_id}/status?format=json`, which only the farm implements, so status calls against a server directly returned 404
 - Farm build list timestamps are real UTC; they used to be local time with a `UTC` suffix
 - Farm build discovery parses server build lists with `BuildListResponse` and stores epoch timestamps. It used to write the server's ISO strings into numeric columns, and gave unstarted builds a fake `start_time`
@@ -75,10 +91,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Client build tarballs no longer include the output directory, build artifacts (`.pkg.tar.*`, `.sig`, `.log`), or common non-source paths (`pkg/`, `.git/`, etc.)
 - PKGBUILD parser now collects multi-line bash arrays (`apb_extra_repos=(...)`, `arch=(...)`, `pkgname=(...)`) instead of treating a lone `(` as a repository name and rejecting farm submissions
 - `apb_extra_repos` URLs preserve pacman `$arch` / `$repo` placeholders so they match admin-configured repository URLs and expand at pacman runtime; other `${var}` references in those URLs still expand normally
+- Admin user list shows each user's real email notification setting (it always showed "Enabled")
+- `src/apb/web` templates and `style.css` are actually used; `/static` was never mounted, so the stylesheet was never served
 
 ### Security
 
 - Farm strips directory components from legacy individual-file source filenames before writing them, and the client strips them from download filenames, so crafted names such as `../x` cannot write outside the target directory
+- HTML pages escape all dynamic values. Usernames, package names, versions, repository data, file contents and the build ID from the URL were inserted unescaped (including into inline `onclick` handlers), which allowed stored and reflected XSS
+- Cookie-authenticated state-changing requests require a CSRF token, and the session cookie is `HttpOnly`, so page scripts can no longer read the token
 
 ## 2026.08.06
 

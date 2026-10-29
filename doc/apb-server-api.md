@@ -36,6 +36,8 @@ For production deployments:
 - **Request**: `multipart/form-data` for file uploads, `application/json` for JSON requests
 - **Response**: `application/json` for API endpoints, `text/html` for web pages
 
+HTML pages (`/build/{build_id}`, `/build/{build_id}/confirm-cancel`, `/build/{build_id}/view/{filename}`, `/admin/cleanup`) are rendered from the same autoescaped templates and stylesheet as the farm UI and work without JavaScript. Their assets are served from `GET /static/{path}` (`style.css`, `apb.js`) with `Cache-Control: public, max-age=31536000, immutable`; pages link them with a `?v=<version>` suffix.
+
 ## File Size Limits
 
 The server implements configurable file size limits to prevent resource exhaustion:
