@@ -7,11 +7,12 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from markupsafe import Markup
 
 from apb import VERSION
 from apb.constants import (
@@ -20,14 +21,25 @@ from apb.constants import (
     TOKEN_EXPIRY_DAYS,
     BuildStatus,
 )
-from apb.farm import core
+from apb.farm import core, mfa
 from apb.models import (
     BuildListResponse,
     BuildStatusResponse,
     BuildSummary,
     LoginRequest,
     LoginResponse,
+    MfaChallengeResponse,
+    MfaEnrollResponse,
+    MfaSetupRequiredResponse,
+    MfaStatusResponse,
+    MfaTokenRequest,
+    MfaVerifyRequest,
+    PasswordConfirmRequest,
+    RecoveryCodesResponse,
+    TotpConfirmRequest,
+    TotpSetupResponse,
     UserResponse,
+    WebAuthnRegisterRequest,
 )
 from apb.tarball import InvalidBuildTarball, extract_build_tarball
 from apb.upstream import (
@@ -62,9 +74,11 @@ def _render_farm_page(
     current_user: Optional[core.User],
     *,
     status_code: int = 200,
+    csrf_session: Optional[str] = None,
     **context: Any,
 ) -> HTMLResponse:
-    csrf_token = core.csrf_token_for(core.session_token(request)) if current_user else ""
+    """csrf_session overrides the token the CSRF token is derived from (pending logins, freshly issued sessions)."""
+    csrf_token = core.csrf_token_for(csrf_session or (core.session_token(request) if current_user else None))
     return render_page(
         template_name,
         status_code=status_code,
@@ -93,12 +107,12 @@ def _render_farm_error(
     )
 
 
-def _set_session_cookie(response: Response, request: Request, token: str) -> None:
+def _set_cookie(response: Response, request: Request, name: str, token: str, max_age: int) -> None:
     is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
     response.set_cookie(
-        core.AUTH_COOKIE_NAME,
+        name,
         token,
-        max_age=TOKEN_EXPIRY_DAYS * 24 * 3600,
+        max_age=max_age,
         path="/",
         httponly=True,
         samesite="lax",
@@ -106,25 +120,134 @@ def _set_session_cookie(response: Response, request: Request, token: str) -> Non
     )
 
 
+def _set_session_cookie(response: Response, request: Request, token: str) -> None:
+    _set_cookie(response, request, core.AUTH_COOKIE_NAME, token, TOKEN_EXPIRY_DAYS * 24 * 3600)
+
+
 def _clear_session_cookie(response: Response) -> None:
     response.delete_cookie(core.AUTH_COOKIE_NAME, path="/")
+
+
+def _clear_mfa_cookie(response: Response) -> None:
+    response.delete_cookie(core.MFA_COOKIE_NAME, path="/")
 
 
 def _see_other(path: str) -> RedirectResponse:
     return RedirectResponse(url=path, status_code=303)
 
 
-@router.post("/auth/login", response_model=LoginResponse)
-async def login(login_data: LoginRequest) -> LoginResponse:
-    """Login with username and password"""
+@router.post("/auth/login", response_model=Union[LoginResponse, MfaChallengeResponse, MfaSetupRequiredResponse])
+async def login(login_data: LoginRequest) -> core.LoginResult:
+    """Login with username and password; users with 2FA get a pending login instead of a token"""
     user = core.auth_manager.authenticate_user(login_data.username, login_data.password)
 
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    token = core.auth_manager.create_token(user)
+    return core.start_login(user)
 
-    return LoginResponse(token=token, user=core.user_response(user))
+
+@router.post("/auth/login/2fa/webauthn-options")
+async def login_webauthn_options(request_data: MfaTokenRequest) -> Dict[str, Any]:
+    """WebAuthn request options for a pending 2FA login"""
+    return core.mfa_login_options(request_data.mfa_token)
+
+
+@router.post("/auth/login/2fa", response_model=LoginResponse)
+async def login_second_factor(request_data: MfaVerifyRequest) -> LoginResponse:
+    """Finish a pending 2FA login with a TOTP code, recovery code or security key response"""
+    return core.complete_mfa_login(request_data.mfa_token, request_data.method, request_data.code, request_data.credential)
+
+
+@router.get("/auth/my/2fa", response_model=MfaStatusResponse)
+async def get_my_mfa(session: core.AuthSession = Depends(core.require_enrollment_session)) -> MfaStatusResponse:
+    """Two-factor status of the current user"""
+    return mfa.mfa_status(core.auth_manager.db, session.user.id, _is_admin(session.user))
+
+
+@router.post("/auth/my/2fa/totp", response_model=TotpSetupResponse)
+async def start_my_totp(session: core.AuthSession = Depends(core.require_enrollment_session)) -> TotpSetupResponse:
+    """Start authenticator app enrollment"""
+    try:
+        secret = mfa.start_totp_enrollment(core.auth_manager.db, session.user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TotpSetupResponse(
+        secret=secret,
+        provisioning_uri=mfa.totp_provisioning_uri(secret, session.user.username, core.public_farm_url()),
+    )
+
+
+@router.post("/auth/my/2fa/totp/confirm", response_model=MfaEnrollResponse)
+async def confirm_my_totp(
+    request_data: TotpConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> MfaEnrollResponse:
+    """Activate the authenticator app with a first code"""
+    try:
+        return core.confirm_totp_enrollment(session, request_data.code)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/auth/my/2fa/totp")
+async def remove_my_totp(
+    request_data: PasswordConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> Dict[str, str]:
+    """Remove the authenticator app"""
+    return {"message": _remove_second_factor(session.user, request_data.password)}
+
+
+@router.post("/auth/my/2fa/webauthn/register-options")
+async def my_webauthn_register_options(session: core.AuthSession = Depends(core.require_enrollment_session)) -> Dict[str, Any]:
+    """WebAuthn creation options for registering a security key"""
+    return mfa.registration_options(
+        core.auth_manager.db, core.public_farm_url(), session.token, session.user.id, session.user.username
+    )
+
+
+@router.post("/auth/my/2fa/webauthn", response_model=MfaEnrollResponse)
+async def register_my_webauthn(
+    request_data: WebAuthnRegisterRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> MfaEnrollResponse:
+    """Finish security key registration"""
+    try:
+        return core.register_security_key(session, request_data.name, request_data.credential)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/auth/my/2fa/webauthn/{credential_id}")
+async def remove_my_webauthn(
+    credential_id: int,
+    request_data: PasswordConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> Dict[str, str]:
+    """Remove a security key"""
+    return {"message": _remove_second_factor(session.user, request_data.password, credential_id)}
+
+
+@router.post("/auth/my/2fa/recovery-codes", response_model=RecoveryCodesResponse)
+async def regenerate_my_recovery_codes(
+    request_data: PasswordConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> RecoveryCodesResponse:
+    """Replace all recovery codes"""
+    try:
+        return RecoveryCodesResponse(recovery_codes=core.regenerate_recovery_codes(session.user, request_data.password))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _remove_second_factor(user: core.User, password: str, key_id: Optional[int] = None) -> str:
+    try:
+        return core.remove_second_factor(user, password, key_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/auth/logout")
@@ -265,6 +388,28 @@ async def change_user_role(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.delete("/auth/users/{user_id}/2fa")
+async def reset_user_mfa(
+    user_id: int,
+    current_user: core.User = Depends(core.require_admin)
+):
+    """Remove all second factors of a user and end their sessions (admin only)"""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot reset your own 2FA; use /account/2fa")
+    user = core.auth_manager.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    core.reset_user_mfa(user_id)
+    logger.warning(f"Admin '{current_user.username}' reset 2FA of user '{user.username}'")
+    if user.email:
+        try:
+            core.auth_manager.send_user_notification(user.email, 'mfa_reset', user.username, current_user.username)
+        except Exception as e:
+            logger.warning(f"Failed to send 2FA reset email to {user.email}: {e}")
+    return {"message": f"Two-factor authentication reset for user {user_id}"}
+
+
 @router.post("/auth/users/{user_id}/revoke-tokens")
 async def revoke_user_tokens(
     user_id: int,
@@ -346,9 +491,294 @@ async def login_form(
             error="Invalid username or password",
         )
 
+    result = core.start_login(user)
+    if isinstance(result, MfaChallengeResponse):
+        response = _see_other("/login/2fa")
+        _set_cookie(response, request, core.MFA_COOKIE_NAME, result.mfa_token, result.expires_in_seconds)
+        return response
+    if isinstance(result, MfaSetupRequiredResponse):
+        response = _see_other(core.MFA_SETUP_PATH)
+        _set_session_cookie(response, request, result.setup_token)
+        return response
+
     response = _see_other("/dashboard")
-    _set_session_cookie(response, request, core.auth_manager.create_token(user))
+    _set_session_cookie(response, request, result.token)
     return response
+
+
+def _pending_login(request: Request) -> tuple[Optional[str], Optional[core.User]]:
+    pending_token = request.cookies.get(core.MFA_COOKIE_NAME)
+    user = core.auth_manager.validate_token(pending_token, (mfa.TOKEN_SCOPE_MFA_PENDING,)) if pending_token else None
+    return pending_token, user
+
+
+def _render_login_second_factor(
+    request: Request, pending_token: str, user: core.User, *, status_code: int = 200, error: Optional[str] = None
+) -> HTMLResponse:
+    methods = mfa.available_methods(core.auth_manager.db, user.id)
+    webauthn_options = core.mfa_login_options(pending_token) if mfa.METHOD_WEBAUTHN in methods else None
+    return _render_farm_page(
+        "farm/login_2fa.html",
+        request,
+        None,
+        status_code=status_code,
+        csrf_session=pending_token,
+        title="Two-factor authentication",
+        nav="login",
+        methods=methods,
+        webauthn_options=webauthn_options,
+        error=error,
+    )
+
+
+def _render_login_expired(request: Request) -> HTMLResponse:
+    response = _render_farm_page(
+        "farm/login.html",
+        request,
+        None,
+        status_code=401,
+        title="Log in",
+        nav="login",
+        error="Your two-factor login expired or had too many failed attempts. Please log in again.",
+    )
+    _clear_mfa_cookie(response)
+    return response
+
+
+@router.get("/login/2fa")
+async def login_second_factor_page(request: Request):
+    """Second login step: authenticator code, recovery code or security key."""
+    pending_token, user = _pending_login(request)
+    if not user:
+        return _see_other("/login")
+    return _render_login_second_factor(request, pending_token, user)
+
+
+@router.post("/login/2fa")
+async def login_second_factor_form(
+    request: Request,
+    method: str = Form(""),
+    code: str = Form(""),
+    credential: str = Form(""),
+):
+    """Finish the 2FA login from the HTML form and start a cookie session."""
+    pending_token, user = _pending_login(request)
+    if not user:
+        return _render_login_expired(request)
+    await core.require_csrf(request, pending_token)
+
+    try:
+        result = core.complete_mfa_login(pending_token, method, code or None, _parse_credential(credential))
+    except HTTPException as e:
+        pending_token, user = _pending_login(request)
+        if not user:
+            return _render_login_expired(request)
+        return _render_login_second_factor(request, pending_token, user, status_code=e.status_code, error=e.detail)
+
+    response = _see_other("/dashboard")
+    _set_session_cookie(response, request, result.token)
+    _clear_mfa_cookie(response)
+    return response
+
+
+def _parse_credential(credential: str) -> Optional[Dict[str, Any]]:
+    try:
+        parsed = json.loads(credential) if credential else None
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _render_account_mfa(
+    request: Request,
+    user: core.User,
+    token: str,
+    scope: str,
+    *,
+    status_code: int = 200,
+    **context: Any,
+) -> HTMLResponse:
+    db = core.auth_manager.db
+    return _render_farm_page(
+        "farm/account_2fa.html",
+        request,
+        user,
+        status_code=status_code,
+        csrf_session=token,
+        title="Two-factor authentication",
+        nav="account",
+        is_setup=scope == mfa.TOKEN_SCOPE_MFA_SETUP,
+        status=mfa.mfa_status(db, user.id, _is_admin(user)),
+        webauthn_options=mfa.registration_options(db, core.public_farm_url(), token, user.id, user.username),
+        **context,
+    )
+
+
+def _render_account_mfa_result(request: Request, session: core.AuthSession, enrolled: MfaEnrollResponse) -> HTMLResponse:
+    """Account 2FA page after enrollment; an enrollment session is swapped for the new full session."""
+    token = enrolled.token or session.token
+    scope = mfa.TOKEN_SCOPE_FULL if enrolled.token else session.scope
+    response = _render_account_mfa(
+        request, session.user, token, scope, success=enrolled.message, recovery_codes=enrolled.recovery_codes
+    )
+    if enrolled.token:
+        _set_session_cookie(response, request, enrolled.token)
+    return response
+
+
+def _render_account_mfa_error(request: Request, session: core.AuthSession, error: str, status_code: int = 400) -> HTMLResponse:
+    return _render_account_mfa(request, session.user, session.token, session.scope, status_code=status_code, error=error)
+
+
+@router.get(core.MFA_SETUP_PATH)
+async def account_mfa_page(
+    request: Request,
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """HTML two-factor settings of the logged-in user."""
+    if not session:
+        return _see_other("/login")
+    return _render_account_mfa(request, session.user, session.token, session.scope)
+
+
+@router.post("/account/2fa/totp")
+async def account_totp_start_form(
+    request: Request,
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Start authenticator app enrollment from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    try:
+        mfa.start_totp_enrollment(core.auth_manager.db, session.user.id)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _see_other("/account/2fa/totp")
+
+
+def _render_account_totp(request: Request, session: core.AuthSession, secret: str, **context: Any) -> HTMLResponse:
+    provisioning_uri = mfa.totp_provisioning_uri(secret, session.user.username, core.public_farm_url())
+    return _render_farm_page(
+        "farm/account_2fa_totp.html",
+        request,
+        session.user,
+        csrf_session=session.token,
+        title="Set up authenticator app",
+        nav="account",
+        secret=secret,
+        provisioning_uri=provisioning_uri,
+        qr_svg=Markup(mfa.totp_qr_svg(provisioning_uri)),
+        **context,
+    )
+
+
+@router.get("/account/2fa/totp")
+async def account_totp_page(
+    request: Request,
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """QR code and confirmation form of a pending authenticator app enrollment."""
+    if not session:
+        return _see_other("/login")
+    secret = mfa.pending_totp_secret(core.auth_manager.db, session.user.id)
+    if not secret:
+        return _see_other(core.MFA_SETUP_PATH)
+    return _render_account_totp(request, session, secret)
+
+
+@router.post("/account/2fa/totp/confirm")
+async def account_totp_confirm_form(
+    request: Request,
+    code: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Activate the authenticator app from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    try:
+        enrolled = core.confirm_totp_enrollment(session, code)
+    except ValueError as e:
+        secret = mfa.pending_totp_secret(core.auth_manager.db, session.user.id)
+        if not secret:
+            return _render_account_mfa_error(request, session, str(e))
+        response = _render_account_totp(request, session, secret, error=str(e))
+        response.status_code = 400
+        return response
+    return _render_account_mfa_result(request, session, enrolled)
+
+
+@router.post("/account/2fa/totp/delete")
+async def account_totp_delete_form(
+    request: Request,
+    password: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Remove the authenticator app from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    return _account_remove_factor(request, session, password)
+
+
+@router.post("/account/2fa/webauthn")
+async def account_webauthn_register_form(
+    request: Request,
+    name: str = Form(""),
+    credential: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Finish security key registration from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    parsed_credential = _parse_credential(credential)
+    name = name.strip()
+    if not parsed_credential or not name or len(name) > 64:
+        return _render_account_mfa_error(request, session, "Enter a key name (up to 64 characters) and touch your security key")
+    try:
+        enrolled = core.register_security_key(session, name, parsed_credential)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _render_account_mfa_result(request, session, enrolled)
+
+
+@router.post("/account/2fa/webauthn/{credential_id}/delete")
+async def account_webauthn_delete_form(
+    request: Request,
+    credential_id: int,
+    password: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Remove a security key from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    return _account_remove_factor(request, session, password, credential_id)
+
+
+def _account_remove_factor(request: Request, session: core.AuthSession, password: str, key_id: Optional[int] = None) -> HTMLResponse:
+    try:
+        message = core.remove_second_factor(session.user, password, key_id)
+    except LookupError as e:
+        return _render_account_mfa_error(request, session, str(e), 404)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _render_account_mfa(request, session.user, session.token, session.scope, success=message)
+
+
+@router.post("/account/2fa/recovery-codes")
+async def account_recovery_codes_form(
+    request: Request,
+    password: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Replace the recovery codes from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    try:
+        recovery_codes = core.regenerate_recovery_codes(session.user, password)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _render_account_mfa(
+        request, session.user, session.token, session.scope, success="New recovery codes generated", recovery_codes=recovery_codes
+    )
 
 
 @router.post("/logout")
@@ -371,7 +801,20 @@ async def account_page(
     """HTML account page with password change form."""
     if not current_user:
         return _see_other("/login")
-    return _render_farm_page("farm/account.html", request, current_user, title="Account", nav="account")
+    return _render_account(request, current_user)
+
+
+def _render_account(request: Request, current_user: core.User, *, status_code: int = 200, **context: Any) -> HTMLResponse:
+    return _render_farm_page(
+        "farm/account.html",
+        request,
+        current_user,
+        status_code=status_code,
+        title="Account",
+        nav="account",
+        mfa_enabled=mfa.has_second_factor(core.auth_manager.db, current_user.id),
+        **context,
+    )
 
 
 @router.post("/account/password")
@@ -388,15 +831,7 @@ async def account_password_form(
     try:
         core.change_user_password(current_user, current_password, new_password, confirm_password)
     except ValueError as e:
-        return _render_farm_page(
-            "farm/account.html",
-            request,
-            current_user,
-            status_code=400,
-            title="Account",
-            nav="account",
-            error=str(e),
-        )
+        return _render_account(request, current_user, status_code=400, error=str(e))
 
     response = _render_farm_page(
         "farm/login.html",
@@ -1893,4 +2328,5 @@ async def get_admin_panel(
         title="Admin",
         nav="admin",
         users=core.auth_manager.list_users(),
+        mfa_user_ids=mfa.users_with_second_factor(core.auth_manager.db),
     )

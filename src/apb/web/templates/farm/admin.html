@@ -22,6 +22,7 @@
 <th scope="col">Email</th>
 <th scope="col">Notifications</th>
 <th scope="col">Role</th>
+<th scope="col">2FA</th>
 <th scope="col">Created</th>
 <th scope="col">Last login</th>
 <th scope="col" class="js-only hidden">Actions</th>
@@ -35,12 +36,16 @@
 <td data-label="Email">{{ user.email or "none" }}</td>
 <td data-label="Notifications">{{ status_badge("enabled" if user.email_notifications_enabled else "disabled") }}</td>
 <td data-label="Role">{{ status_badge(user.role.value) }}</td>
+<td data-label="2FA">{{ status_badge("enabled" if user.id in mfa_user_ids else "disabled") }}</td>
 <td data-label="Created">{{ user.created_at | timestamp }}</td>
 <td data-label="Last login">{{ user.last_login | timestamp if user.last_login else "never" }}</td>
 <td data-label="Actions" class="js-only hidden">
 <button type="button" class="button-small" data-action="edit-user"
  data-user-id="{{ user.id }}" data-username="{{ user.username }}" data-role="{{ user.role.value }}"
  data-email="{{ user.email or '' }}" data-notifications="{{ 'true' if user.email_notifications_enabled else 'false' }}">Edit</button>
+{% if user.id != current_user.id and user.id in mfa_user_ids %}
+<button type="button" class="button-small" data-action="reset-mfa" data-user-id="{{ user.id }}" data-username="{{ user.username }}">Reset 2FA</button>
+{% endif %}
 {% if user.id != current_user.id %}
 <button type="button" class="button-small button-danger" data-action="delete-user" data-user-id="{{ user.id }}" data-username="{{ user.username }}">Delete</button>
 {% endif %}

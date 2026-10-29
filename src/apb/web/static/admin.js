@@ -266,6 +266,20 @@
     });
   }
 
+  function resetMfa(button) {
+    var username = button.getAttribute('data-username');
+    if (!window.confirm('Remove the authenticator app, security keys and recovery codes of "' + username + '" and log them out everywhere?')) {
+      return;
+    }
+    request('DELETE', '/auth/users/' + encodeURIComponent(button.getAttribute('data-user-id')) + '/2fa', null, function (error) {
+      if (error) {
+        window.alert('Failed to reset 2FA: ' + error);
+        return;
+      }
+      window.location.reload();
+    });
+  }
+
   // SMTP
 
   function smtpForm() {
@@ -549,6 +563,7 @@
   var actions = {
     'edit-user': editUser,
     'delete-user': deleteUser,
+    'reset-mfa': resetMfa,
     'reload-smtp': loadSmtp,
     'delete-smtp': deleteSmtp,
     'edit-repository': editRepository,

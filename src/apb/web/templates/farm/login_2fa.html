@@ -1,0 +1,52 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import csrf_field, messages %}
+{% block content %}
+{{ messages(error, success) }}
+{% if webauthn_options %}
+<section class="card js-only hidden">
+<h2>Security key</h2>
+<form class="form" method="post" action="/login/2fa" data-webauthn="get">
+{{ csrf_field(csrf_token) }}
+<input type="hidden" name="method" value="webauthn">
+<input type="hidden" name="credential" value="">
+<script type="application/json" class="webauthn-options">{{ webauthn_options | tojson }}</script>
+<p class="muted">Insert your security key and touch it when it blinks.</p>
+<p class="message" aria-live="polite"></p>
+<button type="submit" class="button-primary">Use security key</button>
+</form>
+</section>
+{% endif %}
+{% if "totp" in methods %}
+<section class="card">
+<h2>Authenticator app</h2>
+<form class="form" method="post" action="/login/2fa">
+{{ csrf_field(csrf_token) }}
+<input type="hidden" name="method" value="totp">
+<div class="field">
+<label for="code">Authentication code</label>
+<input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="8" autocomplete="one-time-code" required autofocus>
+</div>
+<button type="submit" class="button-primary">Verify</button>
+</form>
+</section>
+{% endif %}
+{% if "recovery" in methods %}
+<section class="card">
+<h2>Recovery code</h2>
+<form class="form" method="post" action="/login/2fa">
+{{ csrf_field(csrf_token) }}
+<input type="hidden" name="method" value="recovery">
+<div class="field">
+<label for="recovery-code">Recovery code</label>
+<input type="text" id="recovery-code" name="code" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="16" required>
+<span class="hint">Each recovery code works only once.</span>
+</div>
+<button type="submit">Use recovery code</button>
+</form>
+</section>
+{% endif %}
+<p><a href="/login">Back to login</a></p>
+{% endblock %}
+{% block scripts %}
+<script src="{{ static_url('webauthn.js') }}"></script>
+{% endblock %}

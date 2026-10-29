@@ -1,19 +1,63 @@
 """APB farm authentication client."""
 
+import getpass
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import httpx
+from fido2.client import ClientError, DefaultClientDataCollector, Fido2Client, UserInteraction
 
+from apb.constants import MFA_METHOD_RECOVERY, MFA_METHOD_TOTP, MFA_METHOD_WEBAUTHN
 from apb.http import create_sync_client
-from apb.models import LoginResponse, UserResponse
-from apb.upstream import upstream_url
+from apb.models import LoginResponse, MfaChallengeResponse, MfaSetupRequiredResponse, UserResponse
+from apb.upstream import upstream_url, webauthn_origin
 
 logger = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 30.0
+CLI_MFA_METHODS = {"totp": MFA_METHOD_TOTP, "key": MFA_METHOD_WEBAUTHN, "recovery": MFA_METHOD_RECOVERY}
+MFA_CODE_PROMPTS = {MFA_METHOD_TOTP: "Authentication code: ", MFA_METHOD_RECOVERY: "Recovery code: "}
+
+
+def _print_failure(prefix: str, response: httpx.Response) -> None:
+    try:
+        print(f"{prefix}: {response.json().get('detail', 'Unknown error')}")
+    except ValueError:
+        print(f"{prefix}: HTTP {response.status_code}")
+
+
+def find_security_keys() -> List[Any]:
+    """Connected FIDO2 HID devices; empty when none are present or HID access is unavailable."""
+    try:
+        from fido2.hid import CtapHidDevice
+
+        return list(CtapHidDevice.list_devices())
+    except Exception as e:
+        logger.debug(f"Could not list FIDO2 devices: {e}")
+        return []
+
+
+def choose_mfa_method(methods: Sequence[str], requested: Optional[str], has_security_key: bool) -> Optional[str]:
+    """Second factor to use: the requested one if enrolled, else a connected key, the authenticator app, recovery codes."""
+    if requested:
+        method = CLI_MFA_METHODS.get(requested)
+        return method if method in methods else None
+    if MFA_METHOD_WEBAUTHN in methods and has_security_key:
+        return MFA_METHOD_WEBAUTHN
+    for method in (MFA_METHOD_TOTP, MFA_METHOD_RECOVERY, MFA_METHOD_WEBAUTHN):
+        if method in methods:
+            return method
+    return None
+
+
+class _TerminalInteraction(UserInteraction):
+    def prompt_up(self) -> None:
+        print("Touch your security key...")
+
+    def request_pin(self, permissions, rp_id) -> Optional[str]:
+        return getpass.getpass("Security key PIN: ")
 
 class APBAuthClient:
     """Handles authentication for APB client"""
@@ -82,29 +126,85 @@ class APBAuthClient:
         with create_sync_client(timeout=AUTH_TIMEOUT) as client:
             return client.request(method, upstream_url(self.farm_url, path), **kwargs)
 
-    def login(self, username: str, password: str) -> bool:
-        """Login with username and password"""
+    def login(
+        self,
+        username: str,
+        password: str,
+        mfa_method: Optional[str] = None,
+        prompt: Callable[[str], str] = getpass.getpass,
+    ) -> bool:
+        """Login with username and password, completing two-factor authentication when required"""
         try:
             response = self._request(
                 "POST",
                 "/auth/login",
                 json={"username": username, "password": password},
             )
+            if response.status_code != 200:
+                _print_failure("Login failed", response)
+                return False
 
-            if response.status_code == 200:
-                login_response = LoginResponse.model_validate(response.json())
-                self._save_token(login_response.token)
-                print(f"Successfully logged in as {login_response.user.username}")
-                return True
-            try:
-                print(f"Login failed: {response.json().get('detail', 'Unknown error')}")
-            except ValueError:
-                print(f"Login failed: HTTP {response.status_code}")
-            return False
+            data = response.json()
+            if data.get("mfa_setup_required"):
+                setup = MfaSetupRequiredResponse.model_validate(data)
+                print("Two-factor authentication is required for admin accounts.")
+                print(f"Set up an authenticator app or security key in a browser first: {setup.setup_url}")
+                return False
+            if data.get("mfa_required"):
+                response = self._complete_mfa(MfaChallengeResponse.model_validate(data), mfa_method, prompt)
+                if response is None:
+                    return False
+                if response.status_code != 200:
+                    _print_failure("Two-factor authentication failed", response)
+                    return False
+                data = response.json()
+
+            login_response = LoginResponse.model_validate(data)
+            self._save_token(login_response.token)
+            print(f"Successfully logged in as {login_response.user.username}")
+            return True
 
         except Exception as e:
             print(f"Login error: {e}")
             return False
+
+    def _complete_mfa(
+        self, challenge: MfaChallengeResponse, mfa_method: Optional[str], prompt: Callable[[str], str]
+    ) -> Optional[httpx.Response]:
+        is_key_allowed = MFA_METHOD_WEBAUTHN in challenge.methods and mfa_method in (None, "key")
+        devices = find_security_keys() if is_key_allowed else []
+        method = choose_mfa_method(challenge.methods, mfa_method, bool(devices))
+        if not method:
+            print(f"Two-factor method '{mfa_method}' is not set up for this account (available: {', '.join(challenge.methods)})")
+            return None
+
+        if method == MFA_METHOD_WEBAUTHN:
+            credential = self._security_key_assertion(challenge.mfa_token, devices)
+            if credential is None:
+                return None
+            payload = {"credential": credential}
+        else:
+            payload = {"code": prompt(MFA_CODE_PROMPTS[method]).strip()}
+        return self._request("POST", "/auth/login/2fa", json={"mfa_token": challenge.mfa_token, "method": method, **payload})
+
+    def _security_key_assertion(self, mfa_token: str, devices: List[Any]) -> Optional[Dict[str, Any]]:
+        if not devices:
+            print("No FIDO2 security key found. Connect it, or use --2fa-method totp or --2fa-method recovery.")
+            return None
+        response = self._request("POST", "/auth/login/2fa/webauthn-options", json={"mfa_token": mfa_token})
+        if response.status_code != 200:
+            _print_failure("Security key login failed", response)
+            return None
+
+        client = Fido2Client(
+            devices[0], DefaultClientDataCollector(webauthn_origin(self.farm_url)), user_interaction=_TerminalInteraction()
+        )
+        try:
+            assertion = client.get_assertion(response.json()["publicKey"])
+            return dict(assertion.get_response(0))
+        except ClientError as e:
+            print(f"Security key error: {e}")
+            return None
 
     def logout(self) -> bool:
         """Logout (revoke current token)"""

@@ -23,7 +23,7 @@ from apb.models import BuildStatusResponse, BuildSubmitResponse, FarmBuildSubmit
 from apb.upstream import upstream_url
 
 from apb.client.api import APBotClient, BuildRejectedError
-from apb.client.auth import APBAuthClient
+from apb.client.auth import CLI_MFA_METHODS, APBAuthClient
 from apb.client.helpers import (
     effective_any_server_arch,
     get_architectures_needing_build,
@@ -770,6 +770,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--logout", action="store_true", help="Logout from farm")
     parser.add_argument("--auth-status", action="store_true", help="Show authentication status")
     parser.add_argument("--username", type=str, help="Username for login")
+    parser.add_argument("--2fa-method", dest="mfa_method", choices=sorted(CLI_MFA_METHODS),
+                       help="Second factor for --login (default: connected security key, then authenticator code)")
 
     # Build options
     parser.add_argument("--output-dir", type=Path, default=Path("./output"),
@@ -855,7 +857,7 @@ def run_login(ctx: CliContext) -> int:
 
     username = ctx.args.username or input("Username: ")
     password = getpass.getpass("Password: ")
-    if not ctx.auth_client.login(username, password):
+    if not ctx.auth_client.login(username, password, mfa_method=ctx.args.mfa_method):
         print("Login failed!")
         return 1
 

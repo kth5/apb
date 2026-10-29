@@ -40,8 +40,17 @@ from apb.constants import (
     USER_ROLE,
     BuildStatus,
 )
+from apb.farm import mfa
 from apb.http import create_async_client
-from apb.models import BuildListResponse, BuildSummary, UserResponse
+from apb.models import (
+    BuildListResponse,
+    BuildSummary,
+    LoginResponse,
+    MfaChallengeResponse,
+    MfaEnrollResponse,
+    MfaSetupRequiredResponse,
+    UserResponse,
+)
 from apb.pkgbuild import parse_pkgbuild, pkgbuild_arch_is_any_only
 from apb.tarball import create_build_tarball
 from apb.upstream import (
@@ -116,6 +125,7 @@ def user_response(user: User) -> UserResponse:
         last_login=user.last_login,
         email=user.email,
         email_notifications_enabled=user.email_notifications_enabled,
+        mfa_enabled=bool(auth_manager and mfa.has_second_factor(auth_manager.db, user.id)),
     )
 
 
@@ -188,9 +198,23 @@ server_status_tracker: Dict[str, ServerStatus] = {}
 auth_manager = None
 
 
+TOKEN_SCOPE_LIFETIMES = {
+    mfa.TOKEN_SCOPE_FULL: TOKEN_EXPIRY_DAYS * 24 * 3600,
+    mfa.TOKEN_SCOPE_MFA_PENDING: mfa.MFA_PENDING_TTL_SECONDS,
+    mfa.TOKEN_SCOPE_MFA_SETUP: mfa.MFA_SETUP_TTL_SECONDS,
+}
+ENROLLMENT_SCOPES = (mfa.TOKEN_SCOPE_FULL, mfa.TOKEN_SCOPE_MFA_SETUP)
+MFA_SETUP_PATH = "/account/2fa"
+
+
+def public_farm_url() -> str:
+    """The configured public farm_url (also the WebAuthn origin)."""
+    return config.get("farm_url", DEFAULT_FARM_URL)
+
+
 def farm_page_url(path: str) -> str:
     """Public farm URL for path, based on the configured farm_url."""
-    return upstream_url(config.get("farm_url", DEFAULT_FARM_URL), path)
+    return upstream_url(public_farm_url(), path)
 
 
 class AuthManager:
@@ -288,12 +312,18 @@ class AuthManager:
                 )
             ''')
 
-            # Add user_id column to builds table if it doesn't exist
-            try:
-                self.db.execute('ALTER TABLE builds ADD COLUMN user_id INTEGER')
-                self.db.commit()
-            except sqlite3.OperationalError:
-                pass  # Column already exists
+            for migration in (
+                'ALTER TABLE builds ADD COLUMN user_id INTEGER',
+                f"ALTER TABLE tokens ADD COLUMN scope TEXT NOT NULL DEFAULT '{mfa.TOKEN_SCOPE_FULL}'",
+                'ALTER TABLE tokens ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0',
+            ):
+                try:
+                    self.db.execute(migration)
+                    self.db.commit()
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
+            mfa.init_tables(self.db)
 
             # Create indexes for performance
             self.db.execute('CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)')
@@ -342,7 +372,7 @@ class AuthManager:
 
     def _hash_token(self, token: str) -> str:
         """Hash token for storage"""
-        return hashlib.sha256(token.encode()).hexdigest()
+        return mfa.sha256_hex(token)
 
     def create_user(self, username: str, password: str, role: UserRole = UserRole.USER, email: Optional[str] = None) -> User:
         """Create a new user"""
@@ -414,25 +444,30 @@ class AuthManager:
             email_notifications_enabled=bool(email_notifications_enabled)
         )
 
-    def create_token(self, user: User) -> str:
+    def create_token(self, user: User, scope: str = mfa.TOKEN_SCOPE_FULL) -> str:
         """Create a new authentication token for user"""
         token = self._generate_token()
         token_hash = self._hash_token(token)
         current_time = time.time()
-        expires_at = current_time + (TOKEN_EXPIRY_DAYS * 24 * 3600)
+        expires_at = current_time + TOKEN_SCOPE_LIFETIMES[scope]
 
         cursor = self.db.cursor()
         cursor.execute('''
-            INSERT INTO tokens (token_hash, user_id, created_at, last_used_at, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (token_hash, user.id, current_time, current_time, expires_at))
+            INSERT INTO tokens (token_hash, user_id, created_at, last_used_at, expires_at, scope)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (token_hash, user.id, current_time, current_time, expires_at, scope))
         self.db.commit()
 
-        logger.info(f"Created token for user '{user.username}'")
+        logger.info(f"Created {scope} token for user '{user.username}'")
         return token
 
-    def validate_token(self, token: str) -> Optional[User]:
-        """Validate token and return associated user if valid"""
+    def validate_token(self, token: str, scopes: Tuple[str, ...] = (mfa.TOKEN_SCOPE_FULL,)) -> Optional[User]:
+        """Validate token and return associated user if valid and of one of the given scopes"""
+        session = self.validate_session(token, scopes)
+        return session[0] if session else None
+
+    def validate_session(self, token: str, scopes: Tuple[str, ...] = (mfa.TOKEN_SCOPE_FULL,)) -> Optional[Tuple[User, str]]:
+        """Validate token and return (user, scope); only full tokens get the sliding renewal"""
         if not token:
             return None
 
@@ -442,7 +477,7 @@ class AuthManager:
         cursor = self.db.cursor()
         cursor.execute('''
             SELECT t.user_id, t.expires_at, u.username, u.role, u.created_at, u.last_login,
-                   u.email, u.email_notifications_enabled
+                   u.email, u.email_notifications_enabled, t.scope
             FROM tokens t
             JOIN users u ON t.user_id = u.id
             WHERE t.token_hash = ? AND t.is_active = 1 AND u.is_active = 1
@@ -452,7 +487,9 @@ class AuthManager:
         if not row:
             return None
 
-        user_id, expires_at, username, role, created_at, last_login, email, email_notifications_enabled = row
+        user_id, expires_at, username, role, created_at, last_login, email, email_notifications_enabled, scope = row
+        if scope not in scopes:
+            return None
 
         # Check if token has expired
         if current_time > expires_at:
@@ -461,14 +498,14 @@ class AuthManager:
             self.db.commit()
             return None
 
-        # Update last used time and extend expiration
-        new_expires_at = current_time + (TOKEN_EXPIRY_DAYS * 24 * 3600)
-        cursor.execute('''
-            UPDATE tokens SET last_used_at = ?, expires_at = ? WHERE token_hash = ?
-        ''', (current_time, new_expires_at, token_hash))
-        self.db.commit()
+        if scope == mfa.TOKEN_SCOPE_FULL:
+            new_expires_at = current_time + TOKEN_SCOPE_LIFETIMES[scope]
+            cursor.execute('''
+                UPDATE tokens SET last_used_at = ?, expires_at = ? WHERE token_hash = ?
+            ''', (current_time, new_expires_at, token_hash))
+            self.db.commit()
 
-        return User(
+        user = User(
             id=user_id,
             username=username,
             role=UserRole(role),
@@ -477,6 +514,7 @@ class AuthManager:
             email=email,
             email_notifications_enabled=bool(email_notifications_enabled)
         )
+        return user, scope
 
     def revoke_token(self, token: str) -> bool:
         """Revoke a specific token"""
@@ -485,6 +523,17 @@ class AuthManager:
         cursor.execute('UPDATE tokens SET is_active = 0 WHERE token_hash = ?', (token_hash,))
         self.db.commit()
         return cursor.rowcount > 0
+
+    def record_failed_mfa_attempt(self, token: str) -> bool:
+        """Count a failed second factor; revokes the pending token after MFA_MAX_ATTEMPTS. Returns whether it is still usable."""
+        token_hash = self._hash_token(token)
+        self.db.execute('UPDATE tokens SET attempts = attempts + 1 WHERE token_hash = ?', (token_hash,))
+        self.db.execute(
+            'UPDATE tokens SET is_active = 0 WHERE token_hash = ? AND attempts >= ?', (token_hash, mfa.MFA_MAX_ATTEMPTS)
+        )
+        self.db.commit()
+        row = self.db.execute('SELECT is_active FROM tokens WHERE token_hash = ?', (token_hash,)).fetchone()
+        return bool(row and row[0])
 
     def revoke_user_tokens(self, user_id: int) -> int:
         """Revoke all tokens for a user"""
@@ -561,12 +610,15 @@ class AuthManager:
         return cursor.rowcount > 0
 
     def change_user_role(self, user_id: int, new_role: UserRole) -> bool:
-        """Change user role"""
+        """Change user role; a new admin without 2FA is logged out everywhere so the next login enrolls one"""
         cursor = self.db.cursor()
         cursor.execute('UPDATE users SET role = ? WHERE id = ? AND is_active = 1',
                       (new_role.value, user_id))
         self.db.commit()
-        return cursor.rowcount > 0
+        is_changed = cursor.rowcount > 0
+        if is_changed and new_role == UserRole.ADMIN and not mfa.has_second_factor(self.db, user_id):
+            self.revoke_user_tokens(user_id)
+        return is_changed
 
     def update_user_email(self, user_id: int, email: Optional[str]) -> bool:
         """Update user email address"""
@@ -608,25 +660,21 @@ class AuthManager:
 
         return row and row[0] == user.id
 
+    def verify_user_password(self, user_id: int, password: str) -> bool:
+        """Check the password of an active user"""
+        row = self.db.execute('SELECT password_hash FROM users WHERE id = ? AND is_active = 1', (user_id,)).fetchone()
+        return bool(row and self._verify_password(password, row[0]))
+
     def change_password(self, user_id: int, current_password: str, new_password: str) -> bool:
         """Change user password after verifying current password"""
-        cursor = self.db.cursor()
-        cursor.execute('SELECT password_hash FROM users WHERE id = ? AND is_active = 1', (user_id,))
-        row = cursor.fetchone()
-
-        if not row:
-            return False
-
-        stored_hash = row[0]
-
-        # Verify current password
-        if not self._verify_password(current_password, stored_hash):
+        if not self.verify_user_password(user_id, current_password):
             return False
 
         # Hash new password
         new_password_hash = self._hash_password(new_password)
 
         # Update password
+        cursor = self.db.cursor()
         cursor.execute('UPDATE users SET password_hash = ? WHERE id = ?', (new_password_hash, user_id))
         self.db.commit()
 
@@ -758,7 +806,8 @@ class AuthManager:
         subject_map = {
             'created': f'Your APB Farm account has been created',
             'updated': f'Your APB Farm account has been updated',
-            'deleted': f'Your APB Farm account has been deleted'
+            'deleted': f'Your APB Farm account has been deleted',
+            'mfa_reset': 'Your APB Farm two-factor authentication has been reset'
         }
 
         body_map = {
@@ -789,6 +838,14 @@ Your APB Farm account has been deleted by administrator {admin_user}.
 If you believe this was done in error, please contact your administrator.
 
 Dashboard URL: {dashboard_url}
+
+Best regards,
+APB Farm System""",
+            'mfa_reset': f"""Hello {username},
+
+Administrator {admin_user} removed the authenticator app, security keys and recovery codes from your APB Farm account, and all of your sessions were ended.
+
+You can set up two-factor authentication again at {farm_page_url(MFA_SETUP_PATH)}. If you did not ask for this, please contact your administrator.
 
 Best regards,
 APB Farm System"""
@@ -937,6 +994,7 @@ def finish_build(build_id: str, status: str, build_status: Optional[Dict] = None
 
 
 AUTH_COOKIE_NAME = "authToken"
+MFA_COOKIE_NAME = "apbMfa"
 CSRF_FORM_FIELD = "csrf_token"
 CSRF_HEADER = "X-CSRF-Token"
 CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -985,30 +1043,178 @@ def change_user_password(user: User, current_password: str, new_password: str, c
     auth_manager.revoke_user_tokens(user.id)
 
 
+LoginResult = Union[LoginResponse, MfaChallengeResponse, MfaSetupRequiredResponse]
+
+
+def start_login(user: User) -> LoginResult:
+    """After the password step: a session, a pending 2FA login, or (admins without 2FA) an enrollment session."""
+    db = auth_manager.db
+    if mfa.has_second_factor(db, user.id):
+        return MfaChallengeResponse(
+            mfa_token=auth_manager.create_token(user, mfa.TOKEN_SCOPE_MFA_PENDING),
+            methods=mfa.available_methods(db, user.id),
+            expires_in_seconds=mfa.MFA_PENDING_TTL_SECONDS,
+        )
+    if user.role == UserRole.ADMIN:
+        return MfaSetupRequiredResponse(
+            setup_token=auth_manager.create_token(user, mfa.TOKEN_SCOPE_MFA_SETUP),
+            setup_url=farm_page_url(MFA_SETUP_PATH),
+            expires_in_seconds=mfa.MFA_SETUP_TTL_SECONDS,
+        )
+    return LoginResponse(token=auth_manager.create_token(user), user=user_response(user))
+
+
+def pending_login_user(mfa_token: Optional[str]) -> User:
+    user = auth_manager.validate_token(mfa_token, (mfa.TOKEN_SCOPE_MFA_PENDING,)) if mfa_token else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired 2FA login; please log in again")
+    return user
+
+
+def mfa_login_options(mfa_token: str) -> Dict[str, Any]:
+    """WebAuthn request options for a pending 2FA login."""
+    user = pending_login_user(mfa_token)
+    try:
+        return mfa.authentication_options(auth_manager.db, public_farm_url(), mfa_token, user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def complete_mfa_login(
+    mfa_token: str, method: str, code: Optional[str] = None, credential: Optional[Dict[str, Any]] = None
+) -> LoginResponse:
+    """Exchange a pending 2FA login and a valid second factor for a session token."""
+    user = pending_login_user(mfa_token)
+    db = auth_manager.db
+    if method not in mfa.available_methods(db, user.id):
+        raise HTTPException(status_code=400, detail=f"2FA method '{method}' is not enabled for this account")
+    if (credential if method == mfa.METHOD_WEBAUTHN else code) is None:
+        raise HTTPException(status_code=400, detail="Missing security key response" if method == mfa.METHOD_WEBAUTHN else "Missing code")
+    if not mfa.verify_second_factor(db, public_farm_url(), mfa_token, user.id, method, code, credential):
+        auth_manager.record_failed_mfa_attempt(mfa_token)
+        logger.warning(f"Failed {method} second factor for user '{user.username}'")
+        raise HTTPException(status_code=401, detail="Invalid code or security key response")
+    auth_manager.revoke_token(mfa_token)
+    logger.info(f"User '{user.username}' logged in with {method}")
+    return LoginResponse(token=auth_manager.create_token(user), user=user_response(user))
+
+
+def finish_enrollment(session: AuthSession, had_second_factor: bool, message: str) -> MfaEnrollResponse:
+    """Hand out recovery codes for the first factor and upgrade an enrollment session to a full one."""
+    recovery_codes = None if had_second_factor else mfa.generate_recovery_codes(auth_manager.db, session.user.id)
+    token = None
+    if session.scope == mfa.TOKEN_SCOPE_MFA_SETUP:
+        auth_manager.revoke_token(session.token)
+        token = auth_manager.create_token(session.user)
+    return MfaEnrollResponse(message=message, recovery_codes=recovery_codes, token=token)
+
+
+def confirm_totp_enrollment(session: AuthSession, code: str) -> MfaEnrollResponse:
+    db = auth_manager.db
+    had_second_factor = mfa.has_second_factor(db, session.user.id)
+    if not mfa.pending_totp_secret(db, session.user.id):
+        raise ValueError("No authenticator app setup in progress")
+    if not mfa.verify_totp(db, session.user.id, code, confirm=True):
+        raise ValueError("Invalid code; check the time on your device and try again")
+    return finish_enrollment(session, had_second_factor, "Authenticator app enabled")
+
+
+def register_security_key(session: AuthSession, name: str, credential: Dict[str, Any]) -> MfaEnrollResponse:
+    db = auth_manager.db
+    had_second_factor = mfa.has_second_factor(db, session.user.id)
+    mfa.register_security_key(db, public_farm_url(), session.token, session.user.id, name, credential)
+    return finish_enrollment(session, had_second_factor, "Security key registered")
+
+
+def _require_password(user: User, password: str) -> None:
+    if not auth_manager.verify_user_password(user.id, password):
+        raise ValueError("Password is incorrect")
+
+
+def remove_second_factor(user: User, password: str, key_id: Optional[int] = None) -> str:
+    """Remove the authenticator app (key_id None) or a security key; raises ValueError, or LookupError for unknown keys."""
+    db = auth_manager.db
+    _require_password(user, password)
+    if key_id is None and not mfa.is_totp_enabled(db, user.id):
+        raise ValueError("Authenticator app is not enabled")
+    if key_id is not None and not mfa.has_security_key(db, user.id, key_id):
+        raise LookupError("Security key not found")
+    mfa.ensure_can_remove_factor(db, user.id, user.role == UserRole.ADMIN)
+    if key_id is None:
+        mfa.remove_totp(db, user.id)
+    else:
+        mfa.remove_security_key(db, user.id, key_id)
+    mfa.after_factor_removed(db, user.id)
+    return "Authenticator app removed" if key_id is None else "Security key removed"
+
+
+def regenerate_recovery_codes(user: User, password: str) -> List[str]:
+    _require_password(user, password)
+    if not mfa.has_second_factor(auth_manager.db, user.id):
+        raise ValueError("Two-factor authentication is not enabled")
+    return mfa.generate_recovery_codes(auth_manager.db, user.id)
+
+
+def reset_user_mfa(user_id: int) -> None:
+    """Admin reset: remove all second factors and end all sessions of the user."""
+    mfa.reset_user_mfa(auth_manager.db, user_id)
+    auth_manager.revoke_user_tokens(user_id)
+
+
+@dataclass
+class AuthSession:
+    user: User
+    scope: str
+    token: str
+
+
+async def get_auth_session(
+    credentials: Optional[HTTPAuthorizationCredentials],
+    request: Optional[Request],
+    scopes: Tuple[str, ...] = (mfa.TOKEN_SCOPE_FULL,),
+) -> Optional[AuthSession]:
+    """Session from the Bearer token or the auth cookie, limited to the given token scopes.
+
+    Cookie-authenticated requests that change state must carry a CSRF token.
+    """
+    if not auth_manager:
+        return None
+
+    is_bearer = bool(credentials and credentials.credentials)
+    token = credentials.credentials if is_bearer else session_token(request)
+    validated = auth_manager.validate_session(token, scopes) if token else None
+    if not validated:
+        return None
+
+    if not is_bearer and request.method not in CSRF_SAFE_METHODS:
+        await require_csrf(request, token)
+    return AuthSession(*validated, token)
+
+
 # FastAPI Dependencies
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
     request: Request = None
 ) -> Optional[User]:
-    """Get current authenticated user from token (header or cookie).
+    """Get current authenticated user from a full token (header or cookie)."""
+    session = await get_auth_session(credentials, request)
+    return session.user if session else None
 
-    Cookie-authenticated requests that change state must carry a CSRF token.
-    """
-    global auth_manager
-    if not auth_manager:
-        return None
 
-    if credentials and credentials.credentials:
-        return auth_manager.validate_token(credentials.credentials)
+async def get_enrollment_session_optional(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+) -> Optional[AuthSession]:
+    """Full session, or the enrollment-only session of an admin without 2FA."""
+    return await get_auth_session(credentials, request, ENROLLMENT_SCOPES)
 
-    token = session_token(request)
-    if not token:
-        return None
 
-    user = auth_manager.validate_token(token)
-    if user and request.method not in CSRF_SAFE_METHODS:
-        await require_csrf(request, token)
-    return user
+async def require_enrollment_session(
+    session: Optional[AuthSession] = Depends(get_enrollment_session_optional),
+) -> AuthSession:
+    if not session:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return session
 
 
 async def require_auth(

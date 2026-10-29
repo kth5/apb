@@ -14,6 +14,9 @@ depends=(
   'python-httpx'
   'python-jinja'
   'python-multipart'
+  'python-pyotp'
+  'python-fido2'
+  'python-segno'
 )
 makedepends=(
   'python-build'

@@ -15,9 +15,9 @@ from apb.multipart_compat import install_multipart_compat
 install_multipart_compat()
 
 from apb.farm import core
-from apb.farm import routes as farm_routes
 from apb.server import routes as server_routes
 from apb.web import STATIC_CACHE_CONTROL, mount_static
+from mfa_support import api_token, enroll_totp, web_login
 
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
@@ -38,18 +38,12 @@ def _insert_build(db, *, pkgname: str, status: str, user_id: int = 1) -> str:
     return build_id
 
 
-@pytest.fixture
-def farm_client(monkeypatch: pytest.MonkeyPatch):
-    db = core.init_database(":memory:")
-    monkeypatch.setattr(core, "build_database", db)
-    monkeypatch.setattr(core, "auth_manager", core.AuthManager(db))
-    monkeypatch.setattr(core, "config", {"servers": {}})
-    app = FastAPI()
-    mount_static(app)
-    app.include_router(farm_routes.router)
-    with TestClient(app) as client:
-        yield client
-    db.close()
+@pytest.fixture(autouse=True)
+def admin_totp(request: pytest.FixtureRequest):
+    """Admins must use 2FA; give the default admin an authenticator app for farm tests."""
+    if "farm_client" in request.fixturenames:
+        request.getfixturevalue("farm_client")
+        enroll_totp(core.auth_manager.db, 1)
 
 
 @pytest.fixture
@@ -64,7 +58,7 @@ def server_client(monkeypatch: pytest.MonkeyPatch, tmp_path):
 
 
 def _login(client: TestClient, username: str = ADMIN_USERNAME, password: str = ADMIN_PASSWORD):
-    return client.post("/login", data={"username": username, "password": password}, follow_redirects=False)
+    return web_login(client, core.auth_manager.db, username, password)
 
 
 def _csrf_token(client: TestClient) -> str:
@@ -229,7 +223,7 @@ def test_cookie_post_without_csrf_is_rejected(farm_client: TestClient):
 
 
 def test_bearer_requests_skip_csrf(farm_client: TestClient):
-    token = farm_client.post("/auth/login", json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD}).json()["token"]
+    token = api_token(farm_client, core.auth_manager.db, ADMIN_USERNAME, ADMIN_PASSWORD)
 
     response = farm_client.post(
         "/admin/repositories",

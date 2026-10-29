@@ -39,6 +39,32 @@ def farm_db(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
+def farm_client(monkeypatch: pytest.MonkeyPatch):
+    """TestClient for the farm routes on a fresh in-memory database (default admin/admin123, no 2FA)."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from apb.multipart_compat import install_multipart_compat
+
+    install_multipart_compat()
+
+    from apb.farm import core
+    from apb.farm import routes as farm_routes
+    from apb.web import mount_static
+
+    db = core.init_database(":memory:")
+    monkeypatch.setattr(core, "build_database", db)
+    monkeypatch.setattr(core, "auth_manager", core.AuthManager(db))
+    monkeypatch.setattr(core, "config", {"servers": {}, "farm_url": "http://localhost:8080"})
+    app = FastAPI()
+    mount_static(app)
+    app.include_router(farm_routes.router)
+    with TestClient(app) as client:
+        yield client
+    db.close()
+
+
+@pytest.fixture
 def farm_queue_state(farm_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     """farm_db plus an empty farm build queue and a fresh shutdown event."""
     from apb.farm import core
@@ -272,8 +298,27 @@ def login_farm_user(farm_url: str, auth_path: Path, username: str = "admin", pas
         timeout=30.0,
     )
     response.raise_for_status()
-    auth_client._save_token(response.json()["token"])
+    data = response.json()
+    if data.get("mfa_setup_required"):
+        data = _enroll_admin_totp(farm_url, data["setup_token"])
+    auth_client._save_token(data["token"])
     return auth_client
+
+
+def _enroll_admin_totp(farm_url: str, setup_token: str) -> dict:
+    """Admins must use 2FA: enroll an authenticator app with the setup token and return the upgraded session."""
+    import pyotp
+
+    headers = {"Authorization": f"Bearer {setup_token}"}
+    secret = httpx.post(f"{farm_url}/auth/my/2fa/totp", headers=headers, timeout=30.0).json()["secret"]
+    response = httpx.post(
+        f"{farm_url}/auth/my/2fa/totp/confirm",
+        headers=headers,
+        json={"code": pyotp.TOTP(secret).now()},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 @dataclass

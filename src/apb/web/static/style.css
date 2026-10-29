@@ -242,6 +242,14 @@ button[disabled] { opacity: 0.55; cursor: not-allowed; }
   z-index: 21;
 }
 .hidden { display: none !important; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* Two-factor authentication */
+.qr-code { display: inline-block; padding: 0.5rem; background: #ffffff; line-height: 0; }
+.qr-code svg { width: 14rem; height: auto; max-width: 100%; }
+.totp-secret { word-break: break-all; }
+.recovery-codes { list-style: none; padding: 0; columns: 2; }
+.recovery-codes li { margin: 0.2rem 0; }
 
 /* Admin section anchors */
 .section-nav { margin: 0 0 1.5rem; }

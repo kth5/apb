@@ -5,9 +5,11 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Iterator, Optional, Union
+from urllib.parse import urlparse
 
 import httpx
 
+DEFAULT_PORTS = {"http": 80, "https": 443}
 BUILD_SUBMIT_PATH = "/build"
 BUILDS_LATEST_PATH = "/builds/latest"
 ADMIN_CLEANUP_PATH = "/admin/cleanup"
@@ -17,6 +19,14 @@ DOWNLOAD_CHUNK_SIZE = 64 * 1024
 def upstream_url(base_url: str, path: str) -> str:
     """Join a base URL (which may carry a path prefix) with an absolute endpoint path."""
     return f"{base_url.rstrip('/')}{path}"
+
+
+def webauthn_origin(base_url: str) -> str:
+    """WebAuthn origin of a URL as browsers report it: scheme://host[:port], without path or default port."""
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "localhost"
+    is_default_port = parsed.port in (None, DEFAULT_PORTS.get(parsed.scheme))
+    return f"{parsed.scheme}://{host}" if is_default_port else f"{parsed.scheme}://{host}:{parsed.port}"
 
 
 def build_status_page_path(build_id: str) -> str:

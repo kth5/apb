@@ -25,6 +25,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Progressive live updates (`/static/apb.js`, ES5): unfinished build status pages and the dashboard servers tab reload only their status section in place, one request at a time, paused while the browser tab is hidden and backing off after errors; without JavaScript, build status pages fall back to a `<noscript>` meta refresh
 - Admin panel can edit and enable/disable custom repositories (the edit button used to call an undefined function)
 - `tests/test_web_ui.py` covering page rendering, HTML escaping, the no-JS login, logout and password change flows, and CSRF rejection
+- Two-factor authentication for farm logins with TOTP authenticator apps and WebAuthn security keys (YubiKey and other FIDO2/U2F keys), implemented in the new `apb.farm.mfa` module (`pyotp`, `fido2` and `segno` are new dependencies)
+- Farm 2FA JSON endpoints: `POST /auth/login/2fa`, `POST /auth/login/2fa/webauthn-options`, `GET /auth/my/2fa`, `POST /auth/my/2fa/totp`, `POST /auth/my/2fa/totp/confirm`, `DELETE /auth/my/2fa/totp`, `POST /auth/my/2fa/webauthn/register-options`, `POST /auth/my/2fa/webauthn`, `DELETE /auth/my/2fa/webauthn/{credential_id}` and `POST /auth/my/2fa/recovery-codes`
+- Ten single-use recovery codes, shown once when the first second factor is enrolled and regenerable with the account password
+- Admin endpoint `DELETE /auth/users/{user_id}/2fa` and a "Reset 2FA" button in the admin panel to remove a user's second factors, plus a 2FA column in the admin user list and `mfa_enabled` in user responses
+- Farm web pages `GET`/`POST /login/2fa` (authenticator code, recovery code or security key) and `/account/2fa` (QR code enrollment, security key registration and removal, recovery code regeneration); `/static/webauthn.js` drives the browser security key prompts
+- `apb --farm --login` asks for the authenticator or recovery code, or uses a connected FIDO2 security key through `python-fido2`; `--2fa-method totp|key|recovery` overrides the automatic choice
+- `nginx-apb-farm.conf` passes the new 2FA endpoints and pages through to the farm with their allowed methods
+- `tests/test_farm_mfa.py` covering TOTP, recovery codes, security keys, pending login limits, forced admin enrollment and admin reset
 
 ### Changed
 
@@ -34,6 +42,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Admin panel sections are reachable through in-page links instead of JS tabs; `/static/admin.js` is ES5 (`XMLHttpRequest`, event delegation, `textContent`) and authenticates with the session cookie plus CSRF header
 - Web login sets the `authToken` cookie server-side with `HttpOnly`, `SameSite=Lax` and `Secure` on HTTPS
 - `PUT /auth/change-password` and `POST /account/password` share one `core.change_user_password` helper
+- **Breaking:** `POST /auth/login` returns `{"mfa_required": true, "mfa_token": ...}` instead of a session token for users with 2FA, and `{"mfa_setup_required": true, "setup_token": ...}` for admins without 2FA. Users without 2FA get the same response as before
+- **Breaking:** admins must use two-factor authentication. An admin without a second factor (including the default `admin` account) only gets a 15-minute enrollment session after the password step, and promoting a user without 2FA to admin ends all of their sessions
+- Farm tokens have a `scope` (`full`, `mfa_pending` or `mfa_setup`); only `full` tokens authenticate normal requests and get the sliding 10-day renewal
 
 - Farm default host, port and config search paths now come from `apb.constants` (`FARM_DEFAULT_HOST`, `FARM_DEFAULT_PORT`, `DEFAULT_CONFIG_PATHS`) instead of duplicated definitions in `farm/core.py`
 - Build timeout bounds and default (300, 14400 and 7200 seconds) come from `BUILD_TIMEOUT_MIN`, `BUILD_TIMEOUT_MAX` and `BUILD_TIMEOUT_DEFAULT` in `apb.constants` on server, farm and client
@@ -103,6 +114,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Farm strips directory components from legacy individual-file source filenames before writing them, and the client strips them from download filenames, so crafted names such as `../x` cannot write outside the target directory
 - HTML pages escape all dynamic values. Usernames, package names, versions, repository data, file contents and the build ID from the URL were inserted unescaped (including into inline `onclick` handlers), which allowed stored and reflected XSS
 - Cookie-authenticated state-changing requests require a CSRF token, and the session cookie is `HttpOnly`, so page scripts can no longer read the token
+- Second-factor logins are limited to 5 attempts per 5-minute pending login, TOTP codes cannot be replayed, and security key sign counters are checked to detect cloned keys
 
 ## 2026.08.06
 

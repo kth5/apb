@@ -1,0 +1,24 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import csrf_field, messages %}
+{% block content %}
+{{ messages(error, success) }}
+<section class="card">
+<h2>Scan the QR code</h2>
+<p>Scan this code with your authenticator app, or enter the secret manually.</p>
+<div class="qr-code">{{ qr_svg }}</div>
+<p>Secret: <code class="totp-secret">{{ secret }}</code></p>
+<p class="muted small">Account: {{ current_user.username }}, 6 digits, 30 seconds, SHA-1</p>
+</section>
+<section class="card">
+<h2>Confirm</h2>
+<form class="form" method="post" action="/account/2fa/totp/confirm">
+{{ csrf_field(csrf_token) }}
+<div class="field">
+<label for="code">Code from the app</label>
+<input type="text" id="code" name="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="8" autocomplete="one-time-code" required autofocus>
+</div>
+<button type="submit" class="button-primary">Enable authenticator app</button>
+</form>
+</section>
+<p><a href="/account/2fa">Cancel</a></p>
+{% endblock %}

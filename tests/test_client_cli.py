@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from apb.arch import KNOWN_PACKAGE_ARCH_SUFFIXES
 from apb.client import cli
-from apb.client.auth import APBAuthClient
+from apb.client.auth import APBAuthClient, choose_mfa_method
+from mfa_support import SoftSecurityKey, enroll_totp, fresh_totp_code
 from apb.constants import BuildStatus
 from apb.models import BuildSubmitResponse
 
@@ -173,3 +176,85 @@ def test_auth_client_keeps_url_prefix(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert str(requests[0].url) == "http://farm/apb/auth/login"
     assert json.loads(auth_path.read_text())["tokens"]["http://farm/apb"] == "secret"
     assert auth_client.get_auth_headers() == {"Authorization": "Bearer secret"}
+
+
+@pytest.mark.parametrize(
+    ("methods", "requested", "has_key", "expected"),
+    [
+        (["webauthn", "totp", "recovery"], None, True, "webauthn"),
+        (["webauthn", "totp", "recovery"], None, False, "totp"),
+        (["webauthn", "recovery"], None, False, "recovery"),
+        (["webauthn"], None, False, "webauthn"),
+        (["webauthn", "totp"], "totp", True, "totp"),
+        (["totp"], "key", False, None),
+        (["totp", "recovery"], "recovery", False, "recovery"),
+    ],
+)
+def test_choose_mfa_method(methods, requested, has_key, expected) -> None:
+    assert choose_mfa_method(methods, requested, has_key) == expected
+
+
+def test_parse_args_2fa_method() -> None:
+    assert cli.parse_args(["--login", "--2fa-method", "key"]).mfa_method == "key"
+    assert cli.parse_args(["--login"]).mfa_method is None
+
+
+@pytest.fixture
+def farm_auth_client(farm_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> APBAuthClient:
+    """APBAuthClient talking to the in-process farm app at its configured farm_url."""
+    monkeypatch.setattr("apb.client.auth.create_sync_client", lambda **_kwargs: contextlib.nullcontext(farm_client))
+    return APBAuthClient("http://localhost:8080", config_path=tmp_path / "auth.json")
+
+
+def test_auth_client_login_with_totp(farm_auth_client: APBAuthClient) -> None:
+    from apb.farm import core
+
+    db = core.auth_manager.db
+    user = core.auth_manager.create_user("bob", "password123", core.UserRole.USER)
+    enroll_totp(db, user.id)
+    prompts = []
+
+    def prompt(label: str) -> str:
+        prompts.append(label)
+        return fresh_totp_code(db, user.id)
+
+    assert farm_auth_client.login("bob", "password123", prompt=prompt) is True
+    assert prompts == ["Authentication code: "]
+    assert farm_auth_client.get_user_info()["mfa_enabled"] is True
+
+
+def test_auth_client_login_with_security_key(farm_auth_client: APBAuthClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    from apb.farm import core, mfa
+
+    db = core.auth_manager.db
+    user = core.auth_manager.create_user("bob", "password123", core.UserRole.USER)
+    key = SoftSecurityKey()
+    mfa.register_security_key(
+        db,
+        core.public_farm_url(),
+        "session",
+        user.id,
+        "YubiKey",
+        key.register(mfa.registration_options(db, core.public_farm_url(), "session", user.id, "bob")),
+    )
+    origins = []
+
+    class FakeFido2Client:
+        def __init__(self, device, collector, user_interaction):
+            origins.append(collector._origin)
+
+        def get_assertion(self, options):
+            assertion = key.assertion({"publicKey": dict(options)})
+            return SimpleNamespace(get_response=lambda _index: assertion)
+
+    monkeypatch.setattr("apb.client.auth.find_security_keys", lambda: [object()])
+    monkeypatch.setattr("apb.client.auth.Fido2Client", FakeFido2Client)
+
+    assert farm_auth_client.login("bob", "password123", prompt=lambda _label: pytest.fail("no code prompt expected")) is True
+    assert origins == ["http://localhost:8080"]
+
+
+def test_auth_client_reports_admin_setup(farm_auth_client: APBAuthClient, capsys: pytest.CaptureFixture) -> None:
+    assert farm_auth_client.login("admin", "admin123") is False
+    assert "http://localhost:8080/account/2fa" in capsys.readouterr().out
+    assert not farm_auth_client.is_authenticated()

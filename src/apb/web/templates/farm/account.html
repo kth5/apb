@@ -12,6 +12,11 @@
 ]) }}
 </section>
 <section class="card">
+<h2>Two-factor authentication</h2>
+<p>{{ status_badge("enabled" if mfa_enabled else "disabled") }}</p>
+<p><a href="/account/2fa">Manage authenticator app, security keys and recovery codes</a></p>
+</section>
+<section class="card">
 <h2>Change password</h2>
 <p class="muted">Changing the password logs you out everywhere.</p>
 <form class="form" method="post" action="/account/password">

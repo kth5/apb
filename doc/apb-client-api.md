@@ -149,6 +149,7 @@ client.download_file(response.build_id, "package.pkg.tar.xz", Path("./downloads/
 - `--logout`: Logout from farm (requires `--farm` flag)
 - `--auth-status`: Show authentication status for farm
 - `--username USERNAME`: Username for login (optional, will prompt if not provided)
+- `--2fa-method {totp,key,recovery}`: Second factor to use when the account has 2FA (optional). Without it, a connected FIDO2 security key is used when the account has one, otherwise the client asks for the authenticator code
 
 ### Build Options
 
@@ -211,10 +212,25 @@ python apb.py --farm --login --username myuser
 FARM_USERNAME=myuser FARM_PASSWORD=mypass python apb.py --farm --login
 ```
 
+**Two-factor authentication:**
+
+Accounts with 2FA (always the case for admins) need a second factor after the password:
+- **Security key**: when the account has a security key and a FIDO2 key (YubiKey etc.) is connected over USB, the client asks you to touch it. The farm must be reached through its public `farm_url` (HTTPS or `localhost`), because the key signs the origin
+- **Authenticator app**: the client asks for the 6-digit code
+- **Recovery code**: `--2fa-method recovery` asks for one of the single-use recovery codes
+
+Admins without a second factor cannot log in with the CLI; the client prints the `/account/2fa` URL where the second factor can be enrolled in a browser.
+
+```bash
+# Use the authenticator app even when a security key is connected
+python apb.py --farm --login --2fa-method totp
+```
+
 **Example Output:**
 ```
 Username: myuser
 Password: [hidden]
+Authentication code: [hidden]
 Successfully logged in as myuser
 Logged in as: myuser (user)
 ```
@@ -1229,15 +1245,17 @@ auth_client = APBAuthClient("https://farm.example.com:8080")
 
 ##### login()
 
-Login with username and password.
+Login with username and password, completing two-factor authentication when the account has it.
 
 ```python
-def login(self, username: str, password: str) -> bool
+def login(self, username: str, password: str, mfa_method: Optional[str] = None, prompt: Callable[[str], str] = getpass.getpass) -> bool
 ```
 
 **Parameters:**
 - `username` (str): Username for authentication
 - `password` (str): Password for authentication
+- `mfa_method` (str, optional): `totp`, `key` or `recovery`; by default a connected security key is preferred, then the authenticator code
+- `prompt` (callable, optional): Reads the authenticator or recovery code
 
 **Returns:**
 - `bool`: True if login successful
