@@ -33,6 +33,10 @@ DEFAULT_KEY_NAME = "Security key"
 MAX_KEY_NAME_LENGTH = 64
 
 
+class FarmUnreachableError(Exception):
+    """The farm could not be contacted (connection refused, DNS failure, timeout)."""
+
+
 def _print_failure(prefix: str, response: httpx.Response) -> None:
     try:
         print(f"{prefix}: {response.json().get('detail', 'Unknown error')}")
@@ -142,8 +146,12 @@ class APBAuthClient:
             print(f"Warning: Could not clear token: {e}")
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        with create_sync_client(timeout=AUTH_TIMEOUT) as client:
-            return client.request(method, upstream_url(self.farm_url, path), **kwargs)
+        url = upstream_url(self.farm_url, path)
+        try:
+            with create_sync_client(timeout=AUTH_TIMEOUT) as client:
+                return client.request(method, url, **kwargs)
+        except httpx.TransportError as e:
+            raise FarmUnreachableError(f"Cannot reach the farm at {url}: {e} (check farm_url in apb.json)") from e
 
     def login(
         self,

@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Auth client errors for an unreachable farm (`--login`, `--logout`, `--auth-status`, `--2fa-setup`) name the URL that was tried and point at `farm_url` in `apb.json`, instead of only showing e.g. `[Errno 111] Connection refused`
 - All farm and server HTML pages (dashboard, build status, download error, admin, login and account on the farm; build details, cancel confirmation, file view and cleanup on the server) are rendered from autoescaped Jinja templates in `apb.web` with one shared layout and stylesheet instead of inline f-strings with per-page CSS; emoji icons replaced by text labels and status badges
 - Dashboard tabs are plain links to `/dashboard`, `/dashboard/builds/{page}` and `/dashboard/statistics`; only the requested tab's data is queried, builds are shown in a table, "Next" only appears when another page exists, and server info lookups run concurrently
 - The 6 build status page variants (not found, queued, submission failed, server unavailable with and without cached status, connection failed, live) are one template

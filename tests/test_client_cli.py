@@ -263,6 +263,22 @@ def test_auth_client_reports_admin_setup(farm_auth_client: APBAuthClient, capsys
     assert not farm_auth_client.is_authenticated()
 
 
+def test_auth_client_names_unreachable_farm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[Errno 111] Connection refused", request=request)
+
+    monkeypatch.setattr(
+        "apb.client.auth.create_sync_client",
+        lambda **_kwargs: httpx.Client(transport=httpx.MockTransport(refuse)),
+    )
+    auth_client = APBAuthClient("http://farm.example:8080", config_path=tmp_path / "auth.json")
+
+    assert auth_client.login("admin", "secret") is False
+    output = capsys.readouterr().out
+    assert "Cannot reach the farm at http://farm.example:8080/auth/login" in output
+    assert "Connection refused" in output
+
+
 def test_parse_args_2fa_setup() -> None:
     assert cli.parse_args(["--2fa-setup", "totp"]).mfa_setup == "totp"
     assert cli.parse_args(["--login", "--2fa-setup", "key"]).mfa_setup == "key"
