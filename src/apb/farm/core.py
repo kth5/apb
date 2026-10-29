@@ -20,7 +20,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -172,6 +172,8 @@ class SMTPTestRequest(BaseModel):
     test_email: str = Field(..., min_length=1, max_length=255)
 
 
+SMTP_TIMEOUT_SECONDS = 30
+
 # Global state
 config: Dict[str, Any] = {}
 server_info_cache: Dict[str, Dict] = {}
@@ -181,6 +183,7 @@ http_session: httpx.AsyncClient = None
 shutdown_event = asyncio.Event()
 background_tasks: List[asyncio.Task] = []
 artifact_cache_tasks: Dict[str, asyncio.Task] = {}
+notification_tasks: Set[asyncio.Task] = set()
 server_status_tracker: Dict[str, ServerStatus] = {}
 auth_manager = None
 
@@ -697,54 +700,50 @@ class AuthManager:
             logger.info("SMTP configuration deleted")
         return deleted_count > 0
 
-    def send_email(self, to_email: str, subject: str, body: str, html_body: Optional[str] = None) -> bool:
-        """Send email using configured SMTP settings"""
+    def _prepare_email(self, to_email: str, subject: str, body: str,
+                       html_body: Optional[str] = None) -> Optional[Tuple[SMTPConfig, MIMEMultipart]]:
+        """Validate the recipient and compose a message using the configured SMTP settings"""
         smtp_config = self.get_smtp_config()
         if not smtp_config:
             logger.warning("No SMTP configuration found, cannot send email")
-            return False
+            return None
 
         if not to_email or not self._validate_email(to_email):
             logger.warning(f"Invalid recipient email: {to_email}")
-            return False
+            return None
 
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = f"{smtp_config.from_name or 'APB Farm'} <{smtp_config.from_email or 'noreply@localhost'}>"
+        msg['To'] = to_email
+        msg.attach(MIMEText(body, 'plain'))
+        if html_body: msg.attach(MIMEText(html_body, 'html'))
+        return smtp_config, msg
+
+    @staticmethod
+    def _deliver_email(smtp_config: SMTPConfig, msg: MIMEMultipart) -> bool:
+        """Deliver a composed message over SMTP (blocking network I/O)"""
         try:
-            # Create message
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = subject
-            msg['From'] = f"{smtp_config.from_name or 'APB Farm'} <{smtp_config.from_email or 'noreply@localhost'}>"
-            msg['To'] = to_email
-
-            # Add text part
-            text_part = MIMEText(body, 'plain')
-            msg.attach(text_part)
-
-            # Add HTML part if provided
-            if html_body:
-                html_part = MIMEText(html_body, 'html')
-                msg.attach(html_part)
-
-            # Send email
-            context = ssl.create_default_context() if smtp_config.use_tls else None
-
-            if smtp_config.use_tls:
-                with smtplib.SMTP(smtp_config.server, smtp_config.port) as server:
-                    server.starttls(context=context)
-                    if smtp_config.username and smtp_config.password:
-                        server.login(smtp_config.username, smtp_config.password)
-                    server.send_message(msg)
-            else:
-                with smtplib.SMTP(smtp_config.server, smtp_config.port) as server:
-                    if smtp_config.username and smtp_config.password:
-                        server.login(smtp_config.username, smtp_config.password)
-                    server.send_message(msg)
-
-            logger.info(f"Email sent successfully to {to_email}")
+            with smtplib.SMTP(smtp_config.server, smtp_config.port, timeout=SMTP_TIMEOUT_SECONDS) as server:
+                if smtp_config.use_tls: server.starttls(context=ssl.create_default_context())
+                if smtp_config.username and smtp_config.password:
+                    server.login(smtp_config.username, smtp_config.password)
+                server.send_message(msg)
+            logger.info(f"Email sent successfully to {msg['To']}")
             return True
-
         except Exception as e:
-            logger.error(f"Failed to send email to {to_email}: {e}")
+            logger.error(f"Failed to send email to {msg['To']}: {e}")
             return False
+
+    def send_email(self, to_email: str, subject: str, body: str, html_body: Optional[str] = None) -> bool:
+        """Send email using configured SMTP settings"""
+        prepared = self._prepare_email(to_email, subject, body, html_body)
+        return bool(prepared) and self._deliver_email(*prepared)
+
+    async def send_email_async(self, to_email: str, subject: str, body: str, html_body: Optional[str] = None) -> bool:
+        """Send email without blocking the event loop; only SMTP delivery leaves the loop thread"""
+        prepared = self._prepare_email(to_email, subject, body, html_body)
+        return bool(prepared) and await asyncio.to_thread(self._deliver_email, *prepared)
 
     def send_user_notification(self, user_email: str, action: str, username: str, admin_user: str):
         """Send notification email for user account changes"""
@@ -797,7 +796,7 @@ APB Farm System"""
 
         return self.send_email(user_email, subject, body)
 
-    def send_build_notification(self, user_email: str, username: str, build_id: str, pkgname: str, status: str, arch: str, artifacts: List[Dict] = None):
+    async def send_build_notification(self, user_email: str, username: str, build_id: str, pkgname: str, status: str, arch: str, artifacts: List[Dict] = None) -> bool:
         """Send notification email for build completion"""
         if not user_email:
             return False
@@ -844,7 +843,7 @@ You can view all your builds on the dashboard: {dashboard_url}
 Best regards,
 APB Farm System"""
 
-        return self.send_email(user_email, subject, body)
+        return await self.send_email_async(user_email, subject, body)
 
 
 async def send_build_completion_email(build_id: str, status: str, build_status: Dict):
@@ -887,7 +886,7 @@ async def send_build_completion_email(build_id: str, status: str, build_status: 
             artifacts = build_status['packages']
 
         # Send notification
-        success = auth_manager.send_build_notification(
+        success = await auth_manager.send_build_notification(
             user.email,
             user.username,
             build_id,
@@ -904,6 +903,34 @@ async def send_build_completion_email(build_id: str, status: str, build_status: 
 
     except Exception as e:
         logger.error(f"Error sending build completion email for build {build_id}: {e}")
+
+
+def schedule_build_completion_email(build_id: str, status: str, build_status: Dict) -> None:
+    """Send the completion email in the background, keeping the task referenced until it finishes."""
+    task = asyncio.create_task(send_build_completion_email(build_id, status, build_status))
+    notification_tasks.add(task)
+    task.add_done_callback(notification_tasks.discard)
+
+
+def finish_build(build_id: str, status: str, build_status: Optional[Dict] = None) -> bool:
+    """
+    Move a build into a terminal status and email its owner.
+
+    Only the caller that performs the transition gets True and triggers the
+    email, so each build is notified exactly once regardless of which path
+    (status poller, status page, cancellation, failure handling) sees it first.
+    """
+    terminal_placeholders = ", ".join("?" * len(BuildStatus.TERMINAL))
+    cursor = build_database.cursor()
+    cursor.execute(f'''
+        UPDATE builds SET status = ?, end_time = COALESCE(end_time, ?)
+        WHERE id = ? AND COALESCE(status, '') NOT IN ({terminal_placeholders})
+    ''', (status, time.time(), build_id, *BuildStatus.TERMINAL))
+    build_database.commit()
+
+    is_transitioned = cursor.rowcount == 1
+    if is_transitioned: schedule_build_completion_email(build_id, status, build_status or {"status": status})
+    return is_transitioned
 
 
 AUTH_COOKIE_NAME = "authToken"
@@ -1447,32 +1474,18 @@ def schedule_build_artifact_cache(build_id: str, server_url: str, build_status: 
 def persist_live_build_status(build_id: str, build_status: Dict) -> None:
     """Persist live build-server status into the farm database."""
     status = build_status.get("status", BuildStatus.QUEUED)
-    current_time = time.time()
-    terminal_statuses = (BuildStatus.COMPLETED, BuildStatus.FAILED, BuildStatus.CANCELLED)
+    if status in BuildStatus.TERMINAL: finish_build(build_id, status, build_status)
 
     cursor = build_database.cursor()
     cursor.execute('''
         UPDATE builds SET
             status = ?,
-            end_time = CASE
-                WHEN ? IN (?, ?, ?) THEN COALESCE(end_time, ?)
-                ELSE end_time
-            END,
             last_known_status = ?,
             last_status_update = ?,
             server_available = 1,
             cached_response = ?
         WHERE id = ?
-    ''', (
-        status,
-        status,
-        *terminal_statuses,
-        current_time,
-        status,
-        current_time,
-        json.dumps(build_status),
-        build_id,
-    ))
+    ''', (status, status, time.time(), json.dumps(build_status), build_id))
     build_database.commit()
 
 
@@ -2331,11 +2344,7 @@ async def cancel_farm_queued_build(build_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     remove_from_build_queue(build_id)
-    cursor.execute(
-        "UPDATE builds SET status = ?, end_time = ? WHERE id = ?",
-        (BuildStatus.CANCELLED, time.time(), build_id),
-    )
-    build_database.commit()
+    finish_build(build_id, BuildStatus.CANCELLED)
     logger.info(f"Build {build_id} removed from farm queue by cancellation request")
     return {
         "success": True,
@@ -2345,12 +2354,7 @@ async def cancel_farm_queued_build(build_id: str) -> Optional[Dict[str, Any]]:
 
 async def _mark_build_failed(build_id: str, reason: str) -> None:
     logger.error(f"{reason}, marking build {build_id} as failed")
-    cursor = build_database.cursor()
-    cursor.execute(
-        "UPDATE builds SET status = ?, end_time = ? WHERE id = ?",
-        (BuildStatus.FAILED, time.time(), build_id),
-    )
-    build_database.commit()
+    finish_build(build_id, BuildStatus.FAILED)
 
 
 async def _requeue_build_after_submission_error(build_info: Dict[str, Any], max_retries: int = 3) -> None:
@@ -2477,12 +2481,7 @@ async def forward_build_to_server(build_info: Dict, server_url: str):
         except Exception:
             logger.error(f"Server {server_url} rejected build {build_id} with HTTP {response.status_code}")
 
-        cursor = build_database.cursor()
-        cursor.execute('''
-            UPDATE builds SET status = ?, end_time = ?
-            WHERE id = ?
-        ''', (BuildStatus.FAILED, time.time(), build_id))
-        build_database.commit()
+        finish_build(build_id, BuildStatus.FAILED)
         return False
 
     except asyncio.TimeoutError:
@@ -2504,30 +2503,12 @@ async def update_single_build_status(build_id: str, server_url: str):
         if response.status_code == 200:
             build_status = response.json()
             status = build_status.get("status", BuildStatus.QUEUED)
-            current_time = time.time()
+            persist_live_build_status(build_id, build_status)
 
             cursor = build_database.cursor()
-            cursor.execute('''
-                UPDATE builds SET
-                    status = ?,
-                    end_time = ?,
-                    last_known_status = ?,
-                    last_status_update = ?,
-                    server_available = 1,
-                    cached_response = ?,
-                    first_missing_at = NULL
-                WHERE id = ?
-            ''', (status,
-                     current_time if status in [BuildStatus.COMPLETED, BuildStatus.FAILED] else None,
-                     status,
-                     current_time,
-                     json.dumps(build_status),
-                     build_id))
+            cursor.execute('UPDATE builds SET first_missing_at = NULL WHERE id = ?', (build_id,))
             build_database.commit()
             logger.debug(f"Updated status for build {build_id}: {status}")
-
-            if status in [BuildStatus.COMPLETED, BuildStatus.FAILED, BuildStatus.CANCELLED]:
-                asyncio.create_task(send_build_completion_email(build_id, status, build_status))
 
             if status == BuildStatus.COMPLETED:
                 asyncio.create_task(proactively_cache_build_artifacts(build_id, server_url, build_status))
@@ -2551,15 +2532,13 @@ async def update_single_build_status(build_id: str, server_url: str):
                 missing_duration = current_time - first_missing_at
                 if missing_duration > 900:
                     logger.error(f"Build {build_id} missing from server {server_url} for {missing_duration:.0f} seconds - marking as failed")
+                    finish_build(build_id, BuildStatus.FAILED, {"status": BuildStatus.FAILED, "missing_from_server": True})
                     cursor.execute('''
                         UPDATE builds SET
-                            status = ?,
-                            end_time = ?,
                             last_status_update = ?,
                             last_known_status = 'failed_missing_from_server'
                         WHERE id = ?
-                    ''', (BuildStatus.FAILED, current_time, current_time, build_id))
-                    asyncio.create_task(send_build_completion_email(build_id, BuildStatus.FAILED, {"status": BuildStatus.FAILED, "missing_from_server": True}))
+                    ''', (current_time, build_id))
                 else:
                     cursor.execute('''
                         UPDATE builds SET
@@ -2746,13 +2725,11 @@ async def handle_unavailable_servers():
                         # If server has been unavailable for more than 30 minutes, consider the build lost
                         if time_since_last_update > 1800:  # 30 minutes
                             logger.error(f"Marking build {build_id} as failed - server {server_url} unavailable for {time_since_last_update:.0f} seconds")
+                            finish_build(build_id, BuildStatus.FAILED)
                             cursor.execute('''
-                                UPDATE builds SET
-                                    status = ?,
-                                    end_time = ?,
-                                    last_known_status = 'failed_server_unavailable'
+                                UPDATE builds SET last_known_status = 'failed_server_unavailable'
                                 WHERE id = ?
-                            ''', (BuildStatus.FAILED, current_time, build_id))
+                            ''', (build_id,))
                             build_database.commit()
 
             await asyncio.sleep(120)  # Check every 2 minutes

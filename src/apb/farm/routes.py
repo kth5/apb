@@ -741,14 +741,7 @@ async def _cancel_build(build_id: str, current_user: core.User) -> Dict:
         response = await core.http_session.post(upstream_url(server_url, build_cancel_path(build_id)), timeout=10)
         if response.status_code == 200:
             result = response.json()
-
-            # Update local database
-            cursor = core.build_database.cursor()
-            cursor.execute('''
-                UPDATE builds SET status = ?, end_time = ?
-                WHERE id = ?
-            ''', (core.BuildStatus.CANCELLED, time.time(), build_id))
-            core.build_database.commit()
+            core.finish_build(build_id, core.BuildStatus.CANCELLED)
 
             return {
                 "success": True,
