@@ -74,6 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `nginx-apb-farm.conf` lets `/static/`, `/login`, `/logout`, `/account` and `/account/password` through to the farm. They used to hit the catch-all redirect to `/dashboard`, so pages loaded without stylesheet and scripts and the login form could not be reached
 - `GET /farm` used to fail with a `NameError` (`running_builds_by_server`) when listing running builds per server
 - Client `get_build_status` queries `/build/{build_id}/status-api`, which both server and farm serve. It used to query `/build/{build_id}/status?format=json`, which only the farm implements, so status calls against a server directly returned 404
 - Farm build list timestamps are real UTC; they used to be local time with a `UTC` suffix
