@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -34,7 +35,7 @@ def pkg_dir(tmp_path: Path) -> Path:
 
 
 def _context(argv: list[str], monkeypatch: pytest.MonkeyPatch, config: dict = CONFIG) -> cli.CliContext:
-    monkeypatch.setattr(cli, "load_config", lambda _path: config)
+    monkeypatch.setattr(cli, "load_config_with_source", lambda _path: (config, None))
     return cli.resolve_context(cli.parse_args(argv))
 
 
@@ -277,6 +278,25 @@ def test_auth_client_names_unreachable_farm(monkeypatch: pytest.MonkeyPatch, tmp
     output = capsys.readouterr().out
     assert "Cannot reach the farm at http://farm.example:8080/auth/login" in output
     assert "Connection refused" in output
+
+
+def test_resolve_context_names_config_file_of_farm_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    unreadable = tmp_path / "etc-apb.json"
+    unreadable.write_text('{"farm_url": "https://apb.example.org"}')
+    unreadable.chmod(0)
+    user_config = tmp_path / "home-apb.json"
+    user_config.write_text('{"farm_url": "http://127.0.0.1:8081"}')
+    monkeypatch.setattr("apb.config.DEFAULT_CONFIG_PATHS", [tmp_path / "missing.json", unreadable, user_config])
+    if os.access(unreadable, os.R_OK):
+        pytest.skip("running as root; file permissions are not enforced")
+
+    ctx = cli.resolve_context(cli.parse_args(["--farm", "--login"]))
+
+    assert ctx.server_url == "http://127.0.0.1:8081"
+    assert ctx.auth_client.url_source == f"farm_url in {user_config}"
+    assert f"Ignoring config file {unreadable}" in caplog.text
 
 
 def test_parse_args_2fa_setup() -> None:

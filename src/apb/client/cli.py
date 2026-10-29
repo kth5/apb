@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 import httpx
 
-from apb.config import load_config
+from apb.config import load_config_with_source
 from apb.constants import (
     BUILD_TIMEOUT_MAX,
     BUILD_TIMEOUT_MIN,
@@ -819,12 +819,23 @@ class CliContext(NamedTuple):
         return requested[0] if requested else self.config.get("default_arch")
 
 
+def _url_source(args: argparse.Namespace, config: Dict, config_file: Optional[Path]) -> str:
+    """Where the farm URL came from, for error messages."""
+    if args.server:
+        return "--server"
+    if not config_file:
+        return "built-in default; no apb.json found"
+    if not config.get("farm_url"):
+        return f"built-in default; no farm_url in {config_file}"
+    return f"farm_url in {config_file}"
+
+
 def resolve_context(args: argparse.Namespace) -> CliContext:
     """Load the configuration and pick the server or farm to talk to.
 
     Auth commands fall back to the configured farm_url when neither --server nor --farm points at a farm.
     """
-    config = load_config(args.config)
+    config, config_file = load_config_with_source(args.config)
     farm_url = config.get("farm_url")
 
     if args.server:
@@ -840,7 +851,7 @@ def resolve_context(args: argparse.Namespace) -> CliContext:
         server_url = farm_url
         is_farm = True
 
-    auth_client = APBAuthClient(server_url) if is_farm else None
+    auth_client = APBAuthClient(server_url, url_source=_url_source(args, config, config_file)) if is_farm else None
     return CliContext(args, config, server_url, auth_client, APBotClient(server_url, auth_client))
 
 

@@ -309,6 +309,8 @@ The client searches for configuration files in this order (`apb.constants.DEFAUL
 3. `~/.apb/apb.json` (user home)
 4. `~/.apb-farm/apb.json` (farm-specific)
 
+Only the first file that can be read is used; files are not merged. A file that exists but cannot be read (permissions) or parsed (invalid JSON) is skipped with a warning. When the farm cannot be reached, auth errors name the URL and where it came from, e.g. `(URL from farm_url in /home/user/.apb/apb.json)`.
+
 ### Configuration Schema
 
 ```json
@@ -884,6 +886,8 @@ def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]
 
 **Returns:**
 - `Dict`: Configuration dictionary with defaults
+
+`load_config_with_source()` takes the same arguments and returns `(config, path)`, where `path` is the file that was used or `None` for the built-in defaults.
 
 **Configuration Features:**
 - **Multiple Locations**: Searches standard configuration locations

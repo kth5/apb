@@ -85,8 +85,9 @@ def _print_recovery_codes(codes: Sequence[str]) -> None:
 class APBAuthClient:
     """Handles authentication for APB client"""
 
-    def __init__(self, farm_url: str, config_path: Optional[Path] = None):
+    def __init__(self, farm_url: str, config_path: Optional[Path] = None, url_source: str = "farm_url in apb.json"):
         self.farm_url = farm_url.rstrip('/')
+        self.url_source = url_source
         self.config_path = config_path or Path.home() / ".apb" / "auth.json"
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self._token = None
@@ -151,7 +152,7 @@ class APBAuthClient:
             with create_sync_client(timeout=AUTH_TIMEOUT) as client:
                 return client.request(method, url, **kwargs)
         except httpx.TransportError as e:
-            raise FarmUnreachableError(f"Cannot reach the farm at {url}: {e} (check farm_url in apb.json)") from e
+            raise FarmUnreachableError(f"Cannot reach the farm at {url}: {e} (URL from {self.url_source})") from e
 
     def login(
         self,
