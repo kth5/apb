@@ -7,18 +7,30 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import httpx
+import segno
 from fido2.client import ClientError, DefaultClientDataCollector, Fido2Client, UserInteraction
 
 from apb.constants import MFA_METHOD_RECOVERY, MFA_METHOD_TOTP, MFA_METHOD_WEBAUTHN
 from apb.http import create_sync_client
-from apb.models import LoginResponse, MfaChallengeResponse, MfaSetupRequiredResponse, UserResponse
+from apb.models import (
+    LoginResponse,
+    MfaChallengeResponse,
+    MfaEnrollResponse,
+    MfaSetupRequiredResponse,
+    TotpSetupResponse,
+    UserResponse,
+)
 from apb.upstream import upstream_url, webauthn_origin
 
 logger = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 30.0
 CLI_MFA_METHODS = {"totp": MFA_METHOD_TOTP, "key": MFA_METHOD_WEBAUTHN, "recovery": MFA_METHOD_RECOVERY}
+CLI_SETUP_METHODS = ("totp", "key")
 MFA_CODE_PROMPTS = {MFA_METHOD_TOTP: "Authentication code: ", MFA_METHOD_RECOVERY: "Recovery code: "}
+TOTP_CONFIRM_ATTEMPTS = 3
+DEFAULT_KEY_NAME = "Security key"
+MAX_KEY_NAME_LENGTH = 64
 
 
 def _print_failure(prefix: str, response: httpx.Response) -> None:
@@ -58,6 +70,13 @@ class _TerminalInteraction(UserInteraction):
 
     def request_pin(self, permissions, rp_id) -> Optional[str]:
         return getpass.getpass("Security key PIN: ")
+
+
+def _print_recovery_codes(codes: Sequence[str]) -> None:
+    print("Recovery codes (each one logs you in once if you lose your second factor; shown only now):")
+    for code in codes:
+        print(f"  {code}")
+
 
 class APBAuthClient:
     """Handles authentication for APB client"""
@@ -132,8 +151,9 @@ class APBAuthClient:
         password: str,
         mfa_method: Optional[str] = None,
         prompt: Callable[[str], str] = getpass.getpass,
+        setup_method: Optional[str] = None,
     ) -> bool:
-        """Login with username and password, completing two-factor authentication when required"""
+        """Login with username and password, completing or (with setup_method) enrolling two-factor authentication"""
         try:
             response = self._request(
                 "POST",
@@ -148,7 +168,10 @@ class APBAuthClient:
             if data.get("mfa_setup_required"):
                 setup = MfaSetupRequiredResponse.model_validate(data)
                 print("Two-factor authentication is required for admin accounts.")
-                print(f"Set up an authenticator app or security key in a browser first: {setup.setup_url}")
+                if setup_method:
+                    return self.setup_mfa(setup_method, token=setup.setup_token)
+                print("Set it up with --login --2fa-setup totp (or key), "
+                      f"or in a browser: {setup.setup_url}")
                 return False
             if data.get("mfa_required"):
                 response = self._complete_mfa(MfaChallengeResponse.model_validate(data), mfa_method, prompt)
@@ -162,11 +185,85 @@ class APBAuthClient:
             login_response = LoginResponse.model_validate(data)
             self._save_token(login_response.token)
             print(f"Successfully logged in as {login_response.user.username}")
-            return True
+            return self.setup_mfa(setup_method) if setup_method else True
 
         except Exception as e:
             print(f"Login error: {e}")
             return False
+
+    def setup_mfa(self, method: str, token: Optional[str] = None, prompt: Optional[Callable[[str], str]] = None) -> bool:
+        """Enroll an authenticator app ('totp') or security key ('key') with the stored or a given setup token"""
+        prompt = prompt or input
+        token = token or self._token
+        if not token:
+            print("Not logged in. Use --login --2fa-setup to log in and set up two-factor authentication.")
+            return False
+
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            enroll = self._enroll_totp if method == "totp" else self._enroll_security_key
+            enrolled = enroll(headers, prompt)
+        except Exception as e:
+            print(f"Two-factor setup error: {e}")
+            return False
+        if enrolled is None:
+            return False
+
+        print(enrolled.message)
+        if enrolled.recovery_codes:
+            _print_recovery_codes(enrolled.recovery_codes)
+        if enrolled.token:
+            self._save_token(enrolled.token)
+        return True
+
+    def _enroll_totp(self, headers: Dict[str, str], prompt: Callable[[str], str]) -> Optional[MfaEnrollResponse]:
+        response = self._request("POST", "/auth/my/2fa/totp", headers=headers)
+        if response.status_code != 200:
+            _print_failure("Authenticator app setup failed", response)
+            return None
+
+        setup = TotpSetupResponse.model_validate(response.json())
+        segno.make(setup.provisioning_uri, error="m").terminal(compact=True)
+        print(f"Scan the QR code with your authenticator app, or enter this secret: {setup.secret}")
+        for _ in range(TOTP_CONFIRM_ATTEMPTS):
+            code = prompt("Code from the app: ").strip()
+            response = self._request("POST", "/auth/my/2fa/totp/confirm", headers=headers, json={"code": code})
+            if response.status_code == 200:
+                return MfaEnrollResponse.model_validate(response.json())
+            _print_failure("Authenticator app not confirmed", response)
+            if response.status_code not in (400, 422):
+                return None
+        return None
+
+    def _enroll_security_key(self, headers: Dict[str, str], prompt: Callable[[str], str]) -> Optional[MfaEnrollResponse]:
+        devices = find_security_keys()
+        if not devices:
+            print("No FIDO2 security key found. Connect it and try again.")
+            return None
+
+        name = prompt(f"Key name [{DEFAULT_KEY_NAME}]: ").strip()[:MAX_KEY_NAME_LENGTH] or DEFAULT_KEY_NAME
+        response = self._request("POST", "/auth/my/2fa/webauthn/register-options", headers=headers)
+        if response.status_code != 200:
+            _print_failure("Security key registration failed", response)
+            return None
+        try:
+            registration = self._fido2_client(devices[0]).make_credential(response.json()["publicKey"])
+        except ClientError as e:
+            print(f"Security key error: {e}")
+            return None
+
+        response = self._request(
+            "POST", "/auth/my/2fa/webauthn", headers=headers, json={"name": name, "credential": dict(registration)}
+        )
+        if response.status_code != 200:
+            _print_failure("Security key registration failed", response)
+            return None
+        return MfaEnrollResponse.model_validate(response.json())
+
+    def _fido2_client(self, device: Any) -> Fido2Client:
+        return Fido2Client(
+            device, DefaultClientDataCollector(webauthn_origin(self.farm_url)), user_interaction=_TerminalInteraction()
+        )
 
     def _complete_mfa(
         self, challenge: MfaChallengeResponse, mfa_method: Optional[str], prompt: Callable[[str], str]
@@ -196,11 +293,8 @@ class APBAuthClient:
             _print_failure("Security key login failed", response)
             return None
 
-        client = Fido2Client(
-            devices[0], DefaultClientDataCollector(webauthn_origin(self.farm_url)), user_interaction=_TerminalInteraction()
-        )
         try:
-            assertion = client.get_assertion(response.json()["publicKey"])
+            assertion = self._fido2_client(devices[0]).get_assertion(response.json()["publicKey"])
             return dict(assertion.get_response(0))
         except ClientError as e:
             print(f"Security key error: {e}")

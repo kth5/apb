@@ -23,7 +23,7 @@ from apb.models import BuildStatusResponse, BuildSubmitResponse, FarmBuildSubmit
 from apb.upstream import upstream_url
 
 from apb.client.api import APBotClient, BuildRejectedError
-from apb.client.auth import CLI_MFA_METHODS, APBAuthClient
+from apb.client.auth import CLI_MFA_METHODS, CLI_SETUP_METHODS, APBAuthClient
 from apb.client.helpers import (
     effective_any_server_arch,
     get_architectures_needing_build,
@@ -772,6 +772,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--username", type=str, help="Username for login")
     parser.add_argument("--2fa-method", dest="mfa_method", choices=sorted(CLI_MFA_METHODS),
                        help="Second factor for --login (default: connected security key, then authenticator code)")
+    parser.add_argument("--2fa-setup", dest="mfa_setup", choices=CLI_SETUP_METHODS,
+                       help="Add an authenticator app (QR code in the terminal) or a connected security key; "
+                            "with --login, log in first")
 
     # Build options
     parser.add_argument("--output-dir", type=Path, default=Path("./output"),
@@ -832,7 +835,7 @@ def resolve_context(args: argparse.Namespace) -> CliContext:
         server_url = config.get("default_server", DEFAULT_SERVER_URL)
 
     is_farm = args.farm or server_url == farm_url
-    is_auth_command = args.login or args.logout or args.auth_status
+    is_auth_command = args.login or args.logout or args.auth_status or args.mfa_setup
     if not is_farm and is_auth_command and farm_url:
         server_url = farm_url
         is_farm = True
@@ -857,15 +860,27 @@ def run_login(ctx: CliContext) -> int:
 
     username = ctx.args.username or input("Username: ")
     password = getpass.getpass("Password: ")
-    if not ctx.auth_client.login(username, password, mfa_method=ctx.args.mfa_method):
-        print("Login failed!")
+    is_logged_in = ctx.auth_client.login(
+        username, password, mfa_method=ctx.args.mfa_method, setup_method=ctx.args.mfa_setup
+    )
+    if not is_logged_in:
+        print("Two-factor setup failed!" if ctx.auth_client.is_authenticated() else "Login failed!")
         return 1
 
     print("Login successful!")
     user_info = ctx.auth_client.get_user_info()
     if user_info:
         _print_user("Logged in as", user_info)
+        if not user_info.get("mfa_enabled"):
+            print("Two-factor authentication is not enabled. Add it with --2fa-setup totp or --2fa-setup key.")
     return 0
+
+
+def run_mfa_setup(ctx: CliContext) -> int:
+    if not ctx.auth_client:
+        _print_farm_only("Error: Two-factor setup is only supported for farm connections.")
+        return 1
+    return 0 if ctx.auth_client.setup_mfa(ctx.args.mfa_setup) else 1
 
 
 def run_logout(ctx: CliContext) -> int:
@@ -1145,6 +1160,7 @@ def run(ctx: CliContext) -> int:
         (args.login, run_login),
         (args.logout, run_logout),
         (args.auth_status, run_auth_status),
+        (args.mfa_setup, run_mfa_setup),
         (args.monitor, run_monitor),
         (args.download is not None, run_download),
         (args.status, run_status),

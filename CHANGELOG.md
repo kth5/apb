@@ -31,6 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Admin endpoint `DELETE /auth/users/{user_id}/2fa` and a "Reset 2FA" button in the admin panel to remove a user's second factors, plus a 2FA column in the admin user list and `mfa_enabled` in user responses
 - Farm web pages `GET`/`POST /login/2fa` (authenticator code, recovery code or security key) and `/account/2fa` (QR code enrollment, security key registration and removal, recovery code regeneration); `/static/webauthn.js` drives the browser security key prompts
 - `apb --farm --login` asks for the authenticator or recovery code, or uses a connected FIDO2 security key through `python-fido2`; `--2fa-method totp|key|recovery` overrides the automatic choice
+- `apb --2fa-setup totp|key` enrolls a second factor from the command line: `totp` prints the QR code in the terminal and asks for a code to confirm it, `key` registers a connected FIDO2 security key; combined with `--login` it also finishes the forced enrollment of admins without 2FA. `--login` reminds users without a second factor that they can add one, and the account page links to the setup directly
 - `nginx-apb-farm.conf` passes the new 2FA endpoints and pages through to the farm with their allowed methods
 - `tests/test_farm_mfa.py` covering TOTP, recovery codes, security keys, pending login limits, forced admin enrollment and admin reset
 

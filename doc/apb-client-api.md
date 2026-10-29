@@ -150,6 +150,7 @@ client.download_file(response.build_id, "package.pkg.tar.xz", Path("./downloads/
 - `--auth-status`: Show authentication status for farm
 - `--username USERNAME`: Username for login (optional, will prompt if not provided)
 - `--2fa-method {totp,key,recovery}`: Second factor to use when the account has 2FA (optional). Without it, a connected FIDO2 security key is used when the account has one, otherwise the client asks for the authenticator code
+- `--2fa-setup {totp,key}`: Enroll a second factor for the logged-in user. With `--login`, log in first (admins without 2FA can only finish their login this way or in a browser)
 
 ### Build Options
 
@@ -219,11 +220,24 @@ Accounts with 2FA (always the case for admins) need a second factor after the pa
 - **Authenticator app**: the client asks for the 6-digit code
 - **Recovery code**: `--2fa-method recovery` asks for one of the single-use recovery codes
 
-Admins without a second factor cannot log in with the CLI; the client prints the `/account/2fa` URL where the second factor can be enrolled in a browser.
+Admins without a second factor must enroll one before their login completes: either with `--login --2fa-setup totp|key`, or in a browser at the `/account/2fa` URL the client prints. Other users without a second factor are logged in normally and reminded that they can add one.
+
+**Enrolling a second factor:**
+
+- `--2fa-setup totp` prints the QR code and secret of a new authenticator app in the terminal, then asks for a code from the app to confirm it. Running it again before confirming replaces the unconfirmed secret with a new one
+- `--2fa-setup key` asks for a key name and registers the connected FIDO2 security key (touch it when asked)
+
+The first second factor also prints ten single-use recovery codes; store them safely. To replace or remove factors, use the `/account/2fa` page.
 
 ```bash
 # Use the authenticator app even when a security key is connected
 python apb.py --farm --login --2fa-method totp
+
+# Add an authenticator app while logged in
+python apb.py --farm --2fa-setup totp
+
+# Admin without 2FA: log in and register a security key in one go
+python apb.py --farm --login --2fa-setup key
 ```
 
 **Example Output:**
@@ -1248,7 +1262,7 @@ auth_client = APBAuthClient("https://farm.example.com:8080")
 Login with username and password, completing two-factor authentication when the account has it.
 
 ```python
-def login(self, username: str, password: str, mfa_method: Optional[str] = None, prompt: Callable[[str], str] = getpass.getpass) -> bool
+def login(self, username: str, password: str, mfa_method: Optional[str] = None, prompt: Callable[[str], str] = getpass.getpass, setup_method: Optional[str] = None) -> bool
 ```
 
 **Parameters:**
@@ -1256,6 +1270,7 @@ def login(self, username: str, password: str, mfa_method: Optional[str] = None, 
 - `password` (str): Password for authentication
 - `mfa_method` (str, optional): `totp`, `key` or `recovery`; by default a connected security key is preferred, then the authenticator code
 - `prompt` (callable, optional): Reads the authenticator or recovery code
+- `setup_method` (str, optional): `totp` or `key`; enroll this second factor after the password (see `setup_mfa()`). Required for admins without 2FA to finish logging in
 
 **Returns:**
 - `bool`: True if login successful
@@ -1266,6 +1281,19 @@ success = auth_client.login("myuser", "mypassword")
 if success:
     print("Login successful!")
 ```
+
+##### setup_mfa()
+
+Enroll a second factor through the `/auth/my/2fa` endpoints, using the stored token or the given `mfa_setup` token. `totp` prints the QR code and asks for a confirmation code (three attempts); `key` asks for a name and registers the connected FIDO2 security key. Prints the recovery codes when the farm returns them, and stores the full token returned for a setup token.
+
+```python
+def setup_mfa(self, method: str, token: Optional[str] = None, prompt: Optional[Callable[[str], str]] = None) -> bool
+```
+
+- `prompt` (callable, optional): Reads the confirmation code and key name (default: `input`)
+
+**Returns:**
+- `bool`: True if the second factor was enrolled
 
 ##### logout()
 

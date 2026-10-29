@@ -14,7 +14,12 @@
 <section class="card">
 <h2>Two-factor authentication</h2>
 <p>{{ status_badge("enabled" if mfa_enabled else "disabled") }}</p>
+{% if mfa_enabled %}
 <p><a href="/account/2fa">Manage authenticator app, security keys and recovery codes</a></p>
+{% else %}
+<p>Protect your account with a second factor in addition to your password.</p>
+<p><a class="button button-primary" href="/account/2fa">Set up an authenticator app or security key</a></p>
+{% endif %}
 </section>
 <section class="card">
 <h2>Change password</h2>
