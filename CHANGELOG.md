@@ -74,6 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `/account` showed `none` as email and always showed notifications as enabled, and `GET /auth/me` returned `email: null`: users loaded from a session or API token were missing `email` and `email_notifications_enabled`
 - Build completion emails were only sent when the 2-minute status poller noticed the final status itself. Whenever the APB client or the build status page fetched it first, the build was already stored as finished and no email went out. Cancellations, submission failures, rejected builds and builds lost on unavailable servers never sent one. Every path now goes through `core.finish_build`, which emails exactly once, on the actual transition to `completed`, `failed` or `cancelled`
 - Sending email no longer blocks the farm's event loop: SMTP delivery for build notifications runs in a worker thread with a 30 second timeout, and notification tasks are kept referenced until they finish
 - `nginx-apb-farm.conf` lets `/static/`, `/login`, `/logout`, `/account` and `/account/password` through to the farm. They used to hit the catch-all redirect to `/dashboard`, so pages loaded without stylesheet and scripts and the login form could not be reached

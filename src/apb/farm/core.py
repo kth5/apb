@@ -441,7 +441,8 @@ class AuthManager:
 
         cursor = self.db.cursor()
         cursor.execute('''
-            SELECT t.user_id, t.expires_at, u.username, u.role, u.created_at, u.last_login
+            SELECT t.user_id, t.expires_at, u.username, u.role, u.created_at, u.last_login,
+                   u.email, u.email_notifications_enabled
             FROM tokens t
             JOIN users u ON t.user_id = u.id
             WHERE t.token_hash = ? AND t.is_active = 1 AND u.is_active = 1
@@ -451,7 +452,7 @@ class AuthManager:
         if not row:
             return None
 
-        user_id, expires_at, username, role, created_at, last_login = row
+        user_id, expires_at, username, role, created_at, last_login, email, email_notifications_enabled = row
 
         # Check if token has expired
         if current_time > expires_at:
@@ -472,7 +473,9 @@ class AuthManager:
             username=username,
             role=UserRole(role),
             created_at=created_at,
-            last_login=last_login
+            last_login=last_login,
+            email=email,
+            email_notifications_enabled=bool(email_notifications_enabled)
         )
 
     def revoke_token(self, token: str) -> bool:
