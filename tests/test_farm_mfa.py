@@ -115,14 +115,15 @@ def test_totp_login_rejects_replayed_code(farm_client: TestClient, bob_id: int):
 
 
 def test_totp_accepts_adjacent_time_steps_only(farm_client: TestClient, db, bob_id: int):
-    secret = mfa.start_totp_enrollment(db, bob_id)
+    keyring = core.auth_manager.keyring
+    secret = mfa.start_totp_enrollment(db, keyring, bob_id)
     totp = pyotp.TOTP(secret)
     now = time.time()
-    assert mfa.verify_totp(db, bob_id, totp.at(now - 30), confirm=True, now=now)
+    assert mfa.verify_totp(db, keyring, bob_id, totp.at(now - 30), confirm=True, now=now)
 
-    assert not mfa.verify_totp(db, bob_id, totp.at(now - 90), now=now)
-    assert mfa.verify_totp(db, bob_id, totp.at(now + 30), now=now)
-    assert not mfa.verify_totp(db, bob_id, totp.at(now), now=now)
+    assert not mfa.verify_totp(db, keyring, bob_id, totp.at(now - 90), now=now)
+    assert mfa.verify_totp(db, keyring, bob_id, totp.at(now + 30), now=now)
+    assert not mfa.verify_totp(db, keyring, bob_id, totp.at(now), now=now)
 
 
 def test_pending_login_is_revoked_after_too_many_attempts(farm_client: TestClient, bob_id: int):
@@ -316,7 +317,7 @@ def test_web_admin_setup_flow(farm_client: TestClient):
     assert started.headers["location"] == "/account/2fa/totp"
     totp_page = farm_client.get("/account/2fa/totp")
     assert "<svg" in totp_page.text
-    secret = mfa.pending_totp_secret(core.auth_manager.db, 1)
+    secret = mfa.pending_totp_secret(core.auth_manager.db, core.auth_manager.keyring, 1)
     assert secret in totp_page.text
 
     wrong = farm_client.post("/account/2fa/totp/confirm", data={"csrf_token": csrf_token, "code": "000000"})

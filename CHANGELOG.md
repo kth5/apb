@@ -34,6 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `apb --2fa-setup totp|key` enrolls a second factor from the command line: `totp` prints the QR code in the terminal and asks for a code to confirm it, `key` registers a connected FIDO2 security key; combined with `--login` it also finishes the forced enrollment of admins without 2FA. `--login` reminds users without a second factor that they can add one, and the account page links to the setup directly
 - `nginx-apb-farm.conf` passes the new 2FA endpoints and pages through to the farm with their allowed methods
 - `tests/test_farm_mfa.py` covering TOTP, recovery codes, security keys, pending login limits, forced admin enrollment and admin reset
+- Farm `apb.json` option `totp_keys_file` (default `~/.apb/farm-totp.keys`): TOTP encryption keyring, one `<key_id> <base64url key>` per line with the last line active; generated with mode 0600 on first start. Appending a key and restarting rotates all secrets to it. New module `apb.farm.secret_store`; `cryptography` is now a direct dependency
+- Unit tests for TOTP secret encryption, migration, key rotation and the missing-key fallback
 
 ### Changed
 
@@ -118,6 +120,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - HTML pages escape all dynamic values. Usernames, package names, versions, repository data, file contents and the build ID from the URL were inserted unescaped (including into inline `onclick` handlers), which allowed stored and reflected XSS
 - Cookie-authenticated state-changing requests require a CSRF token, and the session cookie is `HttpOnly`, so page scripts can no longer read the token
 - Second-factor logins are limited to 5 attempts per 5-minute pending login, TOTP codes cannot be replayed, and security key sign counters are checked to detect cloned keys
+- TOTP secrets in `user_totp.secret` are encrypted at rest with AES-256-GCM (bound to the user ID) using a key file kept outside `farm.db`; existing plaintext secrets are encrypted, and secrets of older keys re-encrypted with the active key, on farm startup. Without a usable key the farm still starts, but authenticator app logins and enrollment fail while security keys and recovery codes keep working
 
 ## 2026.08.06
 

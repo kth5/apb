@@ -28,6 +28,7 @@ from fido2.webauthn import (
 )
 
 from apb.constants import MFA_METHOD_RECOVERY, MFA_METHOD_TOTP, MFA_METHOD_WEBAUTHN
+from apb.farm.secret_store import Keyring, decrypt_value, encrypt_value, is_legacy_plaintext, needs_reencryption
 from apb.models import MfaStatusResponse, SecurityKeyInfo
 from apb.upstream import webauthn_origin
 
@@ -110,14 +111,24 @@ def _totp_row(db: sqlite3.Connection, user_id: int) -> Optional[sqlite3.Row]:
     ).fetchone()
 
 
+def _totp_aad(user_id: int) -> str:
+    return f"apb-totp:{user_id}"
+
+
+def _decrypt_totp_secret(keyring: Keyring, user_id: int, stored: str) -> Optional[str]:
+    secret = decrypt_value(keyring, stored, _totp_aad(user_id))
+    if secret is None: logger.warning(f"TOTP secret of user {user_id} cannot be decrypted with the configured keys")
+    return secret
+
+
 def is_totp_enabled(db: sqlite3.Connection, user_id: int) -> bool:
     row = _totp_row(db, user_id)
     return bool(row and row[1])
 
 
-def pending_totp_secret(db: sqlite3.Connection, user_id: int) -> Optional[str]:
+def pending_totp_secret(db: sqlite3.Connection, keyring: Keyring, user_id: int) -> Optional[str]:
     row = _totp_row(db, user_id)
-    return row[0] if row and not row[1] else None
+    return _decrypt_totp_secret(keyring, user_id, row[0]) if row and not row[1] else None
 
 
 def totp_provisioning_uri(secret: str, username: str, farm_url: str) -> str:
@@ -130,26 +141,33 @@ def totp_qr_svg(provisioning_uri: str) -> str:
     return segno.make(provisioning_uri, error="m").svg_inline(scale=5, border=2, dark="#000", light="#fff")
 
 
-def start_totp_enrollment(db: sqlite3.Connection, user_id: int) -> str:
-    """New unconfirmed TOTP secret (replaces an unconfirmed one); raises ValueError if TOTP is active."""
+def start_totp_enrollment(db: sqlite3.Connection, keyring: Keyring, user_id: int) -> str:
+    """New unconfirmed TOTP secret (replaces an unconfirmed one); raises ValueError if TOTP is active or unavailable."""
     if is_totp_enabled(db, user_id):
         raise ValueError("Authenticator app is already enabled; remove it first")
+    if not keyring.is_usable:
+        raise ValueError("Authenticator app unavailable: the farm has no TOTP encryption key")
     secret = pyotp.random_base32()
     db.execute(
         'INSERT OR REPLACE INTO user_totp (user_id, secret, confirmed, last_used_step, created_at) VALUES (?, ?, 0, 0, ?)',
-        (user_id, secret, time.time()),
+        (user_id, encrypt_value(keyring, secret, _totp_aad(user_id)), time.time()),
     )
     db.commit()
     return secret
 
 
-def verify_totp(db: sqlite3.Connection, user_id: int, code: Optional[str], *, confirm: bool = False, now: Optional[float] = None) -> bool:
+def verify_totp(
+    db: sqlite3.Connection, keyring: Keyring, user_id: int, code: Optional[str], *, confirm: bool = False, now: Optional[float] = None
+) -> bool:
     """Check a code for the active (or, with confirm, the pending) secret; each time step is accepted once."""
     row = _totp_row(db, user_id)
     code = re.sub(r"\s", "", code or "")
     if not row or bool(row[1]) == confirm or not code.isdigit():
         return False
-    secret, _, last_used_step = row
+    stored, _, last_used_step = row
+    secret = _decrypt_totp_secret(keyring, user_id, stored)
+    if secret is None:
+        return False
     totp = pyotp.TOTP(secret)
     current_step = int((now if now is not None else time.time()) // totp.interval)
     for step in (current_step - 1, current_step, current_step + 1):
@@ -158,6 +176,39 @@ def verify_totp(db: sqlite3.Connection, user_id: int, code: Optional[str], *, co
             db.commit()
             return True
     return False
+
+
+def migrate_totp_secrets(db: sqlite3.Connection, keyring: Keyring) -> Dict[str, int]:
+    """Encrypt plaintext secrets and move secrets of older keys to the active key; counts per outcome."""
+    counts = {"encrypted": 0, "reencrypted": 0, "undecryptable": 0}
+    rows = db.execute('SELECT user_id, secret FROM user_totp').fetchall()
+    if not keyring.is_usable:
+        if rows: logger.error(f"No TOTP encryption key: {len(rows)} authenticator app(s) cannot be used until the key file is fixed")
+        counts["undecryptable"] = len(rows)
+        return counts
+    for user_id, stored in rows:
+        aad = _totp_aad(user_id)
+        if is_legacy_plaintext(stored):
+            secret, outcome = stored, "encrypted"
+        else:
+            secret = decrypt_value(keyring, stored, aad)
+            outcome = "reencrypted" if needs_reencryption(keyring, stored) else None
+        if secret is None:
+            counts["undecryptable"] += 1
+            continue
+        if outcome is None:
+            continue
+        db.execute('UPDATE user_totp SET secret = ? WHERE user_id = ?', (encrypt_value(keyring, secret, aad), user_id))
+        counts[outcome] += 1
+    db.commit()
+    if counts["encrypted"] or counts["reencrypted"]:
+        logger.info(f"TOTP secrets: {counts['encrypted']} encrypted, {counts['reencrypted']} re-encrypted with key {keyring.active_id}")
+    if counts["undecryptable"]:
+        logger.error(
+            f"{counts['undecryptable']} TOTP secret(s) cannot be decrypted with the configured keys; "
+            "affected users must sign in with a security key or recovery code and re-enroll, or an admin resets their 2FA"
+        )
+    return counts
 
 
 def remove_totp(db: sqlite3.Connection, user_id: int) -> bool:
@@ -407,6 +458,7 @@ def reset_user_mfa(db: sqlite3.Connection, user_id: int) -> None:
 
 def verify_second_factor(
     db: sqlite3.Connection,
+    keyring: Keyring,
     farm_url: str,
     session_token: str,
     user_id: int,
@@ -415,7 +467,7 @@ def verify_second_factor(
     credential: Optional[Dict[str, Any]] = None,
 ) -> bool:
     if method == METHOD_TOTP:
-        return verify_totp(db, user_id, code)
+        return verify_totp(db, keyring, user_id, code)
     if method == METHOD_RECOVERY:
         return consume_recovery_code(db, user_id, code)
     if method == METHOD_WEBAUTHN:

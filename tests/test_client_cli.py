@@ -15,7 +15,7 @@ import pytest
 from apb.arch import KNOWN_PACKAGE_ARCH_SUFFIXES
 from apb.client import cli
 from apb.client.auth import APBAuthClient, choose_mfa_method
-from mfa_support import SoftSecurityKey, enroll_totp, fresh_totp_code
+from mfa_support import SoftSecurityKey, enroll_totp, fresh_totp_code, stored_totp_secret
 from apb.constants import BuildStatus
 from apb.models import BuildSubmitResponse
 
@@ -316,8 +316,9 @@ def _totp_prompt(answers: list) -> Callable[[str], str]:
         answer = answers.pop(0)
         if answer is not None:
             return answer
-        secret = core.auth_manager.db.execute("SELECT secret FROM user_totp ORDER BY user_id DESC").fetchone()[0]
-        return pyotp.TOTP(secret).now()
+        db = core.auth_manager.db
+        user_id = db.execute("SELECT user_id FROM user_totp ORDER BY user_id DESC").fetchone()[0]
+        return pyotp.TOTP(stored_totp_secret(db, user_id)).now()
 
     return prompt
 

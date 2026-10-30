@@ -41,6 +41,7 @@ from apb.constants import (
     BuildStatus,
 )
 from apb.farm import mfa
+from apb.farm.secret_store import Keyring, load_keyring
 from apb.http import create_async_client
 from apb.models import (
     BuildListResponse,
@@ -220,10 +221,12 @@ def farm_page_url(path: str) -> str:
 class AuthManager:
     """Manages authentication and authorization for APB Farm"""
 
-    def __init__(self, db_connection: sqlite3.Connection):
+    def __init__(self, db_connection: sqlite3.Connection, keyring: Optional[Keyring] = None):
         self.db = db_connection
         self.security = HTTPBearer(auto_error=False)
+        self.keyring = keyring if keyring is not None else load_keyring(totp_keys_file())
         self._init_auth_tables()
+        mfa.migrate_totp_secrets(self.db, self.keyring)
         self._create_default_admin()
 
     def _validate_email(self, email: str) -> bool:
@@ -1090,7 +1093,7 @@ def complete_mfa_login(
         raise HTTPException(status_code=400, detail=f"2FA method '{method}' is not enabled for this account")
     if (credential if method == mfa.METHOD_WEBAUTHN else code) is None:
         raise HTTPException(status_code=400, detail="Missing security key response" if method == mfa.METHOD_WEBAUTHN else "Missing code")
-    if not mfa.verify_second_factor(db, public_farm_url(), mfa_token, user.id, method, code, credential):
+    if not mfa.verify_second_factor(db, auth_manager.keyring, public_farm_url(), mfa_token, user.id, method, code, credential):
         auth_manager.record_failed_mfa_attempt(mfa_token)
         logger.warning(f"Failed {method} second factor for user '{user.username}'")
         raise HTTPException(status_code=401, detail="Invalid code or security key response")
@@ -1112,9 +1115,9 @@ def finish_enrollment(session: AuthSession, had_second_factor: bool, message: st
 def confirm_totp_enrollment(session: AuthSession, code: str) -> MfaEnrollResponse:
     db = auth_manager.db
     had_second_factor = mfa.has_second_factor(db, session.user.id)
-    if not mfa.pending_totp_secret(db, session.user.id):
+    if not mfa.pending_totp_secret(db, auth_manager.keyring, session.user.id):
         raise ValueError("No authenticator app setup in progress")
-    if not mfa.verify_totp(db, session.user.id, code, confirm=True):
+    if not mfa.verify_totp(db, auth_manager.keyring, session.user.id, code, confirm=True):
         raise ValueError("Invalid code; check the time on your device and try again")
     return finish_enrollment(session, had_second_factor, "Authenticator app enabled")
 
@@ -1275,6 +1278,13 @@ async def cleanup_cache_task():
 
 
 DEFAULT_DATABASE_PATH = Path.home() / ".apb" / "farm.db"
+DEFAULT_TOTP_KEYS_FILE = DEFAULT_DATABASE_PATH.parent / "farm-totp.keys"
+
+
+def totp_keys_file() -> Path:
+    """TOTP encryption keyring path from `totp_keys_file` in apb.json."""
+    configured = config.get("totp_keys_file")
+    return Path(configured).expanduser() if configured else DEFAULT_TOTP_KEYS_FILE
 
 # Columns added after the original builds schema, in the order existing databases received them.
 BUILD_COLUMN_MIGRATIONS = (

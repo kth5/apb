@@ -27,7 +27,8 @@ from fido2.webauthn import (
     RegistrationResponse,
 )
 
-from apb.farm import mfa
+from apb.farm import core, mfa
+from apb.farm.secret_store import decrypt_value
 
 FARM_URL = "http://localhost:8080"
 CSRF_INPUT = re.compile(r'name="csrf_token" value="([0-9a-f]+)"')
@@ -35,15 +36,24 @@ CSRF_INPUT = re.compile(r'name="csrf_token" value="([0-9a-f]+)"')
 
 def enroll_totp(db: sqlite3.Connection, user_id: int) -> pyotp.TOTP:
     """Confirm an authenticator app for the user directly in the database layer."""
-    secret = mfa.start_totp_enrollment(db, user_id)
+    keyring = core.auth_manager.keyring
+    secret = mfa.start_totp_enrollment(db, keyring, user_id)
     totp = pyotp.TOTP(secret)
-    assert mfa.verify_totp(db, user_id, totp.now(), confirm=True)
+    assert mfa.verify_totp(db, keyring, user_id, totp.now(), confirm=True)
     return totp
+
+
+def stored_totp_secret(db: sqlite3.Connection, user_id: int) -> str:
+    """Decrypted TOTP secret of the user from user_totp."""
+    stored = db.execute("SELECT secret FROM user_totp WHERE user_id = ?", (user_id,)).fetchone()[0]
+    secret = decrypt_value(core.auth_manager.keyring, stored, mfa._totp_aad(user_id))
+    assert secret is not None, "stored TOTP secret must decrypt with the farm keyring"
+    return secret
 
 
 def fresh_totp_code(db: sqlite3.Connection, user_id: int) -> str:
     """Current code with replay protection reset, for tests that log in more than once per time step."""
-    secret = db.execute("SELECT secret FROM user_totp WHERE user_id = ?", (user_id,)).fetchone()[0]
+    secret = stored_totp_secret(db, user_id)
     db.execute("UPDATE user_totp SET last_used_step = 0 WHERE user_id = ?", (user_id,))
     db.commit()
     return pyotp.TOTP(secret).now()

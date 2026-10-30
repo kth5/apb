@@ -17,6 +17,7 @@ depends=(
   'python-pyotp'
   'python-fido2'
   'python-segno'
+  'python-cryptography'
 )
 makedepends=(
   'python-build'

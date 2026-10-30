@@ -50,11 +50,12 @@ def farm_client(monkeypatch: pytest.MonkeyPatch):
 
     from apb.farm import core
     from apb.farm import routes as farm_routes
+    from apb.farm.secret_store import generate_keyring
     from apb.web import mount_static
 
     db = core.init_database(":memory:")
     monkeypatch.setattr(core, "build_database", db)
-    monkeypatch.setattr(core, "auth_manager", core.AuthManager(db))
+    monkeypatch.setattr(core, "auth_manager", core.AuthManager(db, keyring=generate_keyring()))
     monkeypatch.setattr(core, "config", {"servers": {}, "farm_url": "http://localhost:8080"})
     app = FastAPI()
     mount_static(app)

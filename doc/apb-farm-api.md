@@ -93,6 +93,23 @@ WebAuthn requirements:
 - Browsers only offer WebAuthn on HTTPS origins and on `http://localhost`. Serve the farm over HTTPS (for example behind the provided nginx configuration) to use security keys
 - Each pending login or session has at most one outstanding WebAuthn challenge (valid for 5 minutes); requesting new options replaces it
 
+### TOTP Key File
+
+TOTP secrets are stored encrypted with AES-256-GCM, bound to the user ID, as `v1:<key_id>:<base64url(nonce || ciphertext)>`. The keys are kept outside `farm.db`, in the file named by `totp_keys_file` in `apb.json` (default `~/.apb/farm-totp.keys`):
+
+```
+# comment lines and blank lines are ignored
+3f9a1c2e 6Pq...base64url 32-byte key...
+b71d04aa Zr1...base64url 32-byte key...
+```
+
+- One `<key_id> <base64url key>` per line; the key ID is 1-64 characters of `A-Z a-z 0-9 _ -`. The **last** key is active and used for new secrets
+- If the file does not exist, the farm creates it on startup with mode `0600` and one random key. A file readable by group or others is reported as a warning
+- Back up the key file separately from `farm.db`: without it, the stored TOTP secrets cannot be decrypted
+- On every startup, plaintext secrets (from older versions) are encrypted with the active key, and secrets encrypted with an older key are re-encrypted with it
+- **Rotation**: append a new line, for example from `python -c "import secrets,base64;print(secrets.token_hex(4), base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))"`, and restart the farm. Old lines can be removed after that restart
+- **Missing or broken keys**: if the file cannot be read or parsed, the farm still starts with an error in the log. Authenticator app logins fail and `POST /auth/my/2fa/totp` answers `400 Bad Request`, while security keys and recovery codes keep working. Secrets whose key is no longer in the file are reported at startup; those users sign in with another factor and re-enroll the authenticator app, or an admin resets their 2FA
+
 ### Token Security
 
 - **Expiration**: 10-day expiration with automatic renewal on use (`full` tokens only; pending and enrollment tokens have a fixed short lifetime)
@@ -1879,7 +1896,7 @@ CREATE INDEX idx_tokens_active ON tokens(is_active);
 ```sql
 CREATE TABLE user_totp (
     user_id INTEGER PRIMARY KEY,           -- Foreign key to users.id
-    secret TEXT NOT NULL,                  -- Base32 TOTP secret
+    secret TEXT NOT NULL,                  -- AES-256-GCM encrypted Base32 secret (v1:<key_id>:<data>)
     confirmed BOOLEAN NOT NULL DEFAULT 0,  -- Active once a code was confirmed
     last_used_step INTEGER NOT NULL DEFAULT 0, -- Last accepted time step (replay protection)
     created_at REAL NOT NULL,
@@ -1934,7 +1951,7 @@ CREATE TABLE smtp_config (
 
 - **Password Security**: PBKDF2 with 100,000 iterations and random salt per password
 - **Token Security**: SHA-256 hashing for storage, cryptographically secure random generation
-- **Second Factors**: TOTP secrets are stored in the farm database so they can be verified (protect `farm.db` accordingly); security keys only store public keys; recovery codes are stored as SHA-256 hashes
+- **Second Factors**: TOTP secrets are encrypted with AES-256-GCM using keys from a separate key file (see [TOTP Key File](#totp-key-file)); security keys only store public keys; recovery codes are stored as SHA-256 hashes
 - **Email Encryption**: SMTP passwords encrypted before database storage
 - **Database Indexes**: Optimized for authentication and query performance
 - **Automatic Cleanup**: Background task removes expired tokens every hour

@@ -169,7 +169,7 @@ async def get_my_mfa(session: core.AuthSession = Depends(core.require_enrollment
 async def start_my_totp(session: core.AuthSession = Depends(core.require_enrollment_session)) -> TotpSetupResponse:
     """Start authenticator app enrollment"""
     try:
-        secret = mfa.start_totp_enrollment(core.auth_manager.db, session.user.id)
+        secret = mfa.start_totp_enrollment(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return TotpSetupResponse(
@@ -650,7 +650,7 @@ async def account_totp_start_form(
     if not session:
         return _see_other("/login")
     try:
-        mfa.start_totp_enrollment(core.auth_manager.db, session.user.id)
+        mfa.start_totp_enrollment(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
     except ValueError as e:
         return _render_account_mfa_error(request, session, str(e))
     return _see_other("/account/2fa/totp")
@@ -680,7 +680,7 @@ async def account_totp_page(
     """QR code and confirmation form of a pending authenticator app enrollment."""
     if not session:
         return _see_other("/login")
-    secret = mfa.pending_totp_secret(core.auth_manager.db, session.user.id)
+    secret = mfa.pending_totp_secret(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
     if not secret:
         return _see_other(core.MFA_SETUP_PATH)
     return _render_account_totp(request, session, secret)
@@ -698,7 +698,7 @@ async def account_totp_confirm_form(
     try:
         enrolled = core.confirm_totp_enrollment(session, code)
     except ValueError as e:
-        secret = mfa.pending_totp_secret(core.auth_manager.db, session.user.id)
+        secret = mfa.pending_totp_secret(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
         if not secret:
             return _render_account_mfa_error(request, session, str(e))
         response = _render_account_totp(request, session, secret, error=str(e))
