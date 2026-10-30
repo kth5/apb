@@ -127,6 +127,8 @@ The system uses a JSON configuration file (`apb.json`) that defines server topol
 
 Servers listed under the `any` group act as fallbacks for `arch=('any')` packages or when load-based selection cannot reach server status endpoints.
 
+The optional `totp_keys_file` (default `~/.apb/farm-totp.keys`) holds the keys that encrypt TOTP secrets in `farm.db`. The farm creates it on first start; back it up separately from the database. See "TOTP Key File" in [doc/apb-farm-api.md](doc/apb-farm-api.md).
+
 ### Configuration File Locations
 
 Components look for `apb.json` in the following locations (in order):

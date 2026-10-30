@@ -1,0 +1,7 @@
+{% extends "server/layout.html" %}
+{% block content %}
+<p>Free in-memory build outputs and streams, and trim the build history.</p>
+<form method="post" action="/admin/cleanup">
+<button type="submit" class="button-primary">Start cleanup</button>
+</form>
+{% endblock %}

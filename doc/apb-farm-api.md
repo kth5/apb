@@ -17,6 +17,9 @@ The APB Farm implements a comprehensive token-based authentication system with r
 - **Secure Storage**: Passwords hashed with PBKDF2, tokens stored securely
 - **Token Management**: Automatic expiration, renewal, and cleanup
 - **Default Admin**: Creates default admin user on first startup
+- **Web Sessions**: The web UI logs in through `POST /login`, which stores the token in an `HttpOnly` `authToken` cookie (see [Web Form Endpoints](#web-form-endpoints))
+- **CSRF Protection**: Any non-GET request authenticated by the `authToken` cookie must carry a CSRF token (`csrf_token` form field or `X-CSRF-Token` header); requests with an `Authorization: Bearer` header are exempt
+- **Two-Factor Authentication**: TOTP authenticator apps and WebAuthn security keys (YubiKey and other FIDO2/U2F keys), with single-use recovery codes; mandatory for admins, optional for users (see [Two-Factor Authentication](#two-factor-authentication))
 
 ### User Roles
 
@@ -51,9 +54,10 @@ The APB Farm implements a comprehensive token-based authentication system with r
 
 1. **Registration**: Admins create user accounts with username/password/email
 2. **Login**: Users authenticate with credentials to receive token
-3. **Token Usage**: Include token in `Authorization: Bearer <token>` header
-4. **Auto-renewal**: Tokens automatically renewed on use (10-day expiration)
-5. **Logout**: Explicitly revoke tokens when done
+3. **Second factor**: Users with 2FA receive a short-lived `mfa_token` instead and exchange it for a token with `POST /auth/login/2fa`; admins without 2FA receive a `setup_token` that only allows enrolling a second factor
+4. **Token Usage**: Include token in `Authorization: Bearer <token>` header
+5. **Auto-renewal**: Tokens automatically renewed on use (10-day expiration)
+6. **Logout**: Explicitly revoke tokens when done
 
 ### Default Admin Account
 
@@ -61,10 +65,54 @@ On first startup, the farm creates a default admin account:
 - **Username**: `admin`
 - **Password**: `admin123`
 - **⚠️ SECURITY WARNING**: Change this password immediately after first login!
+- Admins must use two-factor authentication, so the first login of this account leads to the 2FA enrollment page (`/account/2fa`)
+
+### Two-Factor Authentication
+
+Supported second factors:
+- **TOTP**: RFC 6238 authenticator apps (6 digits, 30-second steps, SHA-1). A code is accepted for the previous, current and next time step, and every time step can only be used once per user
+- **Security keys**: WebAuthn/FIDO2 credentials, including U2F-only YubiKeys. User verification (PIN) is not required, so a touch is enough. A user can register several keys
+- **Recovery codes**: 10 single-use codes of the form `xxxxx-xxxxx`, shown once when the first second factor is enrolled and stored as SHA-256 hashes. Regenerating them invalidates the old set
+
+Rules:
+- A user has 2FA enabled as soon as a TOTP authenticator is confirmed or a security key is registered. Removing the last second factor of a regular user disables 2FA and deletes the recovery codes
+- Admins must have 2FA. They cannot remove their last second factor, and an admin without a second factor (a new admin, the default `admin` account, or after an admin reset) only receives an enrollment session when logging in
+- Promoting a user without 2FA to admin revokes all of that user's tokens, so the next login goes through enrollment
+- An admin can reset another user's 2FA with `DELETE /auth/users/{user_id}/2fa`
+
+Token scopes:
+
+| Scope | Issued by | Lifetime | Allows |
+|-------|-----------|----------|--------|
+| `full` | completed login | 10 days, renewed on use | all authenticated endpoints |
+| `mfa_pending` | `POST /auth/login` for users with 2FA | 5 minutes, not renewed, 5 failed attempts | `POST /auth/login/2fa` and `POST /auth/login/2fa/webauthn-options` |
+| `mfa_setup` | `POST /auth/login` for admins without 2FA | 15 minutes, not renewed | `/auth/my/2fa` endpoints, `/account/2fa` pages and logout |
+
+WebAuthn requirements:
+- The relying party ID is the host name of the configured `farm_url` and the expected origin is the scheme, host and port of `farm_url`. `farm_url` must therefore be the public URL users open in their browser and pass to `apb --farm-url`
+- Browsers only offer WebAuthn on HTTPS origins and on `http://localhost`. Serve the farm over HTTPS (for example behind the provided nginx configuration) to use security keys
+- Each pending login or session has at most one outstanding WebAuthn challenge (valid for 5 minutes); requesting new options replaces it
+
+### TOTP Key File
+
+TOTP secrets are stored encrypted with AES-256-GCM, bound to the user ID, as `v1:<key_id>:<base64url(nonce || ciphertext)>`. The keys are kept outside `farm.db`, in the file named by `totp_keys_file` in `apb.json` (default `~/.apb/farm-totp.keys`):
+
+```
+# comment lines and blank lines are ignored
+3f9a1c2e 6Pq...base64url 32-byte key...
+b71d04aa Zr1...base64url 32-byte key...
+```
+
+- One `<key_id> <base64url key>` per line; the key ID is 1-64 characters of `A-Z a-z 0-9 _ -`. The **last** key is active and used for new secrets
+- If the file does not exist, the farm creates it on startup with mode `0600` and one random key. A file readable by group or others is reported as a warning
+- Back up the key file separately from `farm.db`: without it, the stored TOTP secrets cannot be decrypted
+- On every startup, plaintext secrets (from older versions) are encrypted with the active key, and secrets encrypted with an older key are re-encrypted with it
+- **Rotation**: append a new line, for example from `python -c "import secrets,base64;print(secrets.token_hex(4), base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip('='))"`, and restart the farm. Old lines can be removed after that restart
+- **Missing or broken keys**: if the file cannot be read or parsed, the farm still starts with an error in the log. Authenticator app logins fail and `POST /auth/my/2fa/totp` answers `400 Bad Request`, while security keys and recovery codes keep working. Secrets whose key is no longer in the file are reported at startup; those users sign in with another factor and re-enroll the authenticator app, or an admin resets their 2FA
 
 ### Token Security
 
-- **Expiration**: 10-day expiration with automatic renewal on use
+- **Expiration**: 10-day expiration with automatic renewal on use (`full` tokens only; pending and enrollment tokens have a fixed short lifetime)
 - **Secure Hashing**: SHA-256 hashing for token storage
 - **Background Cleanup**: Expired tokens automatically removed every hour
 - **Revocation**: Individual token or all user tokens can be revoked
@@ -213,7 +261,7 @@ Get farm information and status of all managed servers.
 ```json
 {
   "status": "running",
-  "version": "2026.10.28",
+  "version": "2026.10.30",
   "servers": [
     {
       "url": "http://server1.example.com:8000",
@@ -221,7 +269,7 @@ Get farm information and status of all managed servers.
       "status": "online",
       "health": "healthy",
       "info": {
-        "version": "2026.10.28",
+        "version": "2026.10.30",
         "supported_architecture": "x86_64",
         "system_info": {
           "architecture": "x86_64",
@@ -265,7 +313,7 @@ Simple health check endpoint for the farm.
 ```json
 {
   "status": "healthy",
-  "version": "2026.10.28"
+  "version": "2026.10.30"
 }
 ```
 
@@ -280,89 +328,45 @@ Get the comprehensive farm dashboard (HTML page) showing all servers, their curr
 
 Legacy query-string URLs (`?tab=` and `?page=`) redirect to the path-based routes above.
 
-**Response:** Enhanced HTML page with:
+Tabs are plain links to these routes, so the dashboard works without JavaScript (including text browsers such as lynx and w3m). Only the data for the requested tab is queried and rendered. `/dashboard/statistics` falls back to the servers tab for guests.
 
-**Server Status by Architecture**:
-- Servers grouped by their actual supported architecture
-- Real-time health indicators (green=online, red=offline, yellow=misconfigured)
-- Current and queued build counts per server
-- Server version information and uptime
+**Response:** HTML page (rendered from templates in `apb.web`, with all values HTML-escaped) with:
 
-**Currently Running Builds**:
-- Displays up to 3 currently building packages per server with:
-  - Package name (clickable link to build details)
-  - Build start time and duration
-  - User who submitted the build (for authenticated users)
-  - "... and X more" indicator if more than 3 builds are running
+**Servers tab** (`/dashboard`):
+- Servers grouped by their actual supported architecture, plus a `misconfigured` group when needed
+- A text status badge per server (`online`, `offline`, `misconfigured (N failures)`)
+- Current and queued build counts per server, and a buildroot recreation indicator
+- Up to 3 currently building packages per server (package link, user, start time) and an "... and N more" line
 
-**Enhanced Build Monitoring**:
-- **Buildroot Recreation Tracking**: Special indicators for builds performing buildroot recreation
-- **Build Timeout Information**: Shows custom timeout configurations
-- **Architecture-specific Information**: Build architecture clearly displayed
-- **User Attribution**: Shows which user submitted each build (with appropriate permissions)
+**Builds tab** (`/dashboard/builds/{page}`):
+- Table of recent builds across all servers (20 per page) with package link, status badge, architecture, server, creation time, user and build ID
+- Previous/next links; "Next" is only shown when another page exists
 
-**Recent Build History**:
-- Paginated list of recent builds across all servers (20 per page)
-- Status-based color coding (green=completed, red=failed, blue=building, gray=cancelled)
-- Build timing information and duration
-- Package names with direct links to build details
-- User information (for authenticated users)
+**Statistics tab** (`/dashboard/statistics`, authenticated users only):
+- Top 10 users by total, successful and failed builds
 
-**Advanced Dashboard Features**:
-- **Auto-refresh**: Page refreshes every 10 seconds for real-time updates
-- **Responsive Design**: Mobile-friendly layout with proper CSS styling
-- **Permission-based Display**: Different information levels based on user role
-- **Server Health Details**: Extended server information including system stats
-- **Queue Status**: Real-time queue information and build distribution
+**Live updates:**
+- With JavaScript, the servers tab is refreshed in place every 30 seconds (paused while the browser tab is hidden). Without JavaScript the page is static; reload it manually
 
-**CSS Styling includes:**
-- Modern card-based layout for server information
-- Color-coded build status indicators
-- Responsive grid layout for different screen sizes
-- Interactive elements with hover effects
-- Status badges for server health and build states
+**Layout:**
+- Shared stylesheet served from `/static/style.css` (system fonts, light and dark color schemes via `prefers-color-scheme`, tables that stack on narrow screens)
+- Status is always shown as text, never by color alone
 
 #### GET /admin
 Get the comprehensive admin panel (Admin Only).
 
-**Request Headers:**
-- `Authorization: Bearer <admin_token>` (required)
+**Authentication:**
+- `Authorization: Bearer <admin_token>` or the dashboard `authToken` cookie (required)
+- Not logged in: `303 See Other` to `/login`; logged in without the admin role: HTML error page with status `403`
 
-**Response:** Full-featured HTML admin panel with:
+**Response:** HTML admin panel. The user list is rendered on the server; all other actions use the JSON endpoints below through `/static/admin.js` (ES5, `XMLHttpRequest`), so the admin panel requires JavaScript. A `<noscript>` notice says so. The script sends the page's CSRF token as `X-CSRF-Token`.
 
-**User Management Section**:
-- List all users with roles, creation dates, and last login
-- Create new users with username, password, role, and email
-- Delete users (with confirmation dialogs)
-- Change user roles between 'user' and 'admin'
-- Revoke user tokens for security purposes
-- View user build histories
+Sections (linked from an in-page section menu):
 
-**SMTP Configuration Section**:
-- Configure email server settings (server, port, authentication)
-- Test email configuration with test messages
-- View current SMTP configuration (passwords hidden)
-- Enable/disable TLS encryption
-- Set custom from address and display name
-
-**Server Management Section**:
-- View detailed server information including health status
-- Monitor server performance and resource usage
-- View server-specific build statistics
-- Access server logs and diagnostic information
-
-**System Statistics**:
-- Overall farm statistics and performance metrics
-- Build distribution across servers and architectures
-- User activity and build submission patterns
-- System health monitoring and alerts
-
-**Admin Panel Features**:
-- **Role-based Security**: Only accessible to admin users
-- **Real-time Updates**: Dynamic content updates without page refresh
-- **Input Validation**: Comprehensive form validation with error messages
-- **Confirmation Dialogs**: Safety confirmations for destructive actions
-- **Mobile Responsive**: Optimized for mobile and tablet access
+- **Users**: list users with role, email, notification setting, creation date and last login; create users; edit role, email and notifications; delete users (with confirmation)
+- **SMTP**: configure the email server (server, port, credentials, TLS, from address and name; the password is never shown), delete the configuration, send a test email
+- **Repositories**: list, add, edit, enable/disable and delete custom repositories
+- **Cache**: show artifact cache status and trigger a manual cleanup
 
 ---
 
@@ -487,15 +491,12 @@ Get build status. Returns HTML page by default, JSON if `format=json` is specifi
 - `build_id` (string, required): The build ID
 - `format` (string, optional): Response format (`json` or `html`)
 
-**Enhanced HTML Response:**
-Returns a comprehensive build status page with:
-- **Real-time Status**: Live updates of build progress
-- **Build Metadata**: Package name, architecture, submission time, user info
-- **Server Information**: Assigned server details and health status
-- **Live Output Streaming**: Real-time build output with auto-scroll
-- **Action Buttons**: Cancel build (if permitted), download artifacts
-- **Progress Indicators**: Build phase tracking and timing information
-- **Error Handling**: Graceful display of server unavailability
+**HTML Response:**
+One build status page covers every state: not found (404), waiting in the farm queue, submission failed (404), live status from the build server, last cached status while the server is unavailable or unreachable, and server unavailable without cached status (503). It shows:
+- **Build Metadata**: Package name, status badge, build ID, architecture, server (obfuscated), user, start and end time, duration, and the farm queue position while queued
+- **Artifacts**: Links to packages and logs
+- **Cancel**: A plain HTML form posting to `POST /build/{build_id}/cancel` when the logged-in user may cancel a queued or building build
+- **Live Updates**: While a build is not finished, the page refreshes. With JavaScript, only the status section is reloaded in place (paused while the browser tab is hidden, backing off on errors, stopping once the build finishes). Without JavaScript, a `<noscript>` meta refresh reloads the page (10 seconds while queued, 30 seconds while building or showing cached status, 60 seconds when the server is unavailable)
 
 **Enhanced JSON Response:**
 
@@ -617,6 +618,9 @@ Cancel a build with comprehensive permission checking.
 ```
 
 Builds still waiting in the farm queue (not yet assigned to a build server) are removed from the queue and marked cancelled without contacting a server.
+
+**Web form submission:**
+When the request body is `application/x-www-form-urlencoded` or `multipart/form-data` (the cancel form on the build status page), the farm authenticates with the `authToken` cookie, requires the `csrf_token` form field, and answers with `303 See Other` to `/build/{build_id}/status` instead of JSON. Errors are rendered as an HTML error page with the same status code.
 
 **Permission Rules:**
 - **Users**: Can cancel only their own builds
@@ -981,9 +985,32 @@ Authenticate user and receive access token.
     "created_at": 1642694400.0,
     "last_login": 1642694400.0,
     "email": "user@example.com",
-    "email_notifications_enabled": true
+    "email_notifications_enabled": true,
+    "mfa_enabled": false
   },
   "expires_in_days": 10
+}
+```
+
+**Response for users with 2FA** (no session token yet; continue with [POST /auth/login/2fa](#post-authlogin2fa)):
+```json
+{
+  "mfa_required": true,
+  "mfa_token": "kq3...",
+  "methods": ["totp", "webauthn", "recovery"],
+  "expires_in_seconds": 300
+}
+```
+
+`methods` lists what the user has enrolled: `totp`, `webauthn` (at least one security key) and `recovery` (unused recovery codes left).
+
+**Response for admins without 2FA** (enroll a second factor with the `/auth/my/2fa` endpoints, or in a browser at `setup_url`):
+```json
+{
+  "mfa_setup_required": true,
+  "setup_token": "Zt0...",
+  "setup_url": "https://apb-farm.example.com/account/2fa",
+  "expires_in_seconds": 900
 }
 ```
 
@@ -996,6 +1023,54 @@ Authenticate user and receive access token.
 **Error Responses:**
 - **401 Unauthorized**: Invalid username or password
 - **400 Bad Request**: Missing or invalid request data
+
+### POST /auth/login/2fa/webauthn-options
+Start a security key login for a pending 2FA login. Replaces any earlier challenge of the same pending login.
+
+**Request:**
+```json
+{
+  "mfa_token": "kq3..."
+}
+```
+
+**Response:** WebAuthn `CredentialRequestOptions` in JSON form (binary values are base64url strings), to pass to `navigator.credentials.get()` or a FIDO2 client:
+```json
+{
+  "publicKey": {
+    "challenge": "m2V...",
+    "rpId": "apb-farm.example.com",
+    "allowCredentials": [{"type": "public-key", "id": "AbC..."}],
+    "userVerification": "discouraged"
+  }
+}
+```
+
+**Error Responses:**
+- **401 Unauthorized**: Invalid or expired 2FA login
+- **400 Bad Request**: The user has no security keys
+
+### POST /auth/login/2fa
+Finish a pending 2FA login and receive a session token.
+
+**Request:**
+```json
+{
+  "mfa_token": "kq3...",
+  "method": "totp",
+  "code": "123456"
+}
+```
+
+- `method`: `totp`, `recovery` or `webauthn`
+- `code`: the authenticator code (`totp`) or a recovery code (`recovery`; dashes and case are ignored)
+- `credential`: for `webauthn`, the `PublicKeyCredential` returned for the options from `POST /auth/login/2fa/webauthn-options`, in JSON form (`id`, `rawId`, `type` and `response` with base64url `clientDataJSON`, `authenticatorData`, `signature` and `userHandle`)
+
+**Response:** the same `LoginResponse` as a login without 2FA. The pending `mfa_token` is revoked.
+
+**Error Responses:**
+- **401 Unauthorized**: Invalid or expired 2FA login, or a wrong code or security key response. After 5 failed attempts the pending login is revoked and the user has to log in with the password again
+- **400 Bad Request**: Unsupported or not enrolled `method`, or missing `code`/`credential`
 
 ### POST /auth/logout
 Logout and revoke current authentication token.
@@ -1037,7 +1112,9 @@ Get current authenticated user information.
   "role": "user",
   "created_at": 1642694400.0,
   "last_login": 1642694400.0,
-  "email": "user@example.com"
+  "email": "user@example.com",
+  "email_notifications_enabled": true,
+  "mfa_enabled": true
 }
 ```
 
@@ -1045,6 +1122,258 @@ Get current authenticated user information.
 - **Complete Profile**: Full user profile information
 - **Role Information**: Current user role and permissions
 - **Email Address**: User's email address if configured
+- **2FA Status**: `mfa_enabled` is true when the user has a confirmed authenticator or a security key
+
+---
+
+## Two-Factor Management Endpoints
+
+Endpoints for managing the second factors of the logged-in user. They accept a `full` token and the `mfa_setup` token returned to admins without 2FA. Cookie-authenticated requests need a CSRF token as usual.
+
+When a request enrolls the user's first second factor, the response contains `recovery_codes` (shown only once). When it was made with an `mfa_setup` token, the response also contains a new `full` `token` and the setup token is revoked; web requests get the new token as `authToken` cookie instead.
+
+### GET /auth/my/2fa
+**Response:**
+```json
+{
+  "enabled": true,
+  "required": false,
+  "totp_enabled": true,
+  "security_keys": [
+    {"id": 1, "name": "YubiKey 5C", "created_at": 1642694400.0, "last_used_at": 1642694800.0}
+  ],
+  "recovery_codes_remaining": 9
+}
+```
+
+### POST /auth/my/2fa/totp
+Start TOTP enrollment. Generates a new secret, replacing an unconfirmed one. The authenticator is not active until it is confirmed.
+
+**Response:**
+```json
+{
+  "secret": "JBSWY3DPEHPK3PXP",
+  "provisioning_uri": "otpauth://totp/APB%20Farm%20%28apb-farm.example.com%29:alice?secret=JBSWY3DPEHPK3PXP&issuer=APB%20Farm%20%28apb-farm.example.com%29"
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: TOTP is already enabled (remove it first)
+
+### POST /auth/my/2fa/totp/confirm
+**Request:**
+```json
+{
+  "code": "123456"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Authenticator app enabled",
+  "recovery_codes": ["3f9a1-0c2d4", "..."],
+  "token": null
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: No pending TOTP enrollment, or a wrong code
+
+### DELETE /auth/my/2fa/totp
+**Request:**
+```json
+{
+  "password": "current_password"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Authenticator app removed"
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: Wrong password, TOTP not enabled, or it is the last second factor of an admin
+
+### POST /auth/my/2fa/webauthn/register-options
+Start security key registration. Replaces any earlier challenge of the same session.
+
+**Response:** WebAuthn `CredentialCreationOptions` in JSON form (binary values are base64url strings), to pass to `navigator.credentials.create()`. Already registered keys are listed in `excludeCredentials`.
+
+### POST /auth/my/2fa/webauthn
+Finish security key registration.
+
+**Request:**
+```json
+{
+  "name": "YubiKey 5C",
+  "credential": {
+    "id": "AbC...",
+    "rawId": "AbC...",
+    "type": "public-key",
+    "response": {"clientDataJSON": "eyJ...", "attestationObject": "o2N..."}
+  }
+}
+```
+
+- `name`: 1-64 characters
+
+**Response:**
+```json
+{
+  "message": "Security key registered",
+  "recovery_codes": null,
+  "token": null
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: No registration in progress, invalid response, or the key is already registered
+
+### DELETE /auth/my/2fa/webauthn/{credential_id}
+**Parameters:**
+- `credential_id` (integer): `id` from `GET /auth/my/2fa`
+
+**Request:**
+```json
+{
+  "password": "current_password"
+}
+```
+
+**Response:**
+```json
+{
+  "message": "Security key removed"
+}
+```
+
+**Error Responses:**
+- **404 Not Found**: No such security key for this user
+- **400 Bad Request**: Wrong password, or it is the last second factor of an admin
+
+### POST /auth/my/2fa/recovery-codes
+Replace all recovery codes with a new set.
+
+**Request:**
+```json
+{
+  "password": "current_password"
+}
+```
+
+**Response:**
+```json
+{
+  "recovery_codes": ["3f9a1-0c2d4", "..."]
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: Wrong password, or 2FA is not enabled
+
+---
+
+## Web Form Endpoints
+
+HTML endpoints used by the web UI. They work with plain HTML forms and no JavaScript, so text browsers and very old browsers can log in, log out, change the password and cancel builds. The JSON endpoints above are unchanged and remain the interface for the APB client.
+
+### Web Session and CSRF
+
+- `POST /login` stores the token in an `authToken` cookie with `HttpOnly`, `SameSite=Lax`, `Path=/`, a lifetime of 10 days and `Secure` when the request came in over HTTPS
+- Pages rendered for a logged-in user embed a CSRF token, derived from the session token, as a hidden `csrf_token` form field and a `<meta name="csrf-token">` tag
+- Every non-GET request authenticated by the `authToken` cookie must send that token as the `csrf_token` form field or the `X-CSRF-Token` header; otherwise the farm answers `403 Forbidden` with `{"detail": "CSRF token missing or invalid"}`
+- Requests that send `Authorization: Bearer <token>` (the APB client) do not need a CSRF token
+
+### GET /login
+HTML login form. Redirects (`303`) to `/dashboard` when already logged in.
+
+### POST /login
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Form fields:**
+- `username` (string, required)
+- `password` (string, required)
+
+**Response:**
+- Success: `303 See Other` to `/dashboard` and sets the `authToken` cookie
+- User with 2FA: `303 See Other` to `/login/2fa` and sets the pending login in an `apbMfa` cookie (`HttpOnly`, `SameSite=Lax`, 5 minutes)
+- Admin without 2FA: `303 See Other` to `/account/2fa` and sets the `authToken` cookie to the 15-minute `mfa_setup` token
+- Invalid credentials: the login form again with an error message, status `401`
+
+### GET /login/2fa
+Second login step: a form for the authenticator or recovery code and, when the user has security keys, a "Use security key" button (needs JavaScript and WebAuthn support). The page embeds fresh WebAuthn request options. Redirects (`303`) to `/login` without a valid `apbMfa` cookie.
+
+### POST /login/2fa
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Form fields:**
+- `csrf_token` (string, required; derived from the pending login)
+- `method` (string, required): `totp`, `recovery` or `webauthn`
+- `code` (string): authenticator or recovery code
+- `credential` (string): for `webauthn`, the JSON-encoded `PublicKeyCredential`
+
+**Response:**
+- Success: `303 See Other` to `/dashboard`, sets the `authToken` cookie and clears `apbMfa`
+- Wrong code or key: the 2FA form again with an error message, status `401`
+- Expired pending login or too many attempts: the login form with an error message, status `401`
+
+### GET /account/2fa
+Two-factor settings of the logged-in user: enrolled factors, "Set up authenticator app", security key registration and removal, and recovery code regeneration. Also reachable with an `mfa_setup` session. Redirects (`303`) to `/login` when not logged in.
+
+### POST /account/2fa/totp
+Start TOTP enrollment (same as `POST /auth/my/2fa/totp`) and answer `303 See Other` to `/account/2fa/totp`.
+
+### GET /account/2fa/totp
+QR code (inline SVG), secret and confirmation form of the pending TOTP enrollment. Redirects (`303`) to `/account/2fa` when there is none.
+
+### POST /account/2fa/totp/confirm
+**Form fields:** `csrf_token`, `code`. On success renders `/account/2fa` with the recovery codes (first factor only); a setup session is replaced by a full session cookie.
+
+### POST /account/2fa/totp/delete
+**Form fields:** `csrf_token`, `password`. Removes the authenticator app.
+
+### POST /account/2fa/webauthn
+**Form fields:** `csrf_token`, `name`, `credential` (JSON-encoded `PublicKeyCredential` from `navigator.credentials.create()` with the options embedded in `/account/2fa`). On success renders `/account/2fa` with the recovery codes (first factor only).
+
+### POST /account/2fa/webauthn/{credential_id}/delete
+**Form fields:** `csrf_token`, `password`. Removes a security key.
+
+### POST /account/2fa/recovery-codes
+**Form fields:** `csrf_token`, `password`. Renders `/account/2fa` with a new set of recovery codes.
+
+All `/account/2fa` form endpoints answer validation errors with the 2FA page and status `400`, and `303 See Other` to `/login` when not logged in.
+
+### POST /logout
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Form fields:**
+- `csrf_token` (string, required when logged in)
+
+**Response:** Revokes the session token, clears the `authToken` cookie and answers `303 See Other` to `/dashboard`. A missing or wrong CSRF token returns `403`.
+
+### GET /account
+HTML account page for the logged-in user (username, role, email) with a password change form. Redirects (`303`) to `/login` when not logged in.
+
+### POST /account/password
+**Content-Type:** `application/x-www-form-urlencoded`
+
+**Form fields:**
+- `current_password` (string, required)
+- `new_password` (string, required, at least 8 characters)
+- `confirm_password` (string, required, must match `new_password`)
+- `csrf_token` (string, required)
+
+**Response:**
+- Success: revokes all tokens of the user (same as `PUT /auth/change-password`), clears the `authToken` cookie and renders the login form with a confirmation message
+- Validation error: the account page again with the error message, status `400`
+- Not logged in: `303 See Other` to `/login`
+
+### GET /static/{path}
+Stylesheet and scripts for the web UI (`style.css`, `apb.js`, `admin.js`, `webauthn.js`). Pages link them with a `?v=<version>` suffix; responses are sent with `Cache-Control: public, max-age=31536000, immutable`.
 
 ---
 
@@ -1228,6 +1557,29 @@ Update own email address (User/Admin).
 - **Self-Service**: Users can update their own email
 - **Email Validation**: Validates email format
 - **Confirmation**: Sends confirmation to new email address
+
+### DELETE /auth/users/{user_id}/2fa
+Reset a user's two-factor authentication: removes the authenticator app, all security keys and recovery codes, and revokes all tokens of the user. A reset admin has to enroll a new second factor at the next login.
+
+**Request Headers:**
+- `Authorization: Bearer <admin_token>` (required)
+
+**Parameters:**
+- `user_id` (integer): User ID
+
+**Response:**
+```json
+{
+  "message": "Two-factor authentication reset for user 2"
+}
+```
+
+**Error Responses:**
+- **400 Bad Request**: Admins cannot reset their own 2FA (use `/account/2fa`)
+- **404 Not Found**: User not found
+
+**Features:**
+- **Email Notification**: Notifies the user of the reset (if configured)
 
 ### POST /auth/users/{user_id}/revoke-tokens
 Revoke all authentication tokens for a user.
@@ -1528,6 +1880,8 @@ CREATE TABLE tokens (
     last_used_at REAL NOT NULL,            -- Unix timestamp
     expires_at REAL NOT NULL,              -- Unix timestamp
     is_active BOOLEAN DEFAULT 1,           -- Token active flag
+    scope TEXT NOT NULL DEFAULT 'full',    -- 'full', 'mfa_pending' or 'mfa_setup'
+    attempts INTEGER NOT NULL DEFAULT 0,   -- Failed second-factor attempts (mfa_pending)
     FOREIGN KEY (user_id) REFERENCES users (id)
 );
 
@@ -1536,6 +1890,45 @@ CREATE INDEX idx_tokens_hash ON tokens(token_hash);
 CREATE INDEX idx_tokens_user ON tokens(user_id);
 CREATE INDEX idx_tokens_expires ON tokens(expires_at);
 CREATE INDEX idx_tokens_active ON tokens(is_active);
+```
+
+### Two-Factor Tables
+```sql
+CREATE TABLE user_totp (
+    user_id INTEGER PRIMARY KEY,           -- Foreign key to users.id
+    secret TEXT NOT NULL,                  -- AES-256-GCM encrypted Base32 secret (v1:<key_id>:<data>)
+    confirmed BOOLEAN NOT NULL DEFAULT 0,  -- Active once a code was confirmed
+    last_used_step INTEGER NOT NULL DEFAULT 0, -- Last accepted time step (replay protection)
+    created_at REAL NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users (id)
+);
+
+CREATE TABLE webauthn_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,              -- Foreign key to users.id
+    credential_id BLOB UNIQUE NOT NULL,    -- WebAuthn credential ID
+    credential_data BLOB NOT NULL,         -- Attested credential data (AAGUID, ID, COSE public key)
+    sign_count INTEGER NOT NULL DEFAULT 0, -- Last seen signature counter
+    name TEXT NOT NULL,                    -- User-chosen key name
+    created_at REAL NOT NULL,
+    last_used_at REAL,
+    FOREIGN KEY (user_id) REFERENCES users (id)
+);
+
+CREATE TABLE recovery_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,              -- Foreign key to users.id
+    code_hash TEXT NOT NULL,               -- SHA-256 of the normalized code
+    used_at REAL,                          -- Set when the code was used
+    FOREIGN KEY (user_id) REFERENCES users (id)
+);
+
+CREATE TABLE webauthn_challenges (
+    token_hash TEXT PRIMARY KEY,           -- Token the ceremony belongs to
+    purpose TEXT NOT NULL,                 -- 'register' or 'authenticate'
+    state TEXT NOT NULL,                   -- JSON ceremony state (challenge)
+    expires_at REAL NOT NULL               -- Unix timestamp
+);
 ```
 
 ### SMTP Configuration Table
@@ -1558,6 +1951,7 @@ CREATE TABLE smtp_config (
 
 - **Password Security**: PBKDF2 with 100,000 iterations and random salt per password
 - **Token Security**: SHA-256 hashing for storage, cryptographically secure random generation
+- **Second Factors**: TOTP secrets are encrypted with AES-256-GCM using keys from a separate key file (see [TOTP Key File](#totp-key-file)); security keys only store public keys; recovery codes are stored as SHA-256 hashes
 - **Email Encryption**: SMTP passwords encrypted before database storage
 - **Database Indexes**: Optimized for authentication and query performance
 - **Automatic Cleanup**: Background task removes expired tokens every hour
@@ -1686,7 +2080,7 @@ The farm provides comprehensive error handling and fallback mechanisms:
 The farm provides comprehensive real-time monitoring across all components:
 
 ### Enhanced Dashboard Updates
-- **Auto-refresh**: Every 10 seconds for active build monitoring
+- **In-place refresh**: With JavaScript, the servers tab and unfinished build status pages reload only their status section; requests are sequential (never in parallel), paused while the browser tab is hidden, and back off after errors. Without JavaScript, build status pages use a meta refresh
 - **Live Build Display**: Shows currently running builds per server with real-time updates
 - **Server Health Indicators**: Visual indicators update in real-time
 - **Queue Status**: Real-time queue information and server capacity
@@ -1769,6 +2163,9 @@ SMTP settings are managed through the [SMTP configuration endpoints](#smtp-confi
 - **Role-based Access Control**: Granular permissions based on user roles
 - **Token Management**: Automatic cleanup of expired tokens
 - **Session Security**: Secure token generation and validation
+- **Web Sessions**: The web UI keeps its token in an `HttpOnly`, `SameSite=Lax` cookie that page scripts cannot read
+- **CSRF Protection**: Cookie-authenticated non-GET requests require a CSRF token, since older browsers ignore `SameSite`
+- **Output Escaping**: All HTML pages are rendered from autoescaped Jinja templates; user-controlled values (usernames, package names, build IDs, repository data) are never inserted as raw HTML or into inline JavaScript
 
 ### Server URL Obfuscation
 - **URL Protection**: Server URLs are obfuscated in API responses for non-admin users

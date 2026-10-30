@@ -1,6 +1,6 @@
 # Maintainer: Alexander Baldeck <alex.bldck@gmail.com>
 pkgname=apb
-pkgver=2026.10.28
+pkgver=2026.10.30
 pkgrel=1
 pkgdesc="Arch Package Builder - A distributed package building system"
 arch=('any')
@@ -14,6 +14,10 @@ depends=(
   'python-httpx'
   'python-jinja'
   'python-multipart'
+  'python-pyotp'
+  'python-fido2'
+  'python-segno'
+  'python-cryptography'
 )
 makedepends=(
   'python-build'

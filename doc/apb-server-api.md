@@ -36,6 +36,8 @@ For production deployments:
 - **Request**: `multipart/form-data` for file uploads, `application/json` for JSON requests
 - **Response**: `application/json` for API endpoints, `text/html` for web pages
 
+HTML pages (`/build/{build_id}`, `/build/{build_id}/confirm-cancel`, `/build/{build_id}/view/{filename}`, `/admin/cleanup`) are rendered from the same autoescaped templates and stylesheet as the farm UI and work without JavaScript. Their assets are served from `GET /static/{path}` (`style.css`, `apb.js`) with `Cache-Control: public, max-age=31536000, immutable`; pages link them with a `?v=<version>` suffix.
+
 ## File Size Limits
 
 The server implements configurable file size limits to prevent resource exhaustion:
@@ -227,7 +229,7 @@ Get comprehensive server information and status.
 ```json
 {
   "status": "running",
-  "version": "2026.10.28",
+  "version": "2026.10.30",
   "supported_architecture": "x86_64",
   "system_info": {
     "architecture": "x86_64",
@@ -284,7 +286,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "healthy",
-  "version": "2026.10.28",
+  "version": "2026.10.30",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 45.2,
   "checks": {
@@ -319,7 +321,7 @@ Enhanced health check endpoint that performs comprehensive system testing.
 ```json
 {
   "status": "degraded",
-  "version": "2026.10.28",
+  "version": "2026.10.30",
   "timestamp": "2024-01-20T10:00:00Z",
   "response_time_ms": 2500.1,
   "warning": "High response time",

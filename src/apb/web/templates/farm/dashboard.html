@@ -1,0 +1,70 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import build_table, pagination, status_badge %}
+{% block content %}
+<ul class="tabs">
+<li><a href="/dashboard"{% if active_tab == "servers" %} aria-current="page"{% endif %}>Servers by architecture</a></li>
+<li><a href="/dashboard/builds"{% if active_tab == "builds" %} aria-current="page"{% endif %}>Recent builds</a></li>
+{% if current_user %}
+<li><a href="/dashboard/statistics"{% if active_tab == "statistics" %} aria-current="page"{% endif %}>Statistics</a></li>
+{% endif %}
+</ul>
+
+{% if active_tab == "servers" %}
+<div data-poll-region>
+{% for arch, servers in servers_by_arch.items() %}
+<section>
+<h2>{{ arch }}</h2>
+{% for server in servers %}
+<div class="card card-{{ server.state }}">
+<p class="card-title">{{ server.url }} {{ status_badge(server.status) }}</p>
+{% if server.has_info %}
+<p class="muted small">
+Building: {{ server.current_builds_count }}, queued: {{ server.queued_builds }}
+{% if server.buildroot_recreation_count is not none %}
+&middot; <span class="badge badge-busy">buildroot recreation ({{ server.buildroot_recreation_count }})</span>
+{% endif %}
+</p>
+{% endif %}
+{% if server.running_builds %}
+<ul class="running">
+{% for build in server.running_builds %}
+<li><a href="/build/{{ build.id }}/status">{{ build.display_name }}</a> by <strong>{{ build.username }}</strong> <span class="muted">(started {{ build.start_time or "unknown" }})</span></li>
+{% endfor %}
+{% if server.more_running_builds %}
+<li class="muted">... and {{ server.more_running_builds }} more</li>
+{% endif %}
+</ul>
+{% endif %}
+</div>
+{% endfor %}
+</section>
+{% else %}
+<p class="alert alert-warning">No build servers are available.</p>
+{% endfor %}
+</div>
+
+{% elif active_tab == "builds" %}
+{{ pagination(page, prev_url, next_url) }}
+<div class="table-scroll">{{ build_table(builds) }}</div>
+{{ pagination(page, prev_url, next_url) }}
+
+{% else %}
+{% for stat in statistics %}
+<section>
+<h2>{{ stat.title }}</h2>
+{% if stat.rows %}
+<table class="data-table narrow">
+<thead><tr><th scope="col" class="num">Rank</th><th scope="col">User</th><th scope="col" class="num">{{ stat.column }}</th></tr></thead>
+<tbody>
+{% for row in stat.rows %}
+<tr><td class="num">{{ loop.index }}</td><td>{{ row.username }}</td><td class="num">{{ row.count }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+{% else %}
+<p class="muted">No data yet.</p>
+{% endif %}
+</section>
+{% endfor %}
+{% endif %}
+{% endblock %}

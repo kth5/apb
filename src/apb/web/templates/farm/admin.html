@@ -1,0 +1,161 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import status_badge %}
+{% block content %}
+<div id="admin">
+<noscript><p class="alert alert-warning">The admin panel needs JavaScript for changes. The user list below is read-only without it.</p></noscript>
+
+<nav class="section-nav" aria-label="Admin sections">
+<a href="#users">Users</a>
+<a href="#smtp">SMTP</a>
+<a href="#repositories">Repositories</a>
+<a href="#cache">Cache</a>
+</nav>
+
+<section id="users">
+<h2>Users</h2>
+<div class="table-scroll">
+<table class="data-table stack">
+<thead>
+<tr>
+<th scope="col" class="num">ID</th>
+<th scope="col">Username</th>
+<th scope="col">Email</th>
+<th scope="col">Notifications</th>
+<th scope="col">Role</th>
+<th scope="col">2FA</th>
+<th scope="col">Created</th>
+<th scope="col">Last login</th>
+<th scope="col" class="js-only hidden">Actions</th>
+</tr>
+</thead>
+<tbody>
+{% for user in users %}
+<tr>
+<td data-label="ID" class="num">{{ user.id }}</td>
+<td data-label="Username">{{ user.username }}</td>
+<td data-label="Email">{{ user.email or "none" }}</td>
+<td data-label="Notifications">{{ status_badge("enabled" if user.email_notifications_enabled else "disabled") }}</td>
+<td data-label="Role">{{ status_badge(user.role.value) }}</td>
+<td data-label="2FA">{{ status_badge("enabled" if user.id in mfa_user_ids else "disabled") }}</td>
+<td data-label="Created">{{ user.created_at | timestamp }}</td>
+<td data-label="Last login">{{ user.last_login | timestamp if user.last_login else "never" }}</td>
+<td data-label="Actions" class="js-only hidden">
+<button type="button" class="button-small" data-action="edit-user"
+ data-user-id="{{ user.id }}" data-username="{{ user.username }}" data-role="{{ user.role.value }}"
+ data-email="{{ user.email or '' }}" data-notifications="{{ 'true' if user.email_notifications_enabled else 'false' }}">Edit</button>
+{% if user.id != current_user.id and user.id in mfa_user_ids %}
+<button type="button" class="button-small" data-action="reset-mfa" data-user-id="{{ user.id }}" data-username="{{ user.username }}">Reset 2FA</button>
+{% endif %}
+{% if user.id != current_user.id %}
+<button type="button" class="button-small button-danger" data-action="delete-user" data-user-id="{{ user.id }}" data-username="{{ user.username }}">Delete</button>
+{% endif %}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<div class="card js-only hidden">
+<h3>Add user</h3>
+<form class="form" data-form="add-user">
+<div class="field"><label for="new-username">Username</label><input type="text" id="new-username" name="username" minlength="3" maxlength="50" autocomplete="off" required></div>
+<div class="field"><label for="new-password">Password</label><input type="password" id="new-password" name="password" minlength="8" autocomplete="new-password" required><span class="hint">At least 8 characters.</span></div>
+<div class="field"><label for="new-email">Email (optional)</label><input type="email" id="new-email" name="email" autocomplete="off"></div>
+<div class="field"><label for="new-role">Role</label><select id="new-role" name="role"><option value="user">user</option><option value="admin">admin</option></select></div>
+<p class="message" aria-live="polite"></p>
+<button type="submit" class="button-primary">Add user</button>
+</form>
+</div>
+</section>
+
+<section id="smtp" class="js-only hidden">
+<h2>SMTP</h2>
+<div class="card">
+<form class="form" data-form="smtp">
+<div class="field"><label for="smtp-server">Server</label><input type="text" id="smtp-server" name="server" placeholder="mail.example.com" required></div>
+<div class="field"><label for="smtp-port">Port</label><input type="number" id="smtp-port" name="port" min="1" max="65535" value="587" required></div>
+<div class="field"><label for="smtp-username">Username (optional)</label><input type="text" id="smtp-username" name="username" autocomplete="off"></div>
+<div class="field"><label for="smtp-password">Password (optional)</label><input type="password" id="smtp-password" name="password" autocomplete="new-password"><span class="hint">Leave empty to keep it unset; the stored password is never shown.</span></div>
+<div class="field"><label for="smtp-from-email">From email</label><input type="email" id="smtp-from-email" name="from_email" placeholder="noreply@example.com"></div>
+<div class="field"><label for="smtp-from-name">From name</label><input type="text" id="smtp-from-name" name="from_name" placeholder="APB Farm"></div>
+<div class="field field-check"><input type="checkbox" id="smtp-use-tls" name="use_tls" checked> <label for="smtp-use-tls">Use TLS/STARTTLS</label></div>
+<p class="message" aria-live="polite"></p>
+<button type="submit" class="button-primary">Save</button>
+<button type="button" data-action="reload-smtp">Reload</button>
+<button type="button" class="button-danger" data-action="delete-smtp">Delete configuration</button>
+</form>
+</div>
+<div class="card">
+<h3>Send test email</h3>
+<form class="form" data-form="smtp-test">
+<div class="field"><label for="smtp-test-email">Recipient</label><input type="email" id="smtp-test-email" name="test_email" required></div>
+<p class="message" aria-live="polite"></p>
+<button type="submit">Send test email</button>
+</form>
+</div>
+</section>
+
+<section id="repositories" class="js-only hidden">
+<h2>Repositories</h2>
+<p class="muted">Custom pacman repositories users can request with <code>apb_extra_repos</code> in their PKGBUILD.</p>
+<div id="repositories-list" aria-live="polite"><p class="muted">Loading repositories...</p></div>
+<div class="card">
+<h3>Add repository</h3>
+<form class="form" data-form="add-repository">
+<div class="field"><label for="repo-name">Name</label><input type="text" id="repo-name" name="name" placeholder="myrepo" required></div>
+<div class="field"><label for="repo-url">URL</label><input type="url" id="repo-url" name="url" placeholder="https://myrepo.example.com/$arch" required></div>
+<div class="field"><label for="repo-gpg">GPG key ID</label><input type="text" id="repo-gpg" name="gpg_key_id" required></div>
+<div class="field"><label for="repo-description">Description (optional)</label><input type="text" id="repo-description" name="description"></div>
+<p class="message" aria-live="polite"></p>
+<button type="submit" class="button-primary">Add repository</button>
+</form>
+</div>
+</section>
+
+<section id="cache" class="js-only hidden">
+<h2>Artifact cache</h2>
+<div class="card">
+<div id="cache-status" aria-live="polite"><p class="muted">Loading cache status...</p></div>
+<p class="message" aria-live="polite"></p>
+<button type="button" data-action="reload-cache">Refresh status</button>
+<button type="button" data-action="cleanup-cache">Clean up expired artifacts</button>
+<p class="muted small">Expired artifacts are also removed automatically every 4 hours.</p>
+</div>
+</section>
+
+<div class="dialog-backdrop hidden" data-action="close-dialog"></div>
+
+<div class="dialog hidden" id="edit-user-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-user-title">
+<h2 id="edit-user-title">Edit user</h2>
+<form class="form" data-form="edit-user">
+<input type="hidden" name="user_id">
+<div class="field"><label for="edit-username">Username</label><input type="text" id="edit-username" name="username" readonly></div>
+<div class="field"><label for="edit-role">Role</label><select id="edit-role" name="role"><option value="user">user</option><option value="admin">admin</option></select></div>
+<div class="field"><label for="edit-email">Email</label><input type="email" id="edit-email" name="email"></div>
+<div class="field field-check"><input type="checkbox" id="edit-notifications" name="email_notifications"> <label for="edit-notifications">Email notifications enabled</label></div>
+<p class="message" aria-live="polite"></p>
+<button type="submit" class="button-primary">Save</button>
+<button type="button" data-action="close-dialog">Cancel</button>
+</form>
+</div>
+
+<div class="dialog hidden" id="edit-repository-dialog" role="dialog" aria-modal="true" aria-labelledby="edit-repository-title">
+<h2 id="edit-repository-title">Edit repository</h2>
+<form class="form" data-form="edit-repository">
+<input type="hidden" name="repo_id">
+<div class="field"><label for="edit-repo-name">Name</label><input type="text" id="edit-repo-name" name="name" required></div>
+<div class="field"><label for="edit-repo-url">URL</label><input type="url" id="edit-repo-url" name="url" required></div>
+<div class="field"><label for="edit-repo-gpg">GPG key ID</label><input type="text" id="edit-repo-gpg" name="gpg_key_id" required></div>
+<div class="field"><label for="edit-repo-description">Description</label><input type="text" id="edit-repo-description" name="description"></div>
+<div class="field field-check"><input type="checkbox" id="edit-repo-active" name="is_active"> <label for="edit-repo-active">Active</label></div>
+<p class="message" aria-live="polite"></p>
+<button type="submit" class="button-primary">Save</button>
+<button type="button" data-action="close-dialog">Cancel</button>
+</form>
+</div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ static_url('admin.js') }}"></script>
+{% endblock %}

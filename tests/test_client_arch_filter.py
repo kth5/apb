@@ -167,7 +167,7 @@ def test_farm_cli_arch_filter_limits_needing_build(tmp_path: Path, monkeypatch):
         )
 
     monkeypatch.setattr("apb.client.cli.submit_build", fake_submit)
-    monkeypatch.setattr("apb.client.cli.load_config", lambda _c: {"farm_url": "http://farm/"})
+    monkeypatch.setattr("apb.client.cli.load_config_with_source", lambda _c: ({"farm_url": "http://farm/"}, None))
     monkeypatch.setattr(
         "apb.client.cli.sys.argv",
         [

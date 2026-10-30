@@ -1,31 +1,45 @@
 """APB farm HTTP routes."""
 
+import asyncio
 import json
 import logging
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from markupsafe import Markup
 
 from apb import VERSION
 from apb.constants import (
-    ADMIN_ROLE,
     GUEST_BUILD_LOG_TAIL_LINES,
     GUEST_ROLE,
+    TOKEN_EXPIRY_DAYS,
+    BuildStatus,
 )
-from apb.farm import core
+from apb.farm import core, mfa
 from apb.models import (
     BuildListResponse,
     BuildStatusResponse,
     BuildSummary,
     LoginRequest,
     LoginResponse,
+    MfaChallengeResponse,
+    MfaEnrollResponse,
+    MfaSetupRequiredResponse,
+    MfaStatusResponse,
+    MfaTokenRequest,
+    MfaVerifyRequest,
+    PasswordConfirmRequest,
+    RecoveryCodesResponse,
+    TotpConfirmRequest,
+    TotpSetupResponse,
     UserResponse,
+    WebAuthnRegisterRequest,
 )
 from apb.tarball import InvalidBuildTarball, extract_build_tarball
 from apb.upstream import (
@@ -36,6 +50,7 @@ from apb.upstream import (
     upstream_url,
 )
 from apb.validation import validate_build_timeout
+from apb.web import render_page
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,17 +60,194 @@ def _build_status_json(build_status: Dict) -> Dict:
     return BuildStatusResponse.model_validate(build_status).model_dump(exclude_none=True)
 
 
-@router.post("/auth/login", response_model=LoginResponse)
-async def login(login_data: LoginRequest) -> LoginResponse:
-    """Login with username and password"""
+def _is_admin(user: Optional[core.User]) -> bool:
+    return bool(user and user.role == core.UserRole.ADMIN)
+
+
+def _display_server_url(server_url: str, current_user: Optional[core.User]) -> str:
+    return server_url if _is_admin(current_user) else core.obfuscate_server_url(server_url)
+
+
+def _render_farm_page(
+    template_name: str,
+    request: Optional[Request],
+    current_user: Optional[core.User],
+    *,
+    status_code: int = 200,
+    csrf_session: Optional[str] = None,
+    **context: Any,
+) -> HTMLResponse:
+    """csrf_session overrides the token the CSRF token is derived from (pending logins, freshly issued sessions)."""
+    csrf_token = core.csrf_token_for(csrf_session or (core.session_token(request) if current_user else None))
+    return render_page(
+        template_name,
+        status_code=status_code,
+        current_user=current_user,
+        csrf_token=csrf_token,
+        **context,
+    )
+
+
+def _render_farm_error(
+    request: Optional[Request],
+    current_user: Optional[core.User],
+    status_code: int,
+    title: str,
+    message: str,
+    **context: Any,
+) -> HTMLResponse:
+    return _render_farm_page(
+        "farm/error.html",
+        request,
+        current_user,
+        status_code=status_code,
+        title=title,
+        message=message,
+        **context,
+    )
+
+
+def _set_cookie(response: Response, request: Request, name: str, token: str, max_age: int) -> None:
+    is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
+    response.set_cookie(
+        name,
+        token,
+        max_age=max_age,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=is_https,
+    )
+
+
+def _set_session_cookie(response: Response, request: Request, token: str) -> None:
+    _set_cookie(response, request, core.AUTH_COOKIE_NAME, token, TOKEN_EXPIRY_DAYS * 24 * 3600)
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(core.AUTH_COOKIE_NAME, path="/")
+
+
+def _clear_mfa_cookie(response: Response) -> None:
+    response.delete_cookie(core.MFA_COOKIE_NAME, path="/")
+
+
+def _see_other(path: str) -> RedirectResponse:
+    return RedirectResponse(url=path, status_code=303)
+
+
+@router.post("/auth/login", response_model=Union[LoginResponse, MfaChallengeResponse, MfaSetupRequiredResponse])
+async def login(login_data: LoginRequest) -> core.LoginResult:
+    """Login with username and password; users with 2FA get a pending login instead of a token"""
     user = core.auth_manager.authenticate_user(login_data.username, login_data.password)
 
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    token = core.auth_manager.create_token(user)
+    return core.start_login(user)
 
-    return LoginResponse(token=token, user=core.user_response(user))
+
+@router.post("/auth/login/2fa/webauthn-options")
+async def login_webauthn_options(request_data: MfaTokenRequest) -> Dict[str, Any]:
+    """WebAuthn request options for a pending 2FA login"""
+    return core.mfa_login_options(request_data.mfa_token)
+
+
+@router.post("/auth/login/2fa", response_model=LoginResponse)
+async def login_second_factor(request_data: MfaVerifyRequest) -> LoginResponse:
+    """Finish a pending 2FA login with a TOTP code, recovery code or security key response"""
+    return core.complete_mfa_login(request_data.mfa_token, request_data.method, request_data.code, request_data.credential)
+
+
+@router.get("/auth/my/2fa", response_model=MfaStatusResponse)
+async def get_my_mfa(session: core.AuthSession = Depends(core.require_enrollment_session)) -> MfaStatusResponse:
+    """Two-factor status of the current user"""
+    return mfa.mfa_status(core.auth_manager.db, session.user.id, _is_admin(session.user))
+
+
+@router.post("/auth/my/2fa/totp", response_model=TotpSetupResponse)
+async def start_my_totp(session: core.AuthSession = Depends(core.require_enrollment_session)) -> TotpSetupResponse:
+    """Start authenticator app enrollment"""
+    try:
+        secret = mfa.start_totp_enrollment(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return TotpSetupResponse(
+        secret=secret,
+        provisioning_uri=mfa.totp_provisioning_uri(secret, session.user.username, core.public_farm_url()),
+    )
+
+
+@router.post("/auth/my/2fa/totp/confirm", response_model=MfaEnrollResponse)
+async def confirm_my_totp(
+    request_data: TotpConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> MfaEnrollResponse:
+    """Activate the authenticator app with a first code"""
+    try:
+        return core.confirm_totp_enrollment(session, request_data.code)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/auth/my/2fa/totp")
+async def remove_my_totp(
+    request_data: PasswordConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> Dict[str, str]:
+    """Remove the authenticator app"""
+    return {"message": _remove_second_factor(session.user, request_data.password)}
+
+
+@router.post("/auth/my/2fa/webauthn/register-options")
+async def my_webauthn_register_options(session: core.AuthSession = Depends(core.require_enrollment_session)) -> Dict[str, Any]:
+    """WebAuthn creation options for registering a security key"""
+    return mfa.registration_options(
+        core.auth_manager.db, core.public_farm_url(), session.token, session.user.id, session.user.username
+    )
+
+
+@router.post("/auth/my/2fa/webauthn", response_model=MfaEnrollResponse)
+async def register_my_webauthn(
+    request_data: WebAuthnRegisterRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> MfaEnrollResponse:
+    """Finish security key registration"""
+    try:
+        return core.register_security_key(session, request_data.name, request_data.credential)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/auth/my/2fa/webauthn/{credential_id}")
+async def remove_my_webauthn(
+    credential_id: int,
+    request_data: PasswordConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> Dict[str, str]:
+    """Remove a security key"""
+    return {"message": _remove_second_factor(session.user, request_data.password, credential_id)}
+
+
+@router.post("/auth/my/2fa/recovery-codes", response_model=RecoveryCodesResponse)
+async def regenerate_my_recovery_codes(
+    request_data: PasswordConfirmRequest,
+    session: core.AuthSession = Depends(core.require_enrollment_session),
+) -> RecoveryCodesResponse:
+    """Replace all recovery codes"""
+    try:
+        return RecoveryCodesResponse(recovery_codes=core.regenerate_recovery_codes(session.user, request_data.password))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _remove_second_factor(user: core.User, password: str, key_id: Optional[int] = None) -> str:
+    try:
+        return core.remove_second_factor(user, password, key_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/auth/logout")
@@ -196,6 +388,28 @@ async def change_user_role(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.delete("/auth/users/{user_id}/2fa")
+async def reset_user_mfa(
+    user_id: int,
+    current_user: core.User = Depends(core.require_admin)
+):
+    """Remove all second factors of a user and end their sessions (admin only)"""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot reset your own 2FA; use /account/2fa")
+    user = core.auth_manager.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    core.reset_user_mfa(user_id)
+    logger.warning(f"Admin '{current_user.username}' reset 2FA of user '{user.username}'")
+    if user.email:
+        try:
+            core.auth_manager.send_user_notification(user.email, 'mfa_reset', user.username, current_user.username)
+        except Exception as e:
+            logger.warning(f"Failed to send 2FA reset email to {user.email}: {e}")
+    return {"message": f"Two-factor authentication reset for user {user_id}"}
+
+
 @router.post("/auth/users/{user_id}/revoke-tokens")
 async def revoke_user_tokens(
     user_id: int,
@@ -227,29 +441,409 @@ async def change_password(
     """Change current user's password"""
     global auth_manager
 
-    # Get current user
     current_user = await core.get_current_user(credentials, request)
     if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    # Validate password confirmation
-    if password_data.new_password != password_data.confirm_password:
-        raise HTTPException(status_code=400, detail="New password and confirmation do not match")
-
-    # Change password
-    success = core.auth_manager.change_password(
-        current_user.id,
-        password_data.current_password,
-        password_data.new_password
-    )
-
-    if not success:
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
-
-    # Revoke all existing tokens for this user (force re-login)
-    core.auth_manager.revoke_user_tokens(current_user.id)
+    try:
+        core.change_user_password(
+            current_user,
+            password_data.current_password,
+            password_data.new_password,
+            password_data.confirm_password,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     return {"message": "Password changed successfully. Please log in again."}
+
+
+# Web form endpoints (work without JavaScript)
+
+@router.get("/login")
+async def login_page(
+    request: Request,
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
+    """HTML login form."""
+    if current_user:
+        return _see_other("/dashboard")
+    return _render_farm_page("farm/login.html", request, None, title="Log in", nav="login")
+
+
+@router.post("/login")
+async def login_form(
+    request: Request,
+    username: str = Form(""),
+    password: str = Form(""),
+):
+    """Log in from the HTML form and start a cookie session."""
+    user = core.auth_manager.authenticate_user(username, password) if username and password else None
+    if not user:
+        return _render_farm_page(
+            "farm/login.html",
+            request,
+            None,
+            status_code=401,
+            title="Log in",
+            nav="login",
+            username=username,
+            error="Invalid username or password",
+        )
+
+    result = core.start_login(user)
+    if isinstance(result, MfaChallengeResponse):
+        response = _see_other("/login/2fa")
+        _set_cookie(response, request, core.MFA_COOKIE_NAME, result.mfa_token, result.expires_in_seconds)
+        return response
+    if isinstance(result, MfaSetupRequiredResponse):
+        response = _see_other(core.MFA_SETUP_PATH)
+        _set_session_cookie(response, request, result.setup_token)
+        return response
+
+    response = _see_other("/dashboard")
+    _set_session_cookie(response, request, result.token)
+    return response
+
+
+def _pending_login(request: Request) -> tuple[Optional[str], Optional[core.User]]:
+    pending_token = request.cookies.get(core.MFA_COOKIE_NAME)
+    user = core.auth_manager.validate_token(pending_token, (mfa.TOKEN_SCOPE_MFA_PENDING,)) if pending_token else None
+    return pending_token, user
+
+
+def _render_login_second_factor(
+    request: Request, pending_token: str, user: core.User, *, status_code: int = 200, error: Optional[str] = None
+) -> HTMLResponse:
+    methods = mfa.available_methods(core.auth_manager.db, user.id)
+    webauthn_options = core.mfa_login_options(pending_token) if mfa.METHOD_WEBAUTHN in methods else None
+    return _render_farm_page(
+        "farm/login_2fa.html",
+        request,
+        None,
+        status_code=status_code,
+        csrf_session=pending_token,
+        title="Two-factor authentication",
+        nav="login",
+        methods=methods,
+        webauthn_options=webauthn_options,
+        error=error,
+    )
+
+
+def _render_login_expired(request: Request) -> HTMLResponse:
+    response = _render_farm_page(
+        "farm/login.html",
+        request,
+        None,
+        status_code=401,
+        title="Log in",
+        nav="login",
+        error="Your two-factor login expired or had too many failed attempts. Please log in again.",
+    )
+    _clear_mfa_cookie(response)
+    return response
+
+
+@router.get("/login/2fa")
+async def login_second_factor_page(request: Request):
+    """Second login step: authenticator code, recovery code or security key."""
+    pending_token, user = _pending_login(request)
+    if not user:
+        return _see_other("/login")
+    return _render_login_second_factor(request, pending_token, user)
+
+
+@router.post("/login/2fa")
+async def login_second_factor_form(
+    request: Request,
+    method: str = Form(""),
+    code: str = Form(""),
+    credential: str = Form(""),
+):
+    """Finish the 2FA login from the HTML form and start a cookie session."""
+    pending_token, user = _pending_login(request)
+    if not user:
+        return _render_login_expired(request)
+    await core.require_csrf(request, pending_token)
+
+    try:
+        result = core.complete_mfa_login(pending_token, method, code or None, _parse_credential(credential))
+    except HTTPException as e:
+        pending_token, user = _pending_login(request)
+        if not user:
+            return _render_login_expired(request)
+        return _render_login_second_factor(request, pending_token, user, status_code=e.status_code, error=e.detail)
+
+    response = _see_other("/dashboard")
+    _set_session_cookie(response, request, result.token)
+    _clear_mfa_cookie(response)
+    return response
+
+
+def _parse_credential(credential: str) -> Optional[Dict[str, Any]]:
+    try:
+        parsed = json.loads(credential) if credential else None
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _render_account_mfa(
+    request: Request,
+    user: core.User,
+    token: str,
+    scope: str,
+    *,
+    status_code: int = 200,
+    **context: Any,
+) -> HTMLResponse:
+    db = core.auth_manager.db
+    return _render_farm_page(
+        "farm/account_2fa.html",
+        request,
+        user,
+        status_code=status_code,
+        csrf_session=token,
+        title="Two-factor authentication",
+        nav="account",
+        is_setup=scope == mfa.TOKEN_SCOPE_MFA_SETUP,
+        status=mfa.mfa_status(db, user.id, _is_admin(user)),
+        webauthn_options=mfa.registration_options(db, core.public_farm_url(), token, user.id, user.username),
+        **context,
+    )
+
+
+def _render_account_mfa_result(request: Request, session: core.AuthSession, enrolled: MfaEnrollResponse) -> HTMLResponse:
+    """Account 2FA page after enrollment; an enrollment session is swapped for the new full session."""
+    token = enrolled.token or session.token
+    scope = mfa.TOKEN_SCOPE_FULL if enrolled.token else session.scope
+    response = _render_account_mfa(
+        request, session.user, token, scope, success=enrolled.message, recovery_codes=enrolled.recovery_codes
+    )
+    if enrolled.token:
+        _set_session_cookie(response, request, enrolled.token)
+    return response
+
+
+def _render_account_mfa_error(request: Request, session: core.AuthSession, error: str, status_code: int = 400) -> HTMLResponse:
+    return _render_account_mfa(request, session.user, session.token, session.scope, status_code=status_code, error=error)
+
+
+@router.get(core.MFA_SETUP_PATH)
+async def account_mfa_page(
+    request: Request,
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """HTML two-factor settings of the logged-in user."""
+    if not session:
+        return _see_other("/login")
+    return _render_account_mfa(request, session.user, session.token, session.scope)
+
+
+@router.post("/account/2fa/totp")
+async def account_totp_start_form(
+    request: Request,
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Start authenticator app enrollment from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    try:
+        mfa.start_totp_enrollment(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _see_other("/account/2fa/totp")
+
+
+def _render_account_totp(request: Request, session: core.AuthSession, secret: str, **context: Any) -> HTMLResponse:
+    provisioning_uri = mfa.totp_provisioning_uri(secret, session.user.username, core.public_farm_url())
+    return _render_farm_page(
+        "farm/account_2fa_totp.html",
+        request,
+        session.user,
+        csrf_session=session.token,
+        title="Set up authenticator app",
+        nav="account",
+        secret=secret,
+        provisioning_uri=provisioning_uri,
+        qr_svg=Markup(mfa.totp_qr_svg(provisioning_uri)),
+        **context,
+    )
+
+
+@router.get("/account/2fa/totp")
+async def account_totp_page(
+    request: Request,
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """QR code and confirmation form of a pending authenticator app enrollment."""
+    if not session:
+        return _see_other("/login")
+    secret = mfa.pending_totp_secret(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
+    if not secret:
+        return _see_other(core.MFA_SETUP_PATH)
+    return _render_account_totp(request, session, secret)
+
+
+@router.post("/account/2fa/totp/confirm")
+async def account_totp_confirm_form(
+    request: Request,
+    code: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Activate the authenticator app from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    try:
+        enrolled = core.confirm_totp_enrollment(session, code)
+    except ValueError as e:
+        secret = mfa.pending_totp_secret(core.auth_manager.db, core.auth_manager.keyring, session.user.id)
+        if not secret:
+            return _render_account_mfa_error(request, session, str(e))
+        response = _render_account_totp(request, session, secret, error=str(e))
+        response.status_code = 400
+        return response
+    return _render_account_mfa_result(request, session, enrolled)
+
+
+@router.post("/account/2fa/totp/delete")
+async def account_totp_delete_form(
+    request: Request,
+    password: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Remove the authenticator app from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    return _account_remove_factor(request, session, password)
+
+
+@router.post("/account/2fa/webauthn")
+async def account_webauthn_register_form(
+    request: Request,
+    name: str = Form(""),
+    credential: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Finish security key registration from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    parsed_credential = _parse_credential(credential)
+    name = name.strip()
+    if not parsed_credential or not name or len(name) > 64:
+        return _render_account_mfa_error(request, session, "Enter a key name (up to 64 characters) and touch your security key")
+    try:
+        enrolled = core.register_security_key(session, name, parsed_credential)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _render_account_mfa_result(request, session, enrolled)
+
+
+@router.post("/account/2fa/webauthn/{credential_id}/delete")
+async def account_webauthn_delete_form(
+    request: Request,
+    credential_id: int,
+    password: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Remove a security key from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    return _account_remove_factor(request, session, password, credential_id)
+
+
+def _account_remove_factor(request: Request, session: core.AuthSession, password: str, key_id: Optional[int] = None) -> HTMLResponse:
+    try:
+        message = core.remove_second_factor(session.user, password, key_id)
+    except LookupError as e:
+        return _render_account_mfa_error(request, session, str(e), 404)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _render_account_mfa(request, session.user, session.token, session.scope, success=message)
+
+
+@router.post("/account/2fa/recovery-codes")
+async def account_recovery_codes_form(
+    request: Request,
+    password: str = Form(""),
+    session: Optional[core.AuthSession] = Depends(core.get_enrollment_session_optional),
+):
+    """Replace the recovery codes from the HTML form."""
+    if not session:
+        return _see_other("/login")
+    try:
+        recovery_codes = core.regenerate_recovery_codes(session.user, password)
+    except ValueError as e:
+        return _render_account_mfa_error(request, session, str(e))
+    return _render_account_mfa(
+        request, session.user, session.token, session.scope, success="New recovery codes generated", recovery_codes=recovery_codes
+    )
+
+
+@router.post("/logout")
+async def logout_form(request: Request):
+    """End the cookie session from the HTML form."""
+    token = core.session_token(request)
+    if token:
+        await core.require_csrf(request, token)
+        core.auth_manager.revoke_token(token)
+    response = _see_other("/dashboard")
+    _clear_session_cookie(response)
+    return response
+
+
+@router.get("/account")
+async def account_page(
+    request: Request,
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
+    """HTML account page with password change form."""
+    if not current_user:
+        return _see_other("/login")
+    return _render_account(request, current_user)
+
+
+def _render_account(request: Request, current_user: core.User, *, status_code: int = 200, **context: Any) -> HTMLResponse:
+    return _render_farm_page(
+        "farm/account.html",
+        request,
+        current_user,
+        status_code=status_code,
+        title="Account",
+        nav="account",
+        mfa_enabled=mfa.has_second_factor(core.auth_manager.db, current_user.id),
+        **context,
+    )
+
+
+@router.post("/account/password")
+async def account_password_form(
+    request: Request,
+    current_password: str = Form(""),
+    new_password: str = Form(""),
+    confirm_password: str = Form(""),
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
+    """Change the password from the HTML form; ends all sessions of the user."""
+    if not current_user:
+        return _see_other("/login")
+    try:
+        core.change_user_password(current_user, current_password, new_password, confirm_password)
+    except ValueError as e:
+        return _render_account(request, current_user, status_code=400, error=str(e))
+
+    response = _render_farm_page(
+        "farm/login.html",
+        request,
+        None,
+        title="Log in",
+        nav="login",
+        username=current_user.username,
+        success="Password changed. Please log in again.",
+    )
+    _clear_session_cookie(response)
+    return response
 
 
 @router.put("/auth/users/{user_id}/email-notifications")
@@ -502,7 +1096,7 @@ async def get_farm_info(current_user: Optional[core.User] = Depends(core.get_cur
                     server_info = await core.get_server_info(server_url)
                     if not server_info:
                         # Initial failure - don't immediately mark as misconfigured
-                        current_builds = running_builds_by_server.get(server_url, [])
+                        current_builds = _running_builds_by_server().get(server_url, [])
                         # Obfuscate URLs for non-admin users
                         display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
                         servers.append({
@@ -537,12 +1131,30 @@ async def health_check():
 @router.post("/build/{build_id}/cancel")
 async def cancel_build(
     build_id: str,
+    request: Request,
     current_user: core.User = Depends(core.require_auth)
 ):
-    """Cancel a build (users can cancel own builds, admins can cancel any)"""
-    global auth_manager
+    """Cancel a build (users can cancel own builds, admins can cancel any).
 
-    # Check permissions
+    HTML form submissions get a 303 back to the status page instead of JSON.
+    """
+    if not core.is_form_submission(request):
+        return await _cancel_build(build_id, current_user)
+    try:
+        await _cancel_build(build_id, current_user)
+    except HTTPException as e:
+        return _render_farm_error(
+            request,
+            current_user,
+            e.status_code,
+            "Cancel failed",
+            str(e.detail),
+            build_id=build_id,
+        )
+    return _see_other(f"/build/{build_id}/status")
+
+
+async def _cancel_build(build_id: str, current_user: core.User) -> Dict:
     if not core.auth_manager.can_cancel_build(current_user, build_id):
         raise HTTPException(status_code=403, detail="Not authorized to cancel this build")
 
@@ -564,14 +1176,7 @@ async def cancel_build(
         response = await core.http_session.post(upstream_url(server_url, build_cancel_path(build_id)), timeout=10)
         if response.status_code == 200:
             result = response.json()
-
-            # Update local database
-            cursor = core.build_database.cursor()
-            cursor.execute('''
-                UPDATE builds SET status = ?, end_time = ?
-                WHERE id = ?
-            ''', (core.BuildStatus.CANCELLED, time.time(), build_id))
-            core.build_database.commit()
+            core.finish_build(build_id, core.BuildStatus.CANCELLED)
 
             return {
                 "success": True,
@@ -620,6 +1225,7 @@ def legacy_dashboard_redirect_path(
 @router.get("/dashboard/builds/{page}")
 async def get_dashboard_builds_page(
     page: int,
+    request: Request,
     tab: Optional[str] = Query(None),
     page_legacy: Optional[int] = Query(None, alias="page"),
     current_user: Optional[core.User] = Depends(core.get_current_user_optional),
@@ -632,12 +1238,13 @@ async def get_dashboard_builds_page(
     )
     if redirect_path:
         return RedirectResponse(url=redirect_path, status_code=301)
-    return await _render_dashboard("builds", page, current_user)
+    return await _render_dashboard("builds", page, request, current_user)
 
 
 @router.get("/dashboard/{tab}")
 async def get_dashboard_tab(
     tab: str,
+    request: Request,
     tab_legacy: Optional[str] = Query(None, alias="tab"),
     page_legacy: Optional[int] = Query(None, alias="page"),
     current_user: Optional[core.User] = Depends(core.get_current_user_optional),
@@ -650,11 +1257,12 @@ async def get_dashboard_tab(
     )
     if redirect_path:
         return RedirectResponse(url=redirect_path, status_code=301)
-    return await _render_dashboard(tab, 1, current_user)
+    return await _render_dashboard(tab, 1, request, current_user)
 
 
 @router.get("/dashboard")
 async def get_dashboard(
+    request: Request,
     tab: Optional[str] = Query(None),
     page: Optional[int] = Query(None),
     current_user: Optional[core.User] = Depends(core.get_current_user_optional),
@@ -663,683 +1271,180 @@ async def get_dashboard(
     redirect_path = legacy_dashboard_redirect_path(tab, page, current_tab="servers", current_page=1)
     if redirect_path:
         return RedirectResponse(url=redirect_path, status_code=301)
-    return await _render_dashboard("servers", 1, current_user)
+    return await _render_dashboard("servers", 1, request, current_user)
+
+
+DASHBOARD_PAGE_SIZE = 20
+DASHBOARD_RUNNING_BUILDS_SHOWN = 3
+DASHBOARD_POLL_SECONDS = 30
+
+
+def _running_builds_by_server() -> Dict[str, List[Dict]]:
+    cursor = core.build_database.cursor()
+    cursor.execute('''
+        SELECT b.id, b.server_url, b.pkgname, b.start_time, u.username, b.epoch, b.pkgver, b.pkgrel
+        FROM builds b
+        LEFT JOIN users u ON b.user_id = u.id
+        WHERE b.status = ? AND b.server_url IS NOT NULL
+        ORDER BY b.start_time DESC
+    ''', (BuildStatus.BUILDING,))
+
+    running_builds: Dict[str, List[Dict]] = {}
+    for build_id, server_url, pkgname, start_time, username, epoch, pkgver, pkgrel in cursor.fetchall():
+        running_builds.setdefault(server_url, []).append({
+            "id": build_id,
+            "display_name": core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel),
+            "start_time": core.safe_timestamp_to_datetime(start_time),
+            "username": username or "#anon#",
+        })
+    return running_builds
+
+
+def _dashboard_server(
+    server_url: str,
+    server_info: Optional[Dict],
+    status: str,
+    state: str,
+    running_builds: List[Dict],
+    current_user: Optional[core.User],
+) -> Dict:
+    queue_status = (server_info or {}).get("queue_status", {})
+    is_busy_with_buildroot = bool(queue_status.get("server_busy_with_buildroot"))
+    return {
+        "url": _display_server_url(server_url, current_user),
+        "status": status,
+        "state": state,
+        "has_info": server_info is not None,
+        "current_builds_count": queue_status.get("current_builds_count", 0),
+        "queued_builds": queue_status.get("queued_builds", 0),
+        "buildroot_recreation_count": queue_status.get("buildroot_recreation_count", 0) if is_busy_with_buildroot else None,
+        "running_builds": running_builds[:DASHBOARD_RUNNING_BUILDS_SHOWN],
+        "more_running_builds": max(0, len(running_builds) - DASHBOARD_RUNNING_BUILDS_SHOWN),
+    }
+
+
+async def _dashboard_servers(current_user: Optional[core.User]) -> Dict[str, List[Dict]]:
+    """Servers grouped by supported architecture, plus confirmed-misconfigured servers."""
+    available_archs = await core.get_available_architectures()
+    running_builds = _running_builds_by_server()
+
+    servers_by_arch: Dict[str, List[Dict]] = {}
+    for arch, server_urls in available_archs.items():
+        server_infos = await asyncio.gather(*(core.get_server_info(server_url) for server_url in server_urls))
+        servers_by_arch[arch] = [
+            _dashboard_server(
+                server_url,
+                server_info,
+                "online" if server_info else "offline",
+                "online" if server_info else "offline",
+                running_builds.get(server_url, []),
+                current_user,
+            )
+            for server_url, server_info in zip(server_urls, server_infos)
+        ]
+
+    listed_urls = {server_url for server_urls in available_archs.values() for server_url in server_urls}
+    for server_urls in core.config.get("servers", {}).values():
+        for server_url in server_urls:
+            status = core.server_status_tracker.get(server_url)
+            if server_url in listed_urls or not status or status.health != core.ServerHealth.MISCONFIGURED:
+                continue
+            listed_urls.add(server_url)
+            servers_by_arch.setdefault("misconfigured", []).append(_dashboard_server(
+                server_url,
+                None,
+                f"misconfigured ({status.consecutive_failures} failures)",
+                "misconfigured",
+                running_builds.get(server_url, []),
+                current_user,
+            ))
+    return servers_by_arch
+
+
+def _dashboard_builds(page: int, current_user: Optional[core.User]) -> Dict[str, Any]:
+    """One page of recent builds; fetches one extra row to know whether a next page exists."""
+    cursor = core.build_database.cursor()
+    cursor.execute('''
+        SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
+        FROM builds b
+        LEFT JOIN users u ON b.user_id = u.id
+        ORDER BY b.created_at DESC LIMIT ? OFFSET ?
+    ''', (DASHBOARD_PAGE_SIZE + 1, (page - 1) * DASHBOARD_PAGE_SIZE))
+    rows = cursor.fetchall()
+
+    builds = [
+        {
+            "id": build_id,
+            "server_url": _display_server_url(server_url, current_user) if server_url else "unknown",
+            "server_arch": server_arch,
+            "display_name": core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel),
+            "status": status,
+            "created_at": core.safe_timestamp_to_datetime(created_at),
+            "username": username or "#anon#",
+        }
+        for build_id, server_url, server_arch, pkgname, status, created_at, username, epoch, pkgver, pkgrel
+        in rows[:DASHBOARD_PAGE_SIZE]
+    ]
+    has_next_page = len(rows) > DASHBOARD_PAGE_SIZE
+    return {
+        "builds": builds,
+        "prev_url": dashboard_path("builds", page - 1) if page > 1 else None,
+        "next_url": dashboard_path("builds", page + 1) if has_next_page else None,
+    }
+
+
+def _top_users(status: Optional[str] = None) -> List[Dict]:
+    """Top 10 active users by build count, optionally only counting builds with status."""
+    status_filter = "AND b.status = ?" if status else ""
+    cursor = core.build_database.cursor()
+    cursor.execute(f'''
+        SELECT u.username, COUNT(b.id) AS build_count
+        FROM users u
+        LEFT JOIN builds b ON u.id = b.user_id
+        WHERE u.is_active = 1 {status_filter}
+        GROUP BY u.id, u.username
+        ORDER BY build_count DESC
+        LIMIT 10
+    ''', (status,) if status else ())
+    return [{"username": username, "count": count} for username, count in cursor.fetchall()]
+
+
+def _dashboard_statistics() -> List[Dict]:
+    return [
+        {"title": "Top 10 users by total builds", "column": "Total builds", "rows": _top_users()},
+        {"title": "Top 10 users by successful builds", "column": "Successful builds", "rows": _top_users(BuildStatus.COMPLETED)},
+        {"title": "Top 10 users by failed builds", "column": "Failed builds", "rows": _top_users(BuildStatus.FAILED)},
+    ]
 
 
 async def _render_dashboard(
     tab: str,
     page: int,
+    request: Request,
     current_user: Optional[core.User],
 ) -> HTMLResponse:
-    """Render farm dashboard HTML."""
+    """Render farm dashboard HTML; only the active tab's data is loaded."""
     active_tab = tab if tab in VALID_DASHBOARD_TABS else "servers"
     if active_tab == "statistics" and not current_user:
         active_tab = "servers"
-    # Get server status grouped by actual supported architecture
-    available_archs = await core.get_available_architectures()
-    servers_by_arch = {}
 
-    # Get currently running builds for all servers
-    cursor = core.build_database.cursor()
-    cursor.execute('''
-        SELECT b.id, b.server_url, b.pkgname, b.start_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
-        FROM builds b
-        LEFT JOIN users u ON b.user_id = u.id
-        WHERE b.status = ? AND b.server_url IS NOT NULL
-        ORDER BY b.start_time DESC
-    ''', (core.BuildStatus.BUILDING,))
-
-    running_builds_by_server = {}
-    for build_id, server_url, pkgname, start_time, created_at, username, epoch, pkgver, pkgrel in cursor.fetchall():
-        if server_url not in running_builds_by_server:
-            running_builds_by_server[server_url] = []
-
-        # Format package name with version
-        display_name = core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
-
-        running_builds_by_server[server_url].append({
-            "id": build_id,
-            "pkgname": pkgname,
-            "display_name": display_name,
-            "start_time": core.safe_timestamp_to_datetime(start_time),
-            "created_at": core.safe_timestamp_to_datetime(created_at),
-            "username": username if username else "#anon#"
-        })
-
-    for arch, server_urls in available_archs.items():
-        servers_by_arch[arch] = []
-        for server_url in server_urls:
-            server_info = await core.get_server_info(server_url)
-            # Get running builds for this server
-            current_builds = running_builds_by_server.get(server_url, [])
-            # Show real URLs to admin users, obfuscated URLs to non-admin users
-            display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
-            servers_by_arch[arch].append({
-                "url": display_url,
-                "status": "online" if server_info else "offline",
-                "info": server_info,
-                "current_builds": current_builds,
-                "real_server_url": server_url  # Keep for matching builds
-            })
-
-    # Check for truly misconfigured servers (conservative dashboard logic)
-    for config_arch, server_urls in core.config.get("servers", {}).items():
-        for server_url in server_urls:
-            # Check if this server is already listed in available architectures
-            already_listed = any(
-                server_url in arch_servers
-                for arch_servers in available_archs.values()
-            )
-            if not already_listed:
-                # Get server status for health information
-                status = core.server_status_tracker.get(server_url)
-
-                # Only show as misconfigured if we have strong evidence
-                if status and status.health == core.ServerHealth.MISCONFIGURED:
-                    if "misconfigured" not in servers_by_arch:
-                        servers_by_arch["misconfigured"] = []
-                    # Get running builds for misconfigured server too
-                    current_builds = running_builds_by_server.get(server_url, [])
-                    # Show real URLs to admin users, obfuscated URLs to non-admin users
-                    display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
-                    servers_by_arch["misconfigured"].append({
-                        "url": display_url,
-                        "status": f"misconfigured ({status.consecutive_failures} failures)",
-                        "info": None,
-                        "current_builds": current_builds,
-                        "real_server_url": server_url
-                    })
-                elif not status or status.consecutive_failures < 3:
-                    # Don't show servers that are just initializing or have few failures
-                    pass
-
-    # Get recent builds with user information
-    cursor = core.build_database.cursor()
-    offset = (page - 1) * 20
-    cursor.execute('''
-        SELECT b.id, b.server_url, b.server_arch, b.pkgname, b.status, b.start_time, b.end_time, b.created_at, u.username, b.epoch, b.pkgver, b.pkgrel
-        FROM builds b
-        LEFT JOIN users u ON b.user_id = u.id
-        ORDER BY b.created_at DESC LIMIT 20 OFFSET ?
-    ''', (offset,))
-
-    builds = []
-    for row in cursor.fetchall():
-        # Show real URLs to admin users, obfuscated URLs to non-admin users
-        server_url = row[1]
-        display_url = "unknown"
-        if server_url:
-            display_url = server_url if (current_user and current_user.role == core.UserRole.ADMIN) else core.obfuscate_server_url(server_url)
-
-        # Format package name with version
-        pkgname = row[3]
-        epoch = row[9]
-        pkgver = row[10]
-        pkgrel = row[11]
-        display_name = core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
-
-        builds.append({
-            "id": row[0],
-            "server_url": display_url,
-            "server_arch": row[2],
-            "pkgname": pkgname,
-            "display_name": display_name,
-            "status": row[4],
-            "start_time": core.safe_timestamp_to_datetime(row[5]),
-            "end_time": core.safe_timestamp_to_datetime(row[6]),
-            "created_at": core.safe_timestamp_to_datetime(row[7]) or "unknown",
-            "username": row[8] if row[8] else "#anon#"
-        })
-
-    # Get user statistics (only for logged-in users)
-    user_stats = {}
-    if current_user:
-        # Top 10 users by total builds
-        cursor.execute('''
-            SELECT u.username, COUNT(b.id) as total_builds
-            FROM users u
-            LEFT JOIN builds b ON u.id = b.user_id
-            WHERE u.is_active = 1
-            GROUP BY u.id, u.username
-            ORDER BY total_builds DESC
-            LIMIT 10
-        ''')
-        user_stats['top_builders'] = [{'username': row[0], 'count': row[1]} for row in cursor.fetchall()]
-
-        # Top 10 users by successful builds
-        cursor.execute('''
-            SELECT u.username, COUNT(b.id) as successful_builds
-            FROM users u
-            LEFT JOIN builds b ON u.id = b.user_id
-            WHERE u.is_active = 1 AND b.status = ?
-            GROUP BY u.id, u.username
-            ORDER BY successful_builds DESC
-            LIMIT 10
-        ''', (core.BuildStatus.COMPLETED,))
-        user_stats['top_successful'] = [{'username': row[0], 'count': row[1]} for row in cursor.fetchall()]
-
-        # Top 10 users by failed builds
-        cursor.execute('''
-            SELECT u.username, COUNT(b.id) as failed_builds
-            FROM users u
-            LEFT JOIN builds b ON u.id = b.user_id
-            WHERE u.is_active = 1 AND b.status = ?
-            GROUP BY u.id, u.username
-            ORDER BY failed_builds DESC
-            LIMIT 10
-        ''', (core.BuildStatus.FAILED,))
-        user_stats['top_failed'] = [{'username': row[0], 'count': row[1]} for row in cursor.fetchall()]
-
-    # Generate HTML with authentication UI
-    auth_section = ""
-    if current_user:
-        admin_link = ""
-        if current_user.role == core.UserRole.ADMIN:
-            admin_link = '<a href="/admin" class="admin-link" title="User Administration">⚙️ Admin</a>'
-
-        auth_section = f"""
-        <div class="auth-section">
-            {admin_link}
-            <span class="auth-user clickable" onclick="showPasswordChangeForm()" title="Click to change password">👤 {current_user.username} ({current_user.role.value})</span>
-            <button onclick="logout()" class="auth-button logout-button">Logout</button>
-        </div>
-        """
+    context: Dict[str, Any] = {"active_tab": active_tab, "page": page}
+    if active_tab == "servers":
+        context["servers_by_arch"] = await _dashboard_servers(current_user)
+        context["poll_seconds"] = DASHBOARD_POLL_SECONDS
+    elif active_tab == "builds":
+        context.update(_dashboard_builds(page, current_user))
     else:
-        auth_section = """
-        <div class="auth-section">
-            <button onclick="showLoginForm()" class="auth-button login-button">Login</button>
-        </div>
-        """
+        context["statistics"] = _dashboard_statistics()
 
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>APB Farm Dashboard</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; position: relative; }}
-            .header {{ text-align: center; margin-bottom: 30px; position: relative; }}
-            .auth-section {{ position: absolute; top: 10px; right: 10px; display: flex; align-items: center; gap: 10px; }}
-            .admin-link {{ color: #ffc107; font-weight: bold; text-decoration: none; padding: 5px 8px; border-radius: 3px; background-color: rgba(255, 193, 7, 0.1); }}
-            .admin-link:hover {{ background-color: rgba(255, 193, 7, 0.2); text-decoration: underline; }}
-            .auth-user {{ margin-right: 10px; font-weight: bold; color: #28a745; }}
-            .auth-user.clickable {{ cursor: pointer; text-decoration: underline; }}
-            .auth-user.clickable:hover {{ color: #1e7e34; }}
-            .auth-button {{ padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }}
-            .login-button {{ background-color: #007bff; color: white; }}
-            .login-button:hover {{ background-color: #0056b3; }}
-            .logout-button {{ background-color: #dc3545; color: white; }}
-            .logout-button:hover {{ background-color: #c82333; }}
-            .login-form {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; display: none; }}
-            .login-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; display: none; }}
-            .login-form input {{ display: block; width: 200px; margin: 10px 0; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
-            .login-form button {{ margin: 5px; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }}
-            .login-submit {{ background-color: #28a745; color: white; }}
-            .login-cancel {{ background-color: #6c757d; color: white; }}
-            .error-message {{ color: #dc3545; margin: 10px 0; }}
-            .success-message {{ color: #28a745; margin: 10px 0; font-weight: bold; }}
-            .password-hint {{ color: #6c757d; font-size: 0.9em; margin: 5px 0; }}
-            .servers {{ margin-bottom: 30px; }}
-            .arch-group {{ margin-bottom: 20px; }}
-            .arch-title {{ font-size: 18px; font-weight: bold; margin-bottom: 10px; }}
-            .server {{ margin: 5px 0; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }}
-            .online {{ background-color: #d4edda; }}
-            .offline {{ background-color: #f8d7da; }}
-            .misconfigured {{ background-color: #fff3cd; }}
-            .builds {{ margin-top: 30px; }}
-            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-            .completed {{ background-color: #d4edda; }}
-            .failed {{ background-color: #f8d7da; }}
-            .building {{ background-color: #fff3cd; }}
-            .queued {{ background-color: #d1ecf1; }}
-            .cancelled {{ background-color: #e2e3e5; }}
-            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-            .build a:hover {{ text-decoration: underline; }}
-            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-            .pagination {{ text-align: center; margin: 20px 0; }}
-            .pagination a {{ margin: 0 5px; padding: 5px 10px; text-decoration: none; border: 1px solid #ddd; }}
-            .running-builds {{ margin-top: 8px; padding: 8px; background-color: #f8f9fa; border-radius: 3px; border-left: 3px solid #007bff; }}
-            .running-builds ul {{ margin: 5px 0 0 0; padding-left: 20px; }}
-            .running-builds li {{ margin: 2px 0; font-size: 0.9em; }}
-            .running-builds a {{ color: #007bff; text-decoration: none; }}
-            .running-builds a:hover {{ text-decoration: underline; }}
-            .running-builds small {{ color: #666; margin-left: 5px; }}
-            .tabs {{ margin: 20px 0; }}
-            .tab-buttons {{ display: flex; border-bottom: 2px solid #ddd; margin-bottom: 20px; }}
-            .tab-button {{ padding: 12px 24px; background: #f8f9fa; border: 1px solid #ddd; border-bottom: none; cursor: pointer; margin-right: 2px; border-radius: 8px 8px 0 0; transition: all 0.3s; }}
-            .tab-button:hover {{ background: #e9ecef; }}
-            .tab-button.active {{ background: white; border-bottom: 2px solid white; margin-bottom: -2px; font-weight: bold; color: #007bff; }}
-            .tab-content {{ display: none; }}
-            .tab-content.active {{ display: block; }}
-            .statistics {{ margin: 20px 0; }}
-            .stat-section {{ margin: 30px 0; }}
-            .stat-section h3 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 5px; margin-bottom: 15px; }}
-            .stats-table {{ width: 100%; border-collapse: collapse; margin: 15px 0; max-width: 600px; }}
-            .stats-table th, .stats-table td {{ border: 1px solid #ddd; padding: 12px; text-align: left; }}
-            .stats-table th {{ background-color: #f8f9fa; font-weight: bold; }}
-            .stats-table tr:nth-child(even) {{ background-color: #f8f9fa; }}
-            .stats-table tr:hover {{ background-color: #e9ecef; }}
-            .stats-table td:first-child {{ text-align: center; font-weight: bold; }}
-            .stats-table td:last-child {{ text-align: center; }}
-        </style>
-    </head>
-    <body>
-        <div class="login-overlay" id="loginOverlay" onclick="hideLoginForm()"></div>
-        <div class="login-form" id="loginForm">
-            <h3>Login to APB Farm</h3>
-            <form id="loginFormElement" onsubmit="submitLogin(event)">
-                <input type="text" id="username" placeholder="Username" required>
-                <input type="password" id="password" placeholder="Password" required>
-                <div class="error-message" id="loginError"></div>
-                <button type="submit" class="login-submit">Login</button>
-                <button type="button" class="login-cancel" onclick="hideLoginForm()">Cancel</button>
-            </form>
-        </div>
-
-        <div class="login-overlay" id="passwordChangeOverlay" onclick="hidePasswordChangeForm()"></div>
-        <div class="login-form" id="passwordChangeForm">
-            <h3>Change Password</h3>
-            <form id="passwordChangeFormElement" onsubmit="submitPasswordChange(event)">
-                <input type="password" id="currentPassword" placeholder="Current Password" required>
-                <input type="password" id="newPassword" placeholder="New Password (min 8 characters)" required>
-                <input type="password" id="confirmPassword" placeholder="Confirm New Password" required>
-                <div class="password-hint">Password must be at least 8 characters long</div>
-                <div class="error-message" id="passwordChangeError"></div>
-                <div class="success-message" id="passwordChangeSuccess"></div>
-                <button type="submit" class="login-submit">Change Password</button>
-                <button type="button" class="login-cancel" onclick="hidePasswordChangeForm()">Cancel</button>
-            </form>
-        </div>
-
-        <div class="header">
-            {auth_section}
-            <h1>APB Farm Dashboard</h1>
-            <p>Version: {VERSION}</p>
-            <p>Available Architectures: {', '.join(available_archs.keys())}</p>
-        </div>
-
-        <div class="tabs">
-            <div class="tab-buttons">
-                <div class="tab-button{' active' if active_tab == 'servers' else ''}" onclick="switchTab('servers-tab', this)">🌾 Servers by Architecture</div>
-                <div class="tab-button{' active' if active_tab == 'builds' else ''}" onclick="switchTab('builds-tab', this)">📋 Recent Builds</div>
-                {'<div class="tab-button' + (' active' if active_tab == 'statistics' else '') + '" onclick="switchTab(\'statistics-tab\', this)">📊 Statistics</div>' if current_user else ''}
-            </div>
-
-            <div id="servers-tab" class="tab-content{' active' if active_tab == 'servers' else ''}">
-                <div class="servers">
-    """
-
-    for arch, servers in servers_by_arch.items():
-        html += f"""
-            <div class="arch-group">
-                <div class="arch-title">{arch}</div>
-        """
-        for server in servers:
-            status_class = "online" if server["status"] == "online" else ("misconfigured" if arch == "misconfigured" else "offline")
-            queue_info = ""
-            buildroot_info = ""
-            if server["info"]:
-                queue_status = server["info"].get("queue_status", {})
-                queue_info = f" - Builds: {queue_status.get('current_builds_count', 0)}, Queued: {queue_status.get('queued_builds', 0)}"
-
-                # Add buildroot recreation information
-                if queue_status.get("server_busy_with_buildroot", False):
-                    buildroot_count = queue_status.get("buildroot_recreation_count", 0)
-                    buildroot_info = f" - <span style='color: #ff8c00; font-weight: bold;'>🔨 Buildroot Recreation ({buildroot_count})</span>"
-
-            # Show currently running builds
-            current_builds_html = ""
-            if server.get("current_builds"):
-                current_builds_html = "<div class='running-builds'><strong>Currently Building:</strong><ul>"
-                for build in server["current_builds"][:3]:  # Show max 3 builds to avoid clutter
-                    start_time = build["start_time"] or "unknown"
-                    username = build.get("username", "#anon#")
-                    display_name = build.get("display_name", build["pkgname"])
-                    current_builds_html += f"""
-                        <li>
-                            <a href="/build/{build['id']}/status">{display_name}</a> by <strong>{username}</strong>
-                            <small>(started: {start_time})</small>
-                        </li>
-                    """
-                if len(server["current_builds"]) > 3:
-                    current_builds_html += f"<li><em>... and {len(server['current_builds']) - 3} more</em></li>"
-                current_builds_html += "</ul></div>"
-
-            html += f"""
-                <div class="server {status_class}">
-                    <strong>{server['url']}</strong> ({server['status']}){queue_info}{buildroot_info}
-                    {current_builds_html}
-                </div>
-            """
-        html += "</div>"
-
-    builds_pagination = f"""
-                <div class="pagination">
-                    <a href="{dashboard_path('builds', max(1, page - 1))}">&laquo; Previous</a>
-                    <span>Page {page}</span>
-                    <a href="{dashboard_path('builds', page + 1)}">Next &raquo;</a>
-                </div>
-    """
-
-    html += f"""
-                </div>
-            </div>
-
-            <div id="builds-tab" class="tab-content{' active' if active_tab == 'builds' else ''}" data-page="{page}">
-                {builds_pagination}
-                <div class="builds">
-    """
-
-    for build in builds:
-        display_name = build.get('display_name', build['pkgname'])
-        html += f"""
-            <div class="build {build['status']}">
-                <strong>{display_name}</strong> - {build['status']} on {build['server_url']} ({build['server_arch']})
-                <br>
-                <span class="build-id">Build ID: {build['id']}</span>
-                <br>
-                <small>Created: {build['created_at']} by <strong>{build['username']}</strong></small>
-                <br>
-                <small>
-                    <a href="/build/{build['id']}/status">📋 View Details & Logs</a>
-                </small>
-            </div>
-        """
-
-    html += f"""
-                </div>
-                {builds_pagination}
-            </div>
-
-            {'<div id="statistics-tab" class="tab-content' + (' active' if active_tab == 'statistics' else '') + '">' if current_user else ''}
-            {'<div class="statistics">' if current_user else ''}
-
-            {'<div class="stat-section">' if current_user else ''}
-            {'<h3>📈 Top 10 Users by Total Builds</h3>' if current_user else ''}
-            {'<table class="stats-table">' if current_user else ''}
-            {'<thead><tr><th>Rank</th><th>Username</th><th>Total Builds</th></tr></thead>' if current_user else ''}
-            {'<tbody>' if current_user else ''}
-            {''.join([f'<tr><td>{i+1}</td><td>{user["username"]}</td><td>{user["count"]}</td></tr>' for i, user in enumerate(user_stats.get('top_builders', []))]) if current_user else ''}
-            {'</tbody></table></div>' if current_user else ''}
-
-            {'<div class="stat-section">' if current_user else ''}
-            {'<h3>✅ Top 10 Users by Successful Builds</h3>' if current_user else ''}
-            {'<table class="stats-table">' if current_user else ''}
-            {'<thead><tr><th>Rank</th><th>Username</th><th>Successful Builds</th></tr></thead>' if current_user else ''}
-            {'<tbody>' if current_user else ''}
-            {''.join([f'<tr><td>{i+1}</td><td>{user["username"]}</td><td>{user["count"]}</td></tr>' for i, user in enumerate(user_stats.get('top_successful', []))]) if current_user else ''}
-            {'</tbody></table></div>' if current_user else ''}
-
-            {'<div class="stat-section">' if current_user else ''}
-            {'<h3>❌ Top 10 Users by Failed Builds</h3>' if current_user else ''}
-            {'<table class="stats-table">' if current_user else ''}
-            {'<thead><tr><th>Rank</th><th>Username</th><th>Failed Builds</th></tr></thead>' if current_user else ''}
-            {'<tbody>' if current_user else ''}
-            {''.join([f'<tr><td>{i+1}</td><td>{user["username"]}</td><td>{user["count"]}</td></tr>' for i, user in enumerate(user_stats.get('top_failed', []))]) if current_user else ''}
-            {'</tbody></table></div>' if current_user else ''}
-
-            {'</div></div>' if current_user else ''}
-        </div>
-
-        <script>
-            const DASHBOARD_BUILDS_PAGE_KEY = 'dashboardBuildsPage';
-
-            function getBuildsPageFromPath() {{
-                const match = window.location.pathname.match(/^\\/dashboard\\/builds(?:\\/(\\d+))?$/);
-                return match && match[1] ? parseInt(match[1], 10) : null;
-            }}
-
-            function buildsDashboardPath(page) {{
-                return page > 1 ? `/dashboard/builds/${{page}}` : '/dashboard/builds';
-            }}
-
-            function syncDashboardBuildsPage() {{
-                const buildsTab = document.getElementById('builds-tab');
-                const pathPage = getBuildsPageFromPath();
-                const page = pathPage || parseInt(buildsTab.dataset.page || '1', 10);
-                sessionStorage.setItem(DASHBOARD_BUILDS_PAGE_KEY, String(page));
-            }}
-
-            syncDashboardBuildsPage();
-
-            // Tab switching function
-            function switchTab(tabId, button) {{
-                const buildsTab = document.getElementById('builds-tab');
-                const wasOnBuilds = buildsTab.classList.contains('active');
-
-                if (wasOnBuilds) {{
-                    const savedPage = getBuildsPageFromPath() || parseInt(buildsTab.dataset.page || '1', 10);
-                    sessionStorage.setItem(DASHBOARD_BUILDS_PAGE_KEY, String(savedPage));
-                }}
-
-                const tabName = tabId.replace('-tab', '');
-
-                if (tabName === 'builds') {{
-                    const targetPage = parseInt(sessionStorage.getItem(DASHBOARD_BUILDS_PAGE_KEY) || '1', 10);
-                    const renderedPage = parseInt(buildsTab.dataset.page || '1', 10);
-                    if (targetPage !== renderedPage) {{
-                        window.location.href = buildsDashboardPath(targetPage);
-                        return;
-                    }}
-                }}
-
-                // Hide all tab contents
-                const tabContents = document.querySelectorAll('.tab-content');
-                tabContents.forEach(content => {{
-                    content.classList.remove('active');
-                }});
-
-                // Remove active class from all tab buttons
-                const tabButtons = document.querySelectorAll('.tab-button');
-                tabButtons.forEach(btn => {{
-                    btn.classList.remove('active');
-                }});
-
-                // Show selected tab content
-                document.getElementById(tabId).classList.add('active');
-
-                // Add active class to clicked tab button
-                button.classList.add('active');
-
-                // Persist active tab in the URL so pagination and reloads keep the selection
-                let path = '/dashboard';
-                if (tabName === 'builds') {{
-                    const targetPage = parseInt(sessionStorage.getItem(DASHBOARD_BUILDS_PAGE_KEY) || '1', 10);
-                    path = buildsDashboardPath(targetPage);
-                }} else if (tabName !== 'servers') {{
-                    path = `/dashboard/${{tabName}}`;
-                }}
-                history.replaceState(null, '', path);
-            }}
-
-            function showLoginForm() {{
-                document.getElementById('loginOverlay').style.display = 'block';
-                document.getElementById('loginForm').style.display = 'block';
-                document.getElementById('username').focus();
-            }}
-
-            function hideLoginForm() {{
-                document.getElementById('loginOverlay').style.display = 'none';
-                document.getElementById('loginForm').style.display = 'none';
-                document.getElementById('loginError').textContent = '';
-                document.getElementById('loginFormElement').reset();
-            }}
-
-            function showPasswordChangeForm() {{
-                document.getElementById('passwordChangeOverlay').style.display = 'block';
-                document.getElementById('passwordChangeForm').style.display = 'block';
-                document.getElementById('currentPassword').focus();
-            }}
-
-            function hidePasswordChangeForm() {{
-                document.getElementById('passwordChangeOverlay').style.display = 'none';
-                document.getElementById('passwordChangeForm').style.display = 'none';
-                document.getElementById('passwordChangeError').textContent = '';
-                document.getElementById('passwordChangeSuccess').textContent = '';
-                document.getElementById('passwordChangeFormElement').reset();
-            }}
-
-            async function submitLogin(event) {{
-                event.preventDefault();
-
-                const username = document.getElementById('username').value;
-                const password = document.getElementById('password').value;
-                const errorDiv = document.getElementById('loginError');
-
-                try {{
-                    const response = await fetch('/auth/login', {{
-                        method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                        }},
-                        body: JSON.stringify({{ username, password }})
-                    }});
-
-                    if (response.ok) {{
-                        const data = await response.json();
-                        // Store token in localStorage and cookie
-                        localStorage.setItem('authToken', data.token);
-                        document.cookie = `authToken=${{data.token}}; path=/; max-age=${{data.expires_in_days * 24 * 3600}}; SameSite=Lax`;
-                        // Reload page to show authenticated state
-                        window.location.reload();
-                    }} else {{
-                        const errorData = await response.json();
-                        errorDiv.textContent = errorData.detail || 'Login failed';
-                    }}
-                }} catch (error) {{
-                    errorDiv.textContent = 'Network error. Please try again.';
-                    console.error('Login error:', error);
-                }}
-            }}
-
-            async function submitPasswordChange(event) {{
-                event.preventDefault();
-
-                const currentPassword = document.getElementById('currentPassword').value;
-                const newPassword = document.getElementById('newPassword').value;
-                const confirmPassword = document.getElementById('confirmPassword').value;
-                const errorDiv = document.getElementById('passwordChangeError');
-                const successDiv = document.getElementById('passwordChangeSuccess');
-
-                // Clear previous messages
-                errorDiv.textContent = '';
-                successDiv.textContent = '';
-
-                // Client-side validation
-                if (newPassword !== confirmPassword) {{
-                    errorDiv.textContent = 'New password and confirmation do not match';
-                    return;
-                }}
-
-                if (newPassword.length < 8) {{
-                    errorDiv.textContent = 'New password must be at least 8 characters long';
-                    return;
-                }}
-
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch('/auth/change-password', {{
-                        method: 'PUT',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: JSON.stringify({{
-                            current_password: currentPassword,
-                            new_password: newPassword,
-                            confirm_password: confirmPassword
-                        }})
-                    }});
-
-                    if (response.ok) {{
-                        const data = await response.json();
-                        successDiv.textContent = data.message;
-
-                        // Auto-logout and redirect to login after 3 seconds
-                        setTimeout(() => {{
-                            localStorage.removeItem('authToken');
-                            document.cookie = 'authToken=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
-                            window.location.reload();
-                        }}, 3000);
-                    }} else {{
-                        const errorData = await response.json();
-                        errorDiv.textContent = errorData.detail || 'Password change failed';
-                    }}
-                }} catch (error) {{
-                    errorDiv.textContent = 'Network error. Please try again.';
-                    console.error('Password change error:', error);
-                }}
-            }}
-
-            async function logout() {{
-                try {{
-                    const token = getAuthToken();
-                    if (token) {{
-                        await fetch('/auth/logout', {{
-                            method: 'POST',
-                            headers: {{
-                                'Authorization': `Bearer ${{token}}`
-                            }}
-                        }});
-                    }}
-                }} catch (error) {{
-                    console.error('Logout error:', error);
-                }} finally {{
-                    // Always remove token from localStorage and cookie
-                    localStorage.removeItem('authToken');
-                    document.cookie = 'authToken=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
-                    window.location.reload();
-                }}
-            }}
-
-            // Helper function to get auth token from localStorage or cookie
-            function getAuthToken() {{
-                // Try localStorage first
-                let token = localStorage.getItem('authToken');
-                if (token) return token;
-
-                // Fall back to cookie
-                const cookies = document.cookie.split(';');
-                for (let cookie of cookies) {{
-                    const [name, value] = cookie.trim().split('=');
-                    if (name === 'authToken') {{
-                        return value;
-                    }}
-                }}
-                return null;
-            }}
-
-            // Sync token between localStorage and cookie on page load
-            const token = getAuthToken();
-            if (token) {{
-                // Ensure token is in both localStorage and cookie
-                localStorage.setItem('authToken', token);
-                if (!document.cookie.includes('authToken=')) {{
-                    document.cookie = `authToken=${{token}}; path=/; max-age=${{10 * 24 * 3600}}; SameSite=Lax`;
-                }}
-
-                // Add auth header to future requests
-                const originalFetch = window.fetch;
-                window.fetch = function(...args) {{
-                    if (args[1]) {{
-                        args[1].headers = args[1].headers || {{}};
-                        args[1].headers['Authorization'] = `Bearer ${{token}}`;
-                    }} else {{
-                        args[1] = {{
-                            headers: {{ 'Authorization': `Bearer ${{token}}` }}
-                        }};
-                    }}
-                    return originalFetch.apply(this, args);
-                }};
-            }}
-        </script>
-    </body>
-    </html>
-    """
-
-    return HTMLResponse(content=html)
+    return _render_farm_page(
+        "farm/dashboard.html",
+        request,
+        current_user,
+        title="Dashboard",
+        nav=active_tab,
+        **context,
+    )
 
 
 @router.post("/build")
@@ -1491,10 +1596,34 @@ async def submit_build(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/build/{build_id}/status")
-async def get_build_status(build_id: str, format: str = Query("html")):
-    """Get build status"""
-    # First check our database for build information
+BUILD_STATUS_REFRESH_SECONDS = {
+    "queued": 10,
+    "live": 30,
+    "cached": 30,
+    "connection_failed": 30,
+    "unavailable": 60,
+    "unreachable": 60,
+}
+BUILD_STATUS_HTTP_CODES = {"not_found": 404, "submission_failed": 404, "unavailable": 503, "unreachable": 503}
+CANCELLABLE_STATES = frozenset({"queued", "live", "cached", "connection_failed"})
+
+
+def _cached_build_status(cached_response: Optional[str]) -> Optional[Dict]:
+    if not cached_response:
+        return None
+    try:
+        return json.loads(cached_response)
+    except json.JSONDecodeError:
+        return None
+
+
+async def _load_build_status(build_id: str) -> Dict[str, Any]:
+    """Resolve a build's status from the farm database, farm queue, build server or cache.
+
+    ``state`` is one of not_found, queued, submission_failed, cached (server marked
+    unavailable), unavailable, live, connection_failed (cached after a failed
+    request) or unreachable.
+    """
     cursor = core.build_database.cursor()
     cursor.execute('''
         SELECT b.server_url, b.server_arch, b.pkgname, b.status, b.last_known_status,
@@ -1504,699 +1633,188 @@ async def get_build_status(build_id: str, format: str = Query("html")):
         LEFT JOIN users u ON b.user_id = u.id
         WHERE b.id = ?
     ''', (build_id,))
-    result = cursor.fetchone()
+    row = cursor.fetchone()
 
-    if not result:
-        # Build not found in our database
-        error_detail = {
-            "error": "Build not found",
-            "detail": f"Build {build_id} was not found in the farm database. "
-                     "This build may not have been submitted through this farm, "
-                     "or the submission may have failed before being recorded.",
-            "build_id": build_id
+    if not row:
+        return {
+            "state": "not_found",
+            "error_detail": {
+                "error": "Build not found",
+                "detail": f"Build {build_id} was not found in the farm database. "
+                         "This build may not have been submitted through this farm, "
+                         "or the submission may have failed before being recorded.",
+                "build_id": build_id,
+            },
         }
-        if format == "json":
-            raise HTTPException(status_code=404, detail=error_detail)
-        else:
-            return HTMLResponse(f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Build Not Found</title>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    .header {{ text-align: center; margin-bottom: 30px; }}
-                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                    .failed {{ background-color: #f8d7da; }}
-                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                    .build a:hover {{ text-decoration: underline; }}
-                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
-                    .error-detail strong {{ color: #721c24; }}
-                </style>
-            </head>
-            <body>
-                <div class="header">
-                    <h1>APB Farm - Build Status</h1>
-                </div>
 
-                <div class="build failed">
-                    <h2>❌ Build Not Found</h2>
-                    <div class="error-detail">
-                        <strong>Error:</strong> The requested build could not be found in the farm database.
-                    </div>
-
-                    <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-
-                    <h3>Details</h3>
-                    <p>{error_detail['detail']}</p>
-
-                    <h3>Next Steps</h3>
-                    <ul>
-                        <li>Verify that you're using the correct build ID</li>
-                        <li>Ensure the build was submitted through this farm</li>
-                        <li>Check if the build was submitted to a different farm instance</li>
-                    </ul>
-
-                    <p>
-                        <a href="/dashboard">🏠 Back to Dashboard</a> |
-                        <a href="/builds/latest">📋 View Recent Builds</a>
-                    </p>
-                </div>
-            </body>
-            </html>
-            """, status_code=404)
-
-    server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response, last_status_update, created_at, username, epoch, pkgver, pkgrel = result
-    username = username if username else "#anon#"
-
-    # Format package name with version for display
-    display_name = core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel)
+    (server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response,
+     last_status_update, created_at, username, epoch, pkgver, pkgrel) = row
+    record = {
+        "server_arch": server_arch,
+        "pkgname": pkgname,
+        "status": status,
+        "last_known_status": last_known_status,
+        "last_status_update": last_status_update,
+        "created_at": created_at,
+        "username": username or "#anon#",
+        "display_name": core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel),
+        "server": core.obfuscate_server_url(server_url) if server_url else None,
+    }
 
     # Builds waiting in the farm queue have no server assignment yet
-    if not server_url and status == core.BuildStatus.QUEUED:
-        queued_status = {
-            "build_id": build_id,
-            "pkgname": pkgname,
-            "status": status,
-            "server_arch": server_arch,
-            "created_at": created_at,
-            "packages": [],
-            "logs": [],
-            "artifacts_ready": False,
-            **core.get_farm_queue_status_for_build(build_id),
+    if not server_url and status == BuildStatus.QUEUED:
+        return {
+            "state": "queued",
+            "record": record,
+            "build_status": {
+                "build_id": build_id,
+                "pkgname": pkgname,
+                "status": status,
+                "server_arch": server_arch,
+                "created_at": created_at,
+                "packages": [],
+                "logs": [],
+                "artifacts_ready": False,
+                **core.get_farm_queue_status_for_build(build_id),
+            },
         }
-        if format == "json":
-            return _build_status_json(queued_status)
-        jobs_ahead = queued_status.get("jobs_ahead", 0)
-        queue_position = queued_status.get("queue_position", "?")
-        farm_queue_size = queued_status.get("farm_queue_size", "?")
-        return HTMLResponse(f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Build Queued - {display_name}</title>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <meta http-equiv="refresh" content="10">
-            </head>
-            <body>
-                <h1>Build Queued: {display_name}</h1>
-                <p><strong>Build ID:</strong> {build_id}</p>
-                <p><strong>Architecture:</strong> {server_arch or 'pending assignment'}</p>
-                <p><strong>Queue position:</strong> {queue_position} of {farm_queue_size} ({jobs_ahead} job(s) ahead)</p>
-                <p>Waiting for an available build server slot.</p>
-                <p><a href="/build/{build_id}/status">Refresh Status</a></p>
-            </body>
-            </html>
-            """)
 
-    # If we don't have a server_url, the build failed during submission
     if not server_url:
-        error_detail = {
-            "error": "Build submission failed",
-            "detail": f"Build {build_id} failed during submission and was never assigned to a server. "
-                     f"Current status: {status}",
-            "build_id": build_id,
-            "status": status,
-            "created_at": created_at
+        return {
+            "state": "submission_failed",
+            "record": record,
+            "error_detail": {
+                "error": "Build submission failed",
+                "detail": f"Build {build_id} failed during submission and was never assigned to a server. "
+                         f"Current status: {status}",
+                "build_id": build_id,
+                "status": status,
+                "created_at": created_at,
+            },
         }
-        if format == "json":
-            raise HTTPException(status_code=404, detail=error_detail)
-        else:
-            return HTMLResponse(f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Build Submission Failed - {display_name}</title>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    .header {{ text-align: center; margin-bottom: 30px; }}
-                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                    .failed {{ background-color: #f8d7da; }}
-                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                    .build a:hover {{ text-decoration: underline; }}
-                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
-                    .error-detail strong {{ color: #721c24; }}
-                    .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
-                    .metadata p {{ margin: 5px 0; }}
-                </style>
-            </head>
-            <body>
-                <div class="header">
-                    <h1>APB Farm - Build Status</h1>
-                </div>
 
-                <div class="build failed">
-                    <h2>❌ Build Submission Failed: {display_name}</h2>
-                    <div class="error-detail">
-                        <strong>Submission Error:</strong> This build failed during submission and was never assigned to a server.
-                    </div>
-
-                    <div class="metadata">
-                        <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                        <p><strong>Package:</strong> {display_name}</p>
-                        <p><strong>Status:</strong> {status}</p>
-                        <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
-                        <p><strong>Created:</strong> {datetime.fromtimestamp(created_at).strftime('%Y-%m-%d %H:%M:%S') if created_at else 'unknown'}</p>
-                        <p><strong>Triggered by:</strong> {username}</p>
-                    </div>
-
-                    <h3>Possible Causes</h3>
-                    <ul>
-                        <li>No servers available for the target architecture</li>
-                        <li>All servers at capacity during submission</li>
-                        <li>Network connectivity issues</li>
-                        <li>Invalid PKGBUILD or source files</li>
-                    </ul>
-
-                    <h3>Next Steps</h3>
-                    <ul>
-                        <li>Check server availability for your architecture</li>
-                        <li>Verify your PKGBUILD is valid</li>
-                        <li>Try submitting the build again</li>
-                    </ul>
-
-                    <p>
-                        <a href="/dashboard">🏠 Back to Dashboard</a> |
-                        <a href="/builds/latest">📋 View Recent Builds</a> |
-                        <a href="/farm">🌾 View Farm Status</a>
-                    </p>
-                </div>
-            </body>
-            </html>
-            """, status_code=404)
-
-    # We have a server assignment - check if server is available
     if server_available is False:
-        # Server is marked as unavailable, use cached data if available
-        if cached_response:
-            try:
-                build_status = json.loads(cached_response)
-                build_status["server_unavailable"] = True
-                build_status["last_status_update"] = last_status_update
-                build_status["server_url"] = core.obfuscate_server_url(server_url)
-                build_status["server_arch"] = server_arch  # Add architecture from farm database
-
-                if format == "json":
-                    return _build_status_json(build_status)
-                else:
-                    status_class = build_status.get('status', 'unknown')
-                    # Get detailed status information if available
-                    packages = build_status.get('packages', [])
-                    logs = build_status.get('logs', [])
-                    start_time = build_status.get('start_time')
-                    end_time = build_status.get('end_time')
-                    duration = build_status.get('duration', 0)
-
-                    # Build packages HTML
-                    packages_html = ""
-                    if packages:
-                        packages_html = "<h3>📦 Available Packages</h3><ul>"
-                        for pkg in packages:
-                            packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
-                        packages_html += "</ul>"
-
-                    # Build logs HTML
-                    logs_html = ""
-                    if logs:
-                        logs_html = "<h3>📄 Build Logs</h3><ul>"
-                        for log in logs:
-                            logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
-                        logs_html += "</ul>"
-
-                    return HTMLResponse(f"""
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>Build Status (Server Unavailable) - {display_name}</title>
-                        <meta charset="utf-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1">
-                        <meta http-equiv="refresh" content="30">
-                        <style>
-                            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                            .header {{ text-align: center; margin-bottom: 30px; }}
-                            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                            .completed {{ background-color: #d4edda; }}
-                            .failed {{ background-color: #f8d7da; }}
-                            .building {{ background-color: #fff3cd; }}
-                            .queued {{ background-color: #d1ecf1; }}
-                            .cancelled {{ background-color: #e2e3e5; }}
-                            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                            .build a:hover {{ text-decoration: underline; }}
-                            .warning-detail {{ background-color: #fff3cd; padding: 15px; border: 1px solid #ffeaa7; border-radius: 5px; margin: 15px 0; }}
-                            .warning-detail strong {{ color: #856404; }}
-                            .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
-                            .metadata p {{ margin: 5px 0; }}
-                            .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
-                            .status-completed {{ background-color: #d4edda; color: #155724; }}
-                            .status-failed {{ background-color: #f8d7da; color: #721c24; }}
-                            .status-building {{ background-color: #fff3cd; color: #856404; }}
-                            .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
-                            .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
-                        </style>
-                    </head>
-                    <body>
-                        <div class="header">
-                            <h1>APB Farm - Build Status</h1>
-                            <p>Package: <strong>{display_name}</strong></p>
-                        </div>
-
-                        <div class="build {status_class}">
-                            <h2>⚠️ Build Status (Server Unavailable)</h2>
-                            <div class="warning-detail">
-                                <strong>Server Status:</strong> The build server is currently unavailable. Showing last known status.<br>
-                                <em>This page will auto-refresh every 30 seconds to check for server recovery.</em>
-                            </div>
-
-                            <div class="metadata">
-                                <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                                <p><strong>Package:</strong> {display_name}</p>
-                                <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
-                                <p><strong>Server:</strong> {core.obfuscate_server_url(server_url)} (unavailable)</p>
-                                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
-                                <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_status_update).strftime('%Y-%m-%d %H:%M:%S UTC') if last_status_update else 'unknown'}</p>
-                                <p><strong>Triggered by:</strong> {username}</p>
-                                {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
-                                {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
-                                {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
-                            </div>
-
-                            {packages_html}
-                            {logs_html}
-
-                            <h3>Actions</h3>
-                            <p>
-                                <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
-                                <a href="/dashboard">🏠 Back to Dashboard</a> |
-                                <a href="/farm">🌾 View Farm Status</a>
-                            </p>
-
-                            <div style="margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; font-size: 0.9em;">
-                                <strong>Note:</strong> This information may be outdated due to server unavailability.
-                                The server will automatically reconnect when available, and status will update.
-                            </div>
-                        </div>
-                    </body>
-                    </html>
-                    """)
-            except json.JSONDecodeError:
-                pass
-
-        # No cached data and server unavailable
-        error_detail = {
-            "error": "Server unavailable",
-            "detail": f"Build {build_id} is assigned to server {core.obfuscate_server_url(server_url)} "
-                     "but the server is currently unavailable and no cached status is available.",
-            "build_id": build_id,
-            "server_url": core.obfuscate_server_url(server_url),
-            "last_known_status": last_known_status or status
+        build_status = _cached_build_status(cached_response)
+        if build_status is not None:
+            build_status.update({
+                "server_unavailable": True,
+                "last_status_update": last_status_update,
+                "server_url": record["server"],
+                "server_arch": server_arch,
+            })
+            return {"state": "cached", "record": record, "build_status": build_status}
+        return {
+            "state": "unavailable",
+            "record": record,
+            "error_detail": {
+                "error": "Server unavailable",
+                "detail": f"Build {build_id} is assigned to server {record['server']} "
+                         "but the server is currently unavailable and no cached status is available.",
+                "build_id": build_id,
+                "server_url": record["server"],
+                "last_known_status": last_known_status or status,
+            },
         }
-        if format == "json":
-            raise HTTPException(status_code=503, detail=error_detail)
+
+    try:
+        response = await core.http_session.get(upstream_url(server_url, build_status_path(build_id)), timeout=10)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="Build not found")
+        build_status = response.json()
+        build_status["server_url"] = record["server"]
+        if server_arch:
+            build_status["server_arch"] = server_arch
         else:
-            return HTMLResponse(f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Server Unavailable - {display_name}</title>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <meta http-equiv="refresh" content="60">
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    .header {{ text-align: center; margin-bottom: 30px; }}
-                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                    .failed {{ background-color: #f8d7da; }}
-                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                    .build a:hover {{ text-decoration: underline; }}
-                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
-                    .error-detail strong {{ color: #721c24; }}
-                    .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
-                    .metadata p {{ margin: 5px 0; }}
-                    .retry-info {{ background-color: #d1ecf1; padding: 15px; border: 1px solid #bee5eb; border-radius: 5px; margin: 15px 0; }}
-                    .retry-info strong {{ color: #0c5460; }}
-                </style>
-            </head>
-            <body>
-                <div class="header">
-                    <h1>APB Farm - Build Status</h1>
-                    <p>Package: <strong>{display_name}</strong></p>
-                </div>
+            logger.warning(f"server_arch is None/empty for build {build_id}")
 
-                <div class="build failed">
-                    <h2>❌ Server Unavailable</h2>
-                    <div class="error-detail">
-                        <strong>Connection Error:</strong> The server handling this build is currently unavailable and no cached status is available.
-                    </div>
+        core.persist_live_build_status(build_id, build_status)
+        build_status = await core.enrich_build_status_with_artifact_cache(build_id, server_url, build_status)
+        return {"state": "live", "record": record, "build_status": build_status}
+    except Exception as e:
+        cursor.execute('SELECT cached_response, last_status_update, server_arch FROM builds WHERE id = ?', (build_id,))
+        cached_row = cursor.fetchone()
+        build_status = _cached_build_status(cached_row[0]) if cached_row else None
+        error = str(e.detail) if isinstance(e, HTTPException) else str(e)
+        if build_status is None:
+            return {"state": "unreachable", "record": record, "error": error}
+        record["last_status_update"] = cached_row[1]
+        build_status.update({
+            "server_unavailable": True,
+            "last_status_update": cached_row[1],
+            "server_url": record["server"],
+            "server_arch": cached_row[2],
+            "error_message": f"Server unavailable: {error}",
+        })
+        return {"state": "connection_failed", "record": record, "build_status": build_status, "error": error}
 
-                    <div class="metadata">
-                        <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                        <p><strong>Package:</strong> {display_name}</p>
-                        <p><strong>Server:</strong> {core.obfuscate_server_url(server_url)} (unavailable)</p>
-                        <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
-                        <p><strong>Last Known Status:</strong> {last_known_status or status}</p>
-                        <p><strong>Triggered by:</strong> {username}</p>
-                    </div>
 
-                    <div class="retry-info">
-                        <strong>Auto-Retry:</strong> This page will automatically refresh every 60 seconds to check for server recovery.<br>
-                        <em>The farm will continue attempting to connect to the server in the background.</em>
-                    </div>
+async def _build_status_json_response(build_id: str) -> Dict:
+    result = await _load_build_status(build_id)
+    state = result["state"]
+    if state in BUILD_STATUS_HTTP_CODES and "error_detail" in result:
+        raise HTTPException(status_code=BUILD_STATUS_HTTP_CODES[state], detail=result["error_detail"])
+    if state == "unreachable":
+        raise HTTPException(status_code=503, detail=f"Server unavailable: {result['error']}")
+    return _build_status_json(result["build_status"])
 
-                    <h3>Possible Causes</h3>
-                    <ul>
-                        <li>Server is temporarily down for maintenance</li>
-                        <li>Network connectivity issues</li>
-                        <li>Server overload or high resource usage</li>
-                        <li>Server configuration problems</li>
-                    </ul>
 
-                    <h3>What to Do</h3>
-                    <ul>
-                        <li>Wait for the server to recover (auto-refresh will detect this)</li>
-                        <li>Check the farm dashboard for other available servers</li>
-                        <li>Contact the farm administrator if the issue persists</li>
-                        <li>Consider submitting to a different architecture if available</li>
-                    </ul>
+def _build_status_page(
+    build_id: str,
+    result: Dict[str, Any],
+    request: Request,
+    current_user: Optional[core.User],
+) -> HTMLResponse:
+    state = result["state"]
+    record = result.get("record") or {}
+    build_status = result.get("build_status") or {}
+    status = build_status.get("status") or record.get("status")
+    if state == "unavailable":
+        status = record.get("last_known_status") or record.get("status")
 
-                    <h3>Actions</h3>
-                    <p>
-                        <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
-                        <a href="/dashboard">🏠 Back to Dashboard</a> |
-                        <a href="/farm">🌾 View Farm Status</a> |
-                        <a href="/builds/latest">📋 View Recent Builds</a>
-                    </p>
+    is_active = status not in BuildStatus.TERMINAL
+    refresh_seconds = BUILD_STATUS_REFRESH_SECONDS.get(state) if (is_active or state in ("unavailable", "unreachable")) else None
+    can_cancel = bool(
+        current_user
+        and state in CANCELLABLE_STATES
+        and status in (BuildStatus.QUEUED, BuildStatus.BUILDING)
+        and core.auth_manager.can_cancel_build(current_user, build_id)
+    )
+    return _render_farm_page(
+        "farm/build_status.html",
+        request,
+        current_user,
+        status_code=BUILD_STATUS_HTTP_CODES.get(state, 200),
+        title="Build not found" if state == "not_found" else f"Build: {record.get('display_name')}",
+        nav="builds",
+        state=state,
+        build_id=build_id,
+        record=record,
+        build_status=build_status,
+        status=status,
+        error=result.get("error"),
+        detail=(result.get("error_detail") or {}).get("detail"),
+        refresh_seconds=refresh_seconds,
+        can_cancel=can_cancel,
+    )
 
-                    <div style="margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; font-size: 0.9em;">
-                        <strong>Status Monitoring:</strong> The farm is actively monitoring this server and will update the build status
-                        as soon as connectivity is restored. Your build may still be running on the server.
-                    </div>
-                </div>
-            </body>
-            </html>
-            """, status_code=503)
 
-    # Server should be available - try to contact it
+@router.get("/build/{build_id}/status")
+async def get_build_status(
+    build_id: str,
+    request: Request,
+    format: str = Query("html"),
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
+):
+    """Get build status as HTML (default) or JSON (format=json)."""
     if format == "json":
-        try:
-            response = await core.http_session.get(
-                upstream_url(server_url, build_status_path(build_id)),
-                timeout=10,
-            )
-            if response.status_code == 200:
-                build_status = response.json()
-                build_status["server_url"] = core.obfuscate_server_url(server_url)
-                if server_arch:
-                    build_status["server_arch"] = server_arch  # Add architecture from farm database
-                else:
-                    logger.warning(f"server_arch is None/empty for build {build_id}")
-
-                core.persist_live_build_status(build_id, build_status)
-                build_status = await core.enrich_build_status_with_artifact_cache(
-                    build_id,
-                    server_url,
-                    build_status,
-                )
-
-                return _build_status_json(build_status)
-
-            raise HTTPException(status_code=response.status_code, detail="Build not found")
-        except Exception as e:
-            # Server is unavailable, try to return cached response
-            cursor = core.build_database.cursor()
-            cursor.execute('''
-                SELECT cached_response, last_status_update, server_arch, pkgname
-                FROM builds WHERE id = ?
-            ''', (build_id,))
-            result = cursor.fetchone()
-
-            if result and result[0]:  # cached_response exists
-                try:
-                    build_status = json.loads(result[0])
-                    build_status["server_unavailable"] = True
-                    build_status["last_status_update"] = result[1]
-                    build_status["server_url"] = core.obfuscate_server_url(server_url)
-                    build_status["server_arch"] = result[2]  # Add architecture from database result
-                    build_status["error_message"] = f"Server unavailable: {str(e)}"
-                    return _build_status_json(build_status)
-                except json.JSONDecodeError:
-                    pass
-
-            raise HTTPException(status_code=503, detail=f"Server unavailable: {str(e)}")
-    else:
-        # Generate farm's own HTML page instead of forwarding to server
-        try:
-            response = await core.http_session.get(
-                upstream_url(server_url, build_status_path(build_id)),
-                timeout=10,
-            )
-            if response.status_code == 200:
-                build_status = response.json()
-                build_status["server_url"] = core.obfuscate_server_url(server_url)
-                if server_arch:
-                    build_status["server_arch"] = server_arch
-
-                core.persist_live_build_status(build_id, build_status)
-                build_status = await core.enrich_build_status_with_artifact_cache(
-                    build_id,
-                    server_url,
-                    build_status,
-                )
-
-                # Generate HTML response
-                status_class = build_status.get('status', 'unknown')
-                packages = build_status.get('packages', [])
-                logs = build_status.get('logs', [])
-                start_time = build_status.get('start_time')
-                end_time = build_status.get('end_time')
-                duration = build_status.get('duration', 0)
-
-                # Build packages HTML
-                packages_html = ""
-                if packages:
-                    packages_html = "<h3>📦 Available Packages</h3><ul>"
-                    for pkg in packages:
-                        packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
-                    packages_html += "</ul>"
-
-                # Build logs HTML
-                logs_html = ""
-                if logs:
-                    logs_html = "<h3>📄 Build Logs</h3><ul>"
-                    for log in logs:
-                        logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
-                    logs_html += "</ul>"
-
-                return HTMLResponse(f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Build Status - {display_name}</title>
-                    <meta charset="utf-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1">
-                    <meta http-equiv="refresh" content="30">
-                    <style>
-                        body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                        .header {{ text-align: center; margin-bottom: 30px; }}
-                        .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                        .completed {{ background-color: #d4edda; }}
-                        .failed {{ background-color: #f8d7da; }}
-                        .building {{ background-color: #fff3cd; }}
-                        .queued {{ background-color: #d1ecf1; }}
-                        .cancelled {{ background-color: #e2e3e5; }}
-                        .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                        .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                        .build a:hover {{ text-decoration: underline; }}
-                        .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
-                        .metadata p {{ margin: 5px 0; }}
-                        .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
-                        .status-completed {{ background-color: #d4edda; color: #155724; }}
-                        .status-failed {{ background-color: #f8d7da; color: #721c24; }}
-                        .status-building {{ background-color: #fff3cd; color: #856404; }}
-                        .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
-                        .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
-                    </style>
-                </head>
-                <body>
-                    <div class="header">
-                        <h1>APB Farm - Build Status</h1>
-                        <p>Package: <strong>{display_name}</strong></p>
-                    </div>
-
-                    <div class="build {status_class}">
-                        <h2>📋 Build Status</h2>
-
-                        <div class="metadata">
-                            <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                            <p><strong>Package:</strong> {display_name}</p>
-                            <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
-                            <p><strong>Server:</strong> {core.obfuscate_server_url(server_url)}</p>
-                            <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
-                            <p><strong>Triggered by:</strong> {username}</p>
-                            {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
-                            {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
-                            {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
-                        </div>
-
-                        {packages_html}
-                        {logs_html}
-
-                        <h3>Actions</h3>
-                        <p>
-                            <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
-                            <a href="/dashboard">🏠 Back to Dashboard</a> |
-                            <a href="/farm">🌾 View Farm Status</a>
-                        </p>
-                    </div>
-                </body>
-                </html>
-                """)
-
-            raise HTTPException(status_code=response.status_code, detail="Build not found")
-        except Exception as e:
-            # Server is unavailable, try to return cached response as HTML
-            cursor = core.build_database.cursor()
-            cursor.execute('''
-                SELECT cached_response, last_status_update, server_arch, pkgname, epoch, pkgver, pkgrel
-                FROM builds WHERE id = ?
-            ''', (build_id,))
-            result = cursor.fetchone()
-
-            if result and result[0]:  # cached_response exists
-                try:
-                    build_status = json.loads(result[0])
-                    cached_pkgname = result[3] or 'unknown'
-                    last_update = result[1]
-                    cached_epoch = result[4]
-                    cached_pkgver = result[5]
-                    cached_pkgrel = result[6]
-                    status_class = build_status.get('status', 'unknown')
-
-                    # Format package name with version for cached response
-                    cached_display_name = core.format_package_name_with_version(cached_pkgname, cached_epoch, cached_pkgver, cached_pkgrel)
-
-                    # Get detailed status information if available
-                    packages = build_status.get('packages', [])
-                    logs = build_status.get('logs', [])
-                    start_time = build_status.get('start_time')
-                    end_time = build_status.get('end_time')
-                    duration = build_status.get('duration', 0)
-
-                    # Build packages HTML
-                    packages_html = ""
-                    if packages:
-                        packages_html = "<h3>📦 Available Packages</h3><ul>"
-                        for pkg in packages:
-                            packages_html += f'<li><a href="{pkg.get("download_url", "#")}">{pkg.get("filename", "unknown")}</a> ({pkg.get("size", 0)} bytes)</li>'
-                        packages_html += "</ul>"
-
-                    # Build logs HTML
-                    logs_html = ""
-                    if logs:
-                        logs_html = "<h3>📄 Build Logs</h3><ul>"
-                        for log in logs:
-                            logs_html += f'<li><a href="{log.get("download_url", "#")}">{log.get("filename", "unknown")}</a> ({log.get("size", 0)} bytes)</li>'
-                        logs_html += "</ul>"
-
-                    return HTMLResponse(f"""
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <title>Build Status (Server Unavailable) - {cached_display_name}</title>
-                        <meta charset="utf-8">
-                        <meta name="viewport" content="width=device-width, initial-scale=1">
-                        <meta http-equiv="refresh" content="30">
-                        <style>
-                            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                            .header {{ text-align: center; margin-bottom: 30px; }}
-                            .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                            .completed {{ background-color: #d4edda; }}
-                            .failed {{ background-color: #f8d7da; }}
-                            .building {{ background-color: #fff3cd; }}
-                            .queued {{ background-color: #d1ecf1; }}
-                            .cancelled {{ background-color: #e2e3e5; }}
-                            .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                            .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                            .build a:hover {{ text-decoration: underline; }}
-                            .warning-detail {{ background-color: #fff3cd; padding: 15px; border: 1px solid #ffeaa7; border-radius: 5px; margin: 15px 0; }}
-                            .warning-detail strong {{ color: #856404; }}
-                            .metadata {{ background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 5px; margin: 15px 0; }}
-                            .metadata p {{ margin: 5px 0; }}
-                            .status-indicator {{ padding: 5px 10px; border-radius: 3px; font-weight: bold; display: inline-block; }}
-                            .status-completed {{ background-color: #d4edda; color: #155724; }}
-                            .status-failed {{ background-color: #f8d7da; color: #721c24; }}
-                            .status-building {{ background-color: #fff3cd; color: #856404; }}
-                            .status-queued {{ background-color: #d1ecf1; color: #0c5460; }}
-                            .status-cancelled {{ background-color: #e2e3e5; color: #383d41; }}
-                            .error-info {{ background-color: #f8d7da; padding: 10px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; font-size: 0.9em; }}
-                        </style>
-                    </head>
-                    <body>
-                        <div class="header">
-                            <h1>APB Farm - Build Status</h1>
-                            <p>Package: <strong>{cached_display_name}</strong></p>
-                        </div>
-
-                        <div class="build {status_class}">
-                            <h2>⚠️ Build Status (Server Connection Failed)</h2>
-                            <div class="warning-detail">
-                                <strong>Connection Issue:</strong> Unable to contact the build server. Showing last cached status.<br>
-                                <em>This page will auto-refresh every 30 seconds to check for server recovery.</em>
-                            </div>
-
-                            <div class="metadata">
-                                <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                                <p><strong>Package:</strong> {cached_display_name}</p>
-                                <p><strong>Status:</strong> <span class="status-indicator status-{status_class}">{build_status.get('status', 'unknown')}</span></p>
-                                <p><strong>Server:</strong> {core.obfuscate_server_url(server_url)} (connection failed)</p>
-                                <p><strong>Architecture:</strong> {server_arch or 'unknown'}</p>
-                                <p><strong>Last Update:</strong> {datetime.fromtimestamp(last_update).strftime('%Y-%m-%d %H:%M:%S UTC') if last_update else 'unknown'}</p>
-                                <p><strong>Triggered by:</strong> {username}</p>
-                                {f'<p><strong>Start Time:</strong> {datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if start_time else ''}
-                                {f'<p><strong>End Time:</strong> {datetime.fromtimestamp(end_time).strftime("%Y-%m-%d %H:%M:%S UTC")}</p>' if end_time else ''}
-                                {f'<p><strong>Duration:</strong> {duration:.1f} seconds</p>' if duration > 0 else ''}
-                            </div>
-
-                            <div class="error-info">
-                                <strong>Connection Error:</strong> {str(e)}
-                            </div>
-
-                            {packages_html}
-                            {logs_html}
-
-                            <h3>Actions</h3>
-                            <p>
-                                <a href="/build/{build_id}/status" onclick="location.reload()">🔄 Refresh Status</a> |
-                                <a href="/dashboard">🏠 Back to Dashboard</a> |
-                                <a href="/farm">🌾 View Farm Status</a>
-                            </p>
-
-                            <div style="margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; font-size: 0.9em;">
-                                <strong>Note:</strong> This information may be outdated due to server connectivity issues.
-                                The farm will automatically retry connection and update status when possible.
-                            </div>
-                        </div>
-                    </body>
-                    </html>
-                    """)
-                except json.JSONDecodeError:
-                    pass
-
-            raise HTTPException(status_code=503, detail=f"Server unavailable: {str(e)}")
+        return await _build_status_json_response(build_id)
+    return _build_status_page(build_id, await _load_build_status(build_id), request, current_user)
 
 
 @router.get("/build/{build_id}/status-api", response_model=BuildStatusResponse, response_model_exclude_none=True)
 async def get_build_status_api(build_id: str) -> Dict:
     """Get build status as JSON"""
-    return await get_build_status(build_id, format="json")
+    return await _build_status_json_response(build_id)
 
 
 @router.get("/build/{build_id}/output")
@@ -2292,6 +1910,7 @@ async def stream_build_output(build_id: str):
 async def download_file(
     build_id: str,
     filename: str,
+    request: Request,
     current_user: Optional[core.User] = Depends(core.get_current_user_optional),
 ):
     """Download build artifact from local cache.
@@ -2307,59 +1926,20 @@ async def download_file(
     else:
         file_path = core.get_local_artifact_path(build_id, filename)
         if not file_path:
-            return HTMLResponse(f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>File Not Found</title>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    .header {{ text-align: center; margin-bottom: 30px; }}
-                    .build {{ margin: 5px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; word-break: break-all; }}
-                    .failed {{ background-color: #f8d7da; }}
-                    .build-id {{ font-family: 'Courier New', monospace; font-size: 0.9em; color: #666; }}
-                    .build a {{ color: #007bff; text-decoration: none; margin-right: 10px; }}
-                    .build a:hover {{ text-decoration: underline; }}
-                    .error-detail {{ background-color: #f8d7da; padding: 15px; border: 1px solid #f5c6cb; border-radius: 5px; margin: 15px 0; }}
-                    .error-detail strong {{ color: #721c24; }}
-                </style>
-            </head>
-            <body>
-                <div class="header">
-                    <h1>APB Farm - Download</h1>
-                </div>
-
-                <div class="build failed">
-                    <h2>❌ File Not Found</h2>
-                    <div class="error-detail">
-                        <strong>Error:</strong> The requested file is not available on this farm.
-                    </div>
-
-                    <p><strong>Build ID:</strong> <span class="build-id">{build_id}</span></p>
-                    <p><strong>Filename:</strong> <span class="build-id">{filename}</span></p>
-
-                    <h3>Details</h3>
-                    <p>The file has not been cached locally on this farm. Artifacts are cached when builds
-                    complete; if the build is still running or the cache has expired, the file may not
-                    be available for download.</p>
-
-                    <h3>Next Steps</h3>
-                    <ul>
-                        <li>Check the build status to see if the build has completed</li>
-                        <li>Verify that you're using the correct build ID and filename</li>
-                        <li>Try again later if the build is still in progress</li>
-                    </ul>
-
-                    <p>
-                        <a href="/build/{build_id}/status">📋 View Build Status</a> |
-                        <a href="/dashboard">🏠 Back to Dashboard</a>
-                    </p>
-                </div>
-            </body>
-            </html>
-            """, status_code=404)
+            return _render_farm_error(
+                request,
+                current_user,
+                404,
+                "File not found",
+                "The requested file is not available on this farm.",
+                build_id=build_id,
+                rows=[("Build ID", build_id), ("Filename", filename)],
+                hints=[
+                    "Artifacts are cached when builds complete; check whether the build has finished",
+                    "Verify that the build ID and filename are correct",
+                    "The cached copy may have expired; try again later if the build is still in progress",
+                ],
+            )
         file_size = file_path.stat().st_size
 
     logger.debug(f"Serving {filename} for build {build_id} from local cache")
@@ -2734,836 +2314,19 @@ async def delete_repository(repo_id: int, current_user: core.User = Depends(core
 @router.get("/admin")
 async def get_admin_panel(
     request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+    current_user: Optional[core.User] = Depends(core.get_current_user_optional),
 ):
-    """Admin panel for user management (admin only)"""
-    current_user = await core.require_admin(request, credentials)
-
-    # Get all users
-    global auth_manager
-    users = core.auth_manager.list_users()
-
-    # Convert users to dict format for display
-    users_data = []
-    for user in users:
-        users_data.append({
-            "id": user.id,
-            "username": user.username,
-            "role": user.role.value,
-            "created_at": datetime.fromtimestamp(user.created_at).strftime('%Y-%m-%d %H:%M:%S') if user.created_at else 'unknown',
-            "last_login": datetime.fromtimestamp(user.last_login).strftime('%Y-%m-%d %H:%M:%S') if user.last_login else 'never',
-            "email": user.email or 'none'
-        })
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>APB Farm - Admin Panel</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            .header {{ text-align: center; margin-bottom: 30px; }}
-            .admin-section {{ margin: 20px 0; }}
-            .admin-section h2 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 5px; }}
-            .user-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-            .user-table th, .user-table td {{ border: 1px solid #ddd; padding: 8px; text-align: left; word-wrap: break-word; }}
-            .user-table th {{ background-color: #f8f9fa; font-weight: bold; }}
-            .user-table tr:nth-child(even) {{ background-color: #f8f9fa; }}
-            .user-table tr:hover {{ background-color: #e9ecef; }}
-            .email-cell {{ max-width: 150px; overflow: hidden; text-overflow: ellipsis; }}
-            .action-button {{ padding: 5px 10px; margin: 2px; border: none; border-radius: 3px; cursor: pointer; font-size: 12px; }}
-            .edit-button {{ background-color: #ffc107; color: #000; }}
-            .delete-button {{ background-color: #dc3545; color: white; }}
-            .admin-badge {{ background-color: #28a745; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; }}
-            .user-badge {{ background-color: #007bff; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px; }}
-            .add-user-form, .smtp-config-form {{ background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0; }}
-            .add-user-form input, .add-user-form select, .smtp-config-form input, .smtp-config-form select {{ display: block; width: 200px; margin: 10px 0; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }}
-            .add-user-form button, .smtp-config-form button {{ margin: 5px; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }}
-            .smtp-config-form label {{ margin-top: 10px; display: block; font-weight: bold; }}
-            .smtp-config-form input[type="checkbox"] {{ width: auto; display: inline; margin-right: 5px; }}
-            .submit-button {{ background-color: #28a745; color: white; }}
-            .cancel-button {{ background-color: #6c757d; color: white; }}
-            .nav-links {{ margin: 20px 0; text-align: center; }}
-            .nav-links a {{ margin: 0 10px; color: #007bff; text-decoration: none; }}
-            .nav-links a:hover {{ text-decoration: underline; }}
-            .error-message {{ color: #dc3545; margin: 10px 0; }}
-            .success-message {{ color: #28a745; margin: 10px 0; font-weight: bold; }}
-            .modal {{ position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 30px; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); z-index: 1000; display: none; max-width: 90%; max-height: 90%; overflow-y: auto; }}
-            .modal-overlay {{ position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 999; display: none; }}
-            .tabs {{ margin: 20px 0; }}
-            .tab-buttons {{ display: flex; border-bottom: 2px solid #ddd; margin-bottom: 20px; }}
-            .tab-button {{ padding: 12px 24px; background: #f8f9fa; border: 1px solid #ddd; border-bottom: none; cursor: pointer; margin-right: 2px; border-radius: 8px 8px 0 0; transition: all 0.3s; }}
-            .tab-button:hover {{ background: #e9ecef; }}
-            .tab-button.active {{ background: white; border-bottom: 2px solid white; margin-bottom: -2px; font-weight: bold; color: #007bff; }}
-            .tab-content {{ display: none; }}
-            .tab-content.active {{ display: block; }}
-        </style>
-    </head>
-    <body>
-        <div class="modal-overlay" id="modalOverlay" onclick="hideModal()"></div>
-        <div class="modal" id="editUserModal">
-            <h3>Edit User</h3>
-            <form id="editUserForm" onsubmit="submitEditUser(event)">
-                <input type="hidden" id="editUserId">
-                <label>Username:</label>
-                <input type="text" id="editUsername" readonly>
-                <label>Role:</label>
-                <select id="editRole" required>
-                    <option value="user">User</option>
-                    <option value="admin">Admin</option>
-                </select>
-                <label>Email:</label>
-                <input type="email" id="editEmail" placeholder="user@example.com">
-                <label>
-                    <input type="checkbox" id="editEmailNotifications"> Email notifications enabled
-                </label>
-                <div class="error-message" id="editError"></div>
-                <div class="success-message" id="editSuccess"></div>
-                <button type="submit" class="submit-button">Update User</button>
-                <button type="button" class="cancel-button" onclick="hideModal()">Cancel</button>
-            </form>
-        </div>
-
-        <div class="header">
-            <h1>APB Farm - Admin Panel</h1>
-            <p>Logged in as: <strong>{current_user.username}</strong> (Admin)</p>
-        </div>
-
-        <div class="nav-links">
-            <a href="/dashboard">🏠 Back to Dashboard</a>
-            <a href="/farm">🌾 Farm Status</a>
-            <a href="/builds/latest">📋 Recent Builds</a>
-        </div>
-
-        <div class="tabs">
-            <div class="tab-buttons">
-                <div class="tab-button active" onclick="switchTab('smtp-tab')">📧 SMTP Configuration</div>
-                <div class="tab-button" onclick="switchTab('repositories-tab')">📦 Repository Management</div>
-                <div class="tab-button" onclick="switchTab('users-tab')">👥 User Management</div>
-                <div class="tab-button" onclick="switchTab('admin-functions-tab')">⚙️ Admin Functions</div>
-            </div>
-
-            <div id="smtp-tab" class="tab-content active">
-                <div class="admin-section">
-                    <div class="smtp-config-form">
-                        <h3>Email Server Settings</h3>
-                        <form id="smtpConfigForm" onsubmit="saveSmtpConfig(event)">
-                            <label>SMTP Server:</label>
-                            <input type="text" id="smtpServer" placeholder="mail.example.com" required>
-                            <label>Port:</label>
-                            <input type="number" id="smtpPort" placeholder="587" min="1" max="65535" required>
-                            <label>Username (optional):</label>
-                            <input type="text" id="smtpUsername" placeholder="username@example.com">
-                            <label>Password (optional):</label>
-                            <input type="password" id="smtpPassword" placeholder="password">
-                            <label>From Email:</label>
-                            <input type="email" id="smtpFromEmail" placeholder="noreply@example.com">
-                            <label>From Name:</label>
-                            <input type="text" id="smtpFromName" placeholder="APB Farm">
-                            <label>
-                                <input type="checkbox" id="smtpUseTls" checked> Use TLS/STARTTLS
-                            </label>
-                            <div class="error-message" id="smtpError"></div>
-                            <div class="success-message" id="smtpSuccess"></div>
-                            <button type="submit" class="submit-button">Save SMTP Config</button>
-                            <button type="button" class="cancel-button" onclick="loadSmtpConfig()">Reload</button>
-                            <button type="button" class="cancel-button" onclick="deleteSmtpConfig()">Delete Config</button>
-                        </form>
-
-                        <div style="margin-top: 20px;">
-                            <h4>Test Email</h4>
-                            <form id="smtpTestForm" onsubmit="testSmtpConfig(event)">
-                                <label>Test Email Address:</label>
-                                <input type="email" id="testEmail" placeholder="test@example.com" required>
-                                <div class="error-message" id="testError"></div>
-                                <div class="success-message" id="testSuccess"></div>
-                                <button type="submit" class="submit-button">Send Test Email</button>
-                            </form>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div id="repositories-tab" class="tab-content">
-                <div class="admin-section">
-                    <h2>📦 Custom Repository Management</h2>
-                    <p>Manage custom pacman repositories that users can request in their PKGBUILD files using the <code>apb_extra_repos</code> variable.</p>
-
-                    <div class="smtp-config-form">
-                        <h3>Add New Repository</h3>
-                        <form id="addRepoForm" onsubmit="submitAddRepository(event)">
-                            <label>Repository Name:</label>
-                            <input type="text" id="repoName" placeholder="myrepo" required>
-                            <label>Repository URL:</label>
-                            <input type="url" id="repoUrl" placeholder="https://myrepo.example.com" required>
-                            <label>GPG Key ID:</label>
-                            <input type="text" id="repoGpgKey" placeholder="ABCD1234..." required>
-                            <label>Description (optional):</label>
-                            <input type="text" id="repoDescription" placeholder="My custom repository">
-                            <div class="error-message" id="repoAddError"></div>
-                            <div class="success-message" id="repoAddSuccess"></div>
-                            <button type="submit" class="submit-button">Add Repository</button>
-                            <button type="button" class="cancel-button" onclick="clearRepoForm()">Clear</button>
-                        </form>
-                    </div>
-
-                    <div style="margin-top: 30px;">
-                        <h3>Existing Repositories</h3>
-                        <div id="repositoriesList">Loading repositories...</div>
-                    </div>
-                </div>
-            </div>
-
-            <div id="admin-functions-tab" class="tab-content">
-                <div class="admin-section">
-                    <h2>🗂️ Cache Management</h2>
-                    <div class="smtp-config-form">
-                        <h3>Build Artifact Cache</h3>
-                        <p>The farm caches build artifacts (packages and logs) for faster downloads and improved reliability.</p>
-
-                        <div id="cacheStatusSection">
-                            <h4>Cache Status</h4>
-                            <div id="cacheStatusDisplay">Loading cache status...</div>
-                            <button type="button" class="submit-button" onclick="loadCacheStatus()">🔄 Refresh Status</button>
-                        </div>
-
-                        <div style="margin-top: 20px;">
-                            <h4>Cache Cleanup</h4>
-                            <p>Manually remove expired cache artifacts. This operation runs automatically every 4 hours.</p>
-                            <div class="error-message" id="cleanupError"></div>
-                            <div class="success-message" id="cleanupSuccess"></div>
-                            <button type="button" class="submit-button" onclick="performCacheCleanup()">🧹 Clean Up Cache</button>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div id="users-tab" class="tab-content">
-                <div class="admin-section">
-
-            <div class="add-user-form">
-                <h3>Add New User</h3>
-                <form id="addUserForm" onsubmit="submitAddUser(event)">
-                    <label>Username:</label>
-                    <input type="text" id="newUsername" placeholder="Username (min 3 characters)" required>
-                    <label>Password:</label>
-                    <input type="password" id="newPassword" placeholder="Password (min 8 characters)" required>
-                    <label>Email:</label>
-                    <input type="email" id="newEmail" placeholder="user@example.com (optional)">
-                    <label>Role:</label>
-                    <select id="newRole" required>
-                        <option value="user">User</option>
-                        <option value="admin">Admin</option>
-                    </select>
-                    <div class="error-message" id="addError"></div>
-                    <div class="success-message" id="addSuccess"></div>
-                    <button type="submit" class="submit-button">Add User</button>
-                    <button type="button" class="cancel-button" onclick="clearAddForm()">Clear</button>
-                </form>
-            </div>
-
-            <table class="user-table">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Username</th>
-                        <th>Email</th>
-                        <th>Email Notifications</th>
-                        <th>Role</th>
-                        <th>Created</th>
-                        <th>Last Login</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-    """
-
-    for user in users_data:
-        role_badge = f'<span class="admin-badge">ADMIN</span>' if user["role"] == ADMIN_ROLE else f'<span class="user-badge">USER</span>'
-        delete_disabled = 'disabled title="Cannot delete yourself"' if user["id"] == current_user.id else ''
-        email_display = user["email"] if user["email"] != "none" else '<em>none</em>'
-        notifications_display = '✓ Enabled' if user.get("email_notifications_enabled", True) else '✗ Disabled'
-
-        html += f"""
-                    <tr>
-                        <td>{user["id"]}</td>
-                        <td>{user["username"]}</td>
-                        <td class="email-cell" title="{user['email']}">{email_display}</td>
-                        <td>{notifications_display}</td>
-                        <td>{role_badge}</td>
-                        <td>{user["created_at"]}</td>
-                        <td>{user["last_login"]}</td>
-                        <td>
-                            <button class="action-button edit-button" onclick="editUser({user['id']}, '{user['username']}', '{user['role']}', '{user['email'] if user['email'] != 'none' else ''}', {str(user.get('email_notifications_enabled', True)).lower()})">Edit</button>
-                            <button class="action-button delete-button" onclick="deleteUser({user['id']}, '{user['username']}')" {delete_disabled}>Delete</button>
-                        </td>
-                    </tr>
-        """
-
-    html += f"""
-                </tbody>
-            </table>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            // Tab switching function
-            function switchTab(tabId) {{
-                // Hide all tab contents
-                const tabContents = document.querySelectorAll('.tab-content');
-                tabContents.forEach(content => {{
-                    content.classList.remove('active');
-                }});
-
-                // Remove active class from all tab buttons
-                const tabButtons = document.querySelectorAll('.tab-button');
-                tabButtons.forEach(button => {{
-                    button.classList.remove('active');
-                }});
-
-                // Show selected tab content
-                document.getElementById(tabId).classList.add('active');
-
-                // Add active class to clicked tab button
-                event.target.classList.add('active');
-            }}
-
-            // Helper function to get auth token
-            function getAuthToken() {{
-                let token = localStorage.getItem('authToken');
-                if (token) return token;
-
-                const cookies = document.cookie.split(';');
-                for (let cookie of cookies) {{
-                    const [name, value] = cookie.trim().split('=');
-                    if (name === 'authToken') {{
-                        return value;
-                    }}
-                }}
-                return null;
-            }}
-
-            function clearAddForm() {{
-                document.getElementById('addUserForm').reset();
-                document.getElementById('addError').textContent = '';
-                document.getElementById('addSuccess').textContent = '';
-            }}
-
-            async function submitAddUser(event) {{
-                event.preventDefault();
-
-                const username = document.getElementById('newUsername').value;
-                const password = document.getElementById('newPassword').value;
-                const email = document.getElementById('newEmail').value || null;
-                const role = document.getElementById('newRole').value;
-                const errorDiv = document.getElementById('addError');
-                const successDiv = document.getElementById('addSuccess');
-
-                errorDiv.textContent = '';
-                successDiv.textContent = '';
-
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch('/auth/users', {{
-                        method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: JSON.stringify({{ username, password, email, role }})
-                    }});
-
-                    if (response.ok) {{
-                        const data = await response.json();
-                        successDiv.textContent = `User '${{username}}' created successfully!`;
-                        clearAddForm();
-                        setTimeout(() => window.location.reload(), 2000);
-                    }} else {{
-                        const errorData = await response.json();
-                        errorDiv.textContent = errorData.detail || 'Failed to create user';
-                    }}
-                }} catch (error) {{
-                    errorDiv.textContent = 'Network error. Please try again.';
-                    console.error('Add user error:', error);
-                }}
-            }}
-
-            function editUser(id, username, role, email, emailNotifications) {{
-                document.getElementById('editUserId').value = id;
-                document.getElementById('editUsername').value = username;
-                document.getElementById('editRole').value = role;
-                document.getElementById('editEmail').value = email || '';
-                document.getElementById('editEmailNotifications').checked = emailNotifications !== false;
-                document.getElementById('editError').textContent = '';
-                document.getElementById('editSuccess').textContent = '';
-
-                document.getElementById('modalOverlay').style.display = 'block';
-                document.getElementById('editUserModal').style.display = 'block';
-            }}
-
-            function hideModal() {{
-                document.getElementById('modalOverlay').style.display = 'none';
-                document.getElementById('editUserModal').style.display = 'none';
-            }}
-
-            async function submitEditUser(event) {{
-                event.preventDefault();
-
-                const userId = document.getElementById('editUserId').value;
-                const role = document.getElementById('editRole').value;
-                const email = document.getElementById('editEmail').value || null;
-                const emailNotifications = document.getElementById('editEmailNotifications').checked;
-                const errorDiv = document.getElementById('editError');
-                const successDiv = document.getElementById('editSuccess');
-
-                errorDiv.textContent = '';
-                successDiv.textContent = '';
-
-                try {{
-                    const token = getAuthToken();
-
-                    // Update role
-                    const roleResponse = await fetch(`/auth/users/${{userId}}/role`, {{
-                        method: 'PUT',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: JSON.stringify({{ role }})
-                    }});
-
-                    if (!roleResponse.ok) {{
-                        const errorData = await roleResponse.json();
-                        errorDiv.textContent = errorData.detail || 'Failed to update role';
-                        return;
-                    }}
-
-                    // Update email notifications
-                    const notificationsResponse = await fetch(`/auth/users/${{userId}}/email-notifications`, {{
-                        method: 'PUT',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: JSON.stringify({{ enabled: emailNotifications }})
-                    }});
-
-                    if (!notificationsResponse.ok) {{
-                        const errorData = await notificationsResponse.json();
-                        errorDiv.textContent = errorData.detail || 'Failed to update email notifications';
-                        return;
-                    }}
-
-                    // Update email
-                    const emailResponse = await fetch(`/auth/users/${{userId}}/email`, {{
-                        method: 'PUT',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: JSON.stringify({{ email }})
-                    }});
-
-                    if (emailResponse.ok) {{
-                        successDiv.textContent = 'User updated successfully!';
-                        setTimeout(() => {{
-                            hideModal();
-                            window.location.reload();
-                        }}, 1500);
-                    }} else {{
-                        const errorData = await emailResponse.json();
-                        errorDiv.textContent = errorData.detail || 'Failed to update email';
-                    }}
-                }} catch (error) {{
-                    errorDiv.textContent = 'Network error. Please try again.';
-                    console.error('Edit user error:', error);
-                }}
-            }}
-
-            async function deleteUser(id, username) {{
-                if (!confirm(`Are you sure you want to delete user '${{username}}'? This action cannot be undone.`)) {{
-                    return;
-                }}
-
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch(`/auth/users/${{id}}`, {{
-                        method: 'DELETE',
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }}
-                    }});
-
-                    if (response.ok) {{
-                        alert(`User '${{username}}' deleted successfully!`);
-                        window.location.reload();
-                    }} else {{
-                        const errorData = await response.json();
-                        alert(`Failed to delete user: ${{errorData.detail || 'Unknown error'}}`);
-                    }}
-                }} catch (error) {{
-                    alert('Network error. Please try again.');
-                    console.error('Delete user error:', error);
-                }}
-            }}
-
-            // SMTP Configuration Functions
-            async function loadSmtpConfig() {{
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch('/admin/smtp', {{
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }}
-                    }});
-
-                    if (response.ok) {{
-                        const config = await response.json();
-                        if (config) {{
-                            document.getElementById('smtpServer').value = config.server || '';
-                            document.getElementById('smtpPort').value = config.port || 587;
-                            document.getElementById('smtpUsername').value = config.username || '';
-                            document.getElementById('smtpPassword').value = ''; // Don't populate password for security
-                            document.getElementById('smtpFromEmail').value = config.from_email || '';
-                            document.getElementById('smtpFromName').value = config.from_name || '';
-                            document.getElementById('smtpUseTls').checked = config.use_tls !== false;
-                        }}
-                    }}
-                }} catch (error) {{
-                    console.error('Error loading SMTP config:', error);
-                }}
-            }}
-
-            async function saveSmtpConfig(event) {{
-                event.preventDefault();
-
-                const server = document.getElementById('smtpServer').value;
-                const port = parseInt(document.getElementById('smtpPort').value);
-                const username = document.getElementById('smtpUsername').value || null;
-                const password = document.getElementById('smtpPassword').value || null;
-                const fromEmail = document.getElementById('smtpFromEmail').value || null;
-                const fromName = document.getElementById('smtpFromName').value || null;
-                const useTls = document.getElementById('smtpUseTls').checked;
-                const errorDiv = document.getElementById('smtpError');
-                const successDiv = document.getElementById('smtpSuccess');
-
-                errorDiv.textContent = '';
-                successDiv.textContent = '';
-
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch('/admin/smtp', {{
-                        method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: JSON.stringify({{
-                            server, port, username, password, from_email: fromEmail, from_name: fromName, use_tls: useTls
-                        }})
-                    }});
-
-                    if (response.ok) {{
-                        successDiv.textContent = 'SMTP configuration saved successfully!';
-                        // Clear password field for security
-                        document.getElementById('smtpPassword').value = '';
-                    }} else {{
-                        const errorData = await response.json();
-                        errorDiv.textContent = errorData.detail || 'Failed to save SMTP configuration';
-                    }}
-                }} catch (error) {{
-                    errorDiv.textContent = 'Network error. Please try again.';
-                    console.error('Save SMTP config error:', error);
-                }}
-            }}
-
-            async function deleteSmtpConfig() {{
-                if (!confirm('Are you sure you want to delete the SMTP configuration? This will disable email notifications.')) {{
-                    return;
-                }}
-
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch('/admin/smtp', {{
-                        method: 'DELETE',
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }}
-                    }});
-
-                    if (response.ok) {{
-                        document.getElementById('smtpConfigForm').reset();
-                        document.getElementById('smtpSuccess').textContent = 'SMTP configuration deleted successfully!';
-                        document.getElementById('smtpError').textContent = '';
-                    }} else {{
-                        const errorData = await response.json();
-                        document.getElementById('smtpError').textContent = errorData.detail || 'Failed to delete SMTP configuration';
-                    }}
-                }} catch (error) {{
-                    document.getElementById('smtpError').textContent = 'Network error. Please try again.';
-                    console.error('Delete SMTP config error:', error);
-                }}
-            }}
-
-            async function testSmtpConfig(event) {{
-                event.preventDefault();
-
-                const testEmail = document.getElementById('testEmail').value;
-                const errorDiv = document.getElementById('testError');
-                const successDiv = document.getElementById('testSuccess');
-
-                errorDiv.textContent = '';
-                successDiv.textContent = '';
-
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch('/admin/smtp/test', {{
-                        method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: JSON.stringify({{ test_email: testEmail }})
-                    }});
-
-                    if (response.ok) {{
-                        const data = await response.json();
-                        successDiv.textContent = data.message;
-                    }} else {{
-                        const errorData = await response.json();
-                        errorDiv.textContent = errorData.detail || 'Failed to send test email';
-                    }}
-                }} catch (error) {{
-                    errorDiv.textContent = 'Network error. Please try again.';
-                    console.error('Test SMTP config error:', error);
-                }}
-            }}
-
-            // Cache management functions
-            async function loadCacheStatus() {{
-                const displayElement = document.getElementById('cacheStatusDisplay');
-                displayElement.innerHTML = 'Loading...';
-
-                try {{
-                    const token = getAuthToken();
-                    if (!token) {{
-                        displayElement.innerHTML = '<span class="error-message">Authentication required</span>';
-                        return;
-                    }}
-
-                    const response = await fetch('/admin/cache', {{
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }}
-                    }});
-
-                    if (response.ok) {{
-                        const data = await response.json();
-                        if (data.enabled) {{
-                            displayElement.innerHTML = `
-                                <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #28a745;">
-                                    <h5 style="margin-top: 0; color: #28a745;">✅ Cache Enabled</h5>
-                                    <p><strong>Retention:</strong> ${{data.retention_days}} days</p>
-                                    <p><strong>Total Artifacts:</strong> ${{data.total_artifacts}} files</p>
-                                    <p><strong>Total Size:</strong> ${{data.total_size_mb}} MB (${{data.total_size_bytes}} bytes)</p>
-                                    <p><strong>Expired Artifacts:</strong> ${{data.expired_artifacts}} files</p>
-                                    ${{data.oldest_cache_age_days ? `<p><strong>Oldest Cache:</strong> ${{data.oldest_cache_age_days}} days old</p>` : ''}}
-                                </div>
-                            `;
-                        }} else {{
-                            displayElement.innerHTML = `
-                                <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
-                                    <h5 style="margin-top: 0; color: #856404;">⚠️ Cache Disabled</h5>
-                                    <p>${{data.message}}</p>
-                                </div>
-                            `;
-                        }}
-                    }} else {{
-                        displayElement.innerHTML = '<span class="error-message">Failed to load cache status</span>';
-                    }}
-                }} catch (error) {{
-                    displayElement.innerHTML = '<span class="error-message">Error loading cache status</span>';
-                }}
-            }}
-
-            async function performCacheCleanup() {{
-                const errorElement = document.getElementById('cleanupError');
-                const successElement = document.getElementById('cleanupSuccess');
-
-                // Clear previous messages
-                errorElement.textContent = '';
-                successElement.textContent = '';
-
-                try {{
-                    const token = getAuthToken();
-                    if (!token) {{
-                        errorElement.textContent = 'Authentication required';
-                        return;
-                    }}
-
-                    const response = await fetch('/admin/cache/cleanup', {{
-                        method: 'POST',
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }}
-                    }});
-
-                    const data = await response.json();
-
-                    if (response.ok && data.success) {{
-                        successElement.textContent = data.message;
-                        // Reload cache status to show updated information
-                        loadCacheStatus();
-                    }} else {{
-                        errorElement.textContent = data.message || 'Cache cleanup failed';
-                    }}
-                }} catch (error) {{
-                    errorElement.textContent = 'Error performing cache cleanup';
-                }}
-            }}
-
-            // Repository management functions
-            async function loadRepositories() {{
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch('/admin/repositories', {{
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }}
-                    }});
-
-                    if (response.ok) {{
-                        const data = await response.json();
-                        displayRepositories(data.repositories);
-                    }} else {{
-                        document.getElementById('repositoriesList').innerHTML = 'Error loading repositories';
-                    }}
-                }} catch (error) {{
-                    console.error('Error loading repositories:', error);
-                    document.getElementById('repositoriesList').innerHTML = 'Error loading repositories';
-                }}
-            }}
-
-            function displayRepositories(repositories) {{
-                const container = document.getElementById('repositoriesList');
-
-                if (repositories.length === 0) {{
-                    container.innerHTML = '<p>No repositories configured.</p>';
-                    return;
-                }}
-
-                let html = '<table class="user-table"><thead><tr><th>Name</th><th>URL</th><th>GPG Key</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
-
-                repositories.forEach(repo => {{
-                    const statusBadge = repo.is_active ?
-                        '<span class="admin-badge">Active</span>' :
-                        '<span style="background-color: #dc3545; color: white; padding: 2px 6px; border-radius: 3px; font-size: 11px;">Inactive</span>';
-
-                    html += `<tr>
-                        <td>${{repo.name}}</td>
-                        <td class="email-cell">${{repo.url}}</td>
-                        <td>${{repo.gpg_key_id}}</td>
-                        <td>${{repo.description || '-'}}</td>
-                        <td>${{statusBadge}}</td>
-                        <td>
-                            <button class="action-button edit-button" onclick="editRepository(${{repo.id}}, '${{repo.name}}', '${{repo.url}}', '${{repo.gpg_key_id}}', '${{repo.description || ''}}', ${{repo.is_active}})">Edit</button>
-                            <button class="action-button delete-button" onclick="deleteRepository(${{repo.id}}, '${{repo.name}}')">Delete</button>
-                        </td>
-                    </tr>`;
-                }});
-
-                html += '</tbody></table>';
-                container.innerHTML = html;
-            }}
-
-            async function submitAddRepository(event) {{
-                event.preventDefault();
-
-                const name = document.getElementById('repoName').value;
-                const url = document.getElementById('repoUrl').value;
-                const gpgKey = document.getElementById('repoGpgKey').value;
-                const description = document.getElementById('repoDescription').value;
-                const errorDiv = document.getElementById('repoAddError');
-                const successDiv = document.getElementById('repoAddSuccess');
-
-                errorDiv.textContent = '';
-                successDiv.textContent = '';
-
-                try {{
-                    const token = getAuthToken();
-                    const formData = new FormData();
-                    formData.append('name', name);
-                    formData.append('url', url);
-                    formData.append('gpg_key_id', gpgKey);
-                    formData.append('description', description);
-
-                    const response = await fetch('/admin/repositories', {{
-                        method: 'POST',
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }},
-                        body: formData
-                    }});
-
-                    const data = await response.json();
-
-                    if (response.ok && data.success) {{
-                        successDiv.textContent = data.message;
-                        clearRepoForm();
-                        loadRepositories();
-                    }} else {{
-                        errorDiv.textContent = data.message || 'Failed to add repository';
-                    }}
-                }} catch (error) {{
-                    errorDiv.textContent = 'Error adding repository';
-                }}
-            }}
-
-            function clearRepoForm() {{
-                document.getElementById('addRepoForm').reset();
-                document.getElementById('repoAddError').textContent = '';
-                document.getElementById('repoAddSuccess').textContent = '';
-            }}
-
-            async function deleteRepository(repoId, repoName) {{
-                if (!confirm(`Are you sure you want to delete repository "${{repoName}}"?`)) {{
-                    return;
-                }}
-
-                try {{
-                    const token = getAuthToken();
-                    const response = await fetch(`/admin/repositories/${{repoId}}`, {{
-                        method: 'DELETE',
-                        headers: {{
-                            'Authorization': `Bearer ${{token}}`
-                        }}
-                    }});
-
-                    const data = await response.json();
-
-                    if (response.ok && data.success) {{
-                        loadRepositories();
-                    }} else {{
-                        alert(data.message || 'Failed to delete repository');
-                    }}
-                }} catch (error) {{
-                    alert('Error deleting repository');
-                }}
-            }}
-
-            // Load SMTP config and cache status on page load
-            window.addEventListener('load', function() {{
-                loadSmtpConfig();
-                loadCacheStatus();
-                loadRepositories();
-            }});
-        </script>
-    </body>
-    </html>
-    """
-
-    return HTMLResponse(content=html)
-
+    """Admin panel (admin only); user actions, SMTP, repositories and cache go through the JSON API."""
+    if not current_user:
+        return _see_other("/login")
+    if not _is_admin(current_user):
+        return _render_farm_error(request, current_user, 403, "Admin access required", "Only administrators can open the admin panel.")
+    return _render_farm_page(
+        "farm/admin.html",
+        request,
+        current_user,
+        title="Admin",
+        nav="admin",
+        users=core.auth_manager.list_users(),
+        mfa_user_ids=mfa.users_with_second_factor(core.auth_manager.db),
+    )

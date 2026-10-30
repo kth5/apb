@@ -22,6 +22,10 @@ ADMIN_ROLE = "admin"
 USER_ROLE = "user"
 GUEST_ROLE = "guest"
 
+MFA_METHOD_TOTP = "totp"
+MFA_METHOD_WEBAUTHN = "webauthn"
+MFA_METHOD_RECOVERY = "recovery"
+
 DEFAULT_CONFIG_PATHS = [
     Path.cwd() / "apb.json",
     Path("/etc/apb/apb.json"),

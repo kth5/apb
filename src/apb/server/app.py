@@ -14,6 +14,7 @@ from apb import VERSION
 from apb.server import engine
 from apb.server.routes import router
 from apb.service import add_default_cors
+from apb.web import mount_static
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,7 @@ def create_app() -> FastAPI:
             content={"error": "Internal server error", "detail": str(exc), "type": type(exc).__name__},
         )
 
+    mount_static(app)
     app.include_router(router)
     return app
 

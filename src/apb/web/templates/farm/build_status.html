@@ -1,0 +1,92 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import csrf_field, file_list, status_badge %}
+{% block content %}
+<div data-poll-region>
+{% if state == "not_found" %}
+<p class="alert alert-error" role="alert">The requested build could not be found in the farm database.</p>
+<div class="card">
+<dl class="details">
+<dt>Build ID</dt><dd><code class="build-id">{{ build_id }}</code></dd>
+</dl>
+<p>{{ detail }}</p>
+</div>
+<h2>What to check</h2>
+<ul>
+<li>Verify that you are using the correct build ID</li>
+<li>Ensure the build was submitted through this farm</li>
+<li>Check whether the build was submitted to a different farm instance</li>
+</ul>
+{% else %}
+{% if state == "queued" %}
+<p class="alert alert-info" role="status">Waiting for an available build server slot.</p>
+{% elif state == "submission_failed" %}
+<p class="alert alert-error" role="alert">This build failed during submission and was never assigned to a server.</p>
+{% elif state == "cached" %}
+<p class="alert alert-warning" role="status">The build server is currently unavailable. Showing the last known status; it may be outdated.</p>
+{% elif state == "connection_failed" %}
+<p class="alert alert-warning" role="status">Unable to contact the build server ({{ error }}). Showing the last cached status; it may be outdated.</p>
+{% elif state == "unavailable" %}
+<p class="alert alert-error" role="alert">The server handling this build is unavailable and no cached status is available. Your build may still be running on the server.</p>
+{% elif state == "unreachable" %}
+<p class="alert alert-error" role="alert">Unable to contact the build server: {{ error }}</p>
+{% endif %}
+
+<div class="card">
+<dl class="details">
+<dt>Package</dt><dd>{{ record.display_name }}</dd>
+<dt>Status</dt><dd>{{ status_badge(status) }}{% if state == "unavailable" %} <span class="muted">(last known)</span>{% endif %}</dd>
+<dt>Build ID</dt><dd><code class="build-id">{{ build_id }}</code></dd>
+<dt>Architecture</dt><dd>{{ record.server_arch or ("pending assignment" if state == "queued" else "unknown") }}</dd>
+{% if record.server %}
+<dt>Server</dt><dd>{{ record.server }}{% if state in ("cached", "unavailable") %} (unavailable){% elif state in ("connection_failed", "unreachable") %} (connection failed){% endif %}</dd>
+{% endif %}
+<dt>Triggered by</dt><dd>{{ record.username }}</dd>
+{% if state == "queued" and build_status.queue_position %}
+<dt>Queue position</dt><dd>{{ build_status.queue_position }}{% if build_status.farm_queue_size %} of {{ build_status.farm_queue_size }}{% endif %} ({{ build_status.jobs_ahead or 0 }} job(s) ahead)</dd>
+{% endif %}
+<dt>Created</dt><dd>{{ record.created_at | timestamp }}</dd>
+{% if build_status.start_time %}<dt>Started</dt><dd>{{ build_status.start_time | timestamp }}</dd>{% endif %}
+{% if build_status.end_time %}<dt>Finished</dt><dd>{{ build_status.end_time | timestamp }}</dd>{% endif %}
+{% if build_status.duration %}<dt>Duration</dt><dd>{{ build_status.duration | duration }}</dd>{% endif %}
+{% if state in ("cached", "connection_failed") %}<dt>Last update</dt><dd>{{ record.last_status_update | timestamp }}</dd>{% endif %}
+</dl>
+</div>
+
+{% if state == "submission_failed" %}
+<h2>Possible causes</h2>
+<ul>
+<li>No servers available for the target architecture</li>
+<li>All servers at capacity during submission</li>
+<li>Network connectivity issues</li>
+<li>Invalid PKGBUILD or source files</li>
+</ul>
+{% elif state in ("unavailable", "unreachable") %}
+<h2>What to do</h2>
+<ul>
+<li>Wait for the server to recover; the farm keeps retrying in the background</li>
+<li>Check the dashboard for other available servers</li>
+<li>Contact the farm administrator if the issue persists</li>
+</ul>
+{% endif %}
+
+{{ file_list("Packages", build_status.packages) }}
+{{ file_list("Logs", build_status.logs) }}
+
+{% if can_cancel %}
+<form class="actions" method="post" action="/build/{{ build_id }}/cancel" data-confirm="Cancel this build?">
+{{ csrf_field(csrf_token) }}
+<button type="submit" class="button-danger">Cancel build</button>
+</form>
+{% endif %}
+{% endif %}
+
+<p class="actions">
+{% if state != "not_found" %}<a href="/build/{{ build_id }}/status">Refresh</a>{% endif %}
+<a href="/dashboard">Dashboard</a>
+<a href="/dashboard/builds">Recent builds</a>
+</p>
+{% if refresh_seconds %}
+<p class="muted small">This page updates every {{ refresh_seconds }} seconds until the build finishes.</p>
+{% endif %}
+</div>
+{% endblock %}

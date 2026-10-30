@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [ UNRELEASED ]
+## [ 2026.10.30 ]
 
 ### Added
 
@@ -18,8 +18,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Unit tests for model round-trips and timestamp normalisation
 - Unit tests for client CLI dispatch, config-based multi-architecture builds, auth client URL handling, and farm database creation and migration
 - Shared `farm_db` and `farm_queue_state` pytest fixtures in `tests/conftest.py`, built from the real farm schema via `core.init_database(":memory:")` instead of per-file hand-written tables
+- Farm web form endpoints that work without JavaScript (lynx, w3m, very old browsers): `GET`/`POST /login`, `POST /logout`, `GET /account` and `POST /account/password`; the build status page has a plain HTML cancel form, and `POST /build/{build_id}/cancel` answers form submissions with `303 See Other` back to the status page
+- CSRF protection for cookie-authenticated non-GET requests (`csrf_token` form field or `X-CSRF-Token` header); Bearer-token requests from the APB client are unaffected
+- Shared web UI stylesheet and scripts served from `GET /static/{path}` on farm and server, with versioned URLs and long-lived `Cache-Control`
+- Dark color scheme via `prefers-color-scheme`, a print stylesheet, and tables that stack on narrow screens
+- Progressive live updates (`/static/apb.js`, ES5): unfinished build status pages and the dashboard servers tab reload only their status section in place, one request at a time, paused while the browser tab is hidden and backing off after errors; without JavaScript, build status pages fall back to a `<noscript>` meta refresh
+- Admin panel can edit and enable/disable custom repositories (the edit button used to call an undefined function)
+- `tests/test_web_ui.py` covering page rendering, HTML escaping, the no-JS login, logout and password change flows, and CSRF rejection
+- Two-factor authentication for farm logins with TOTP authenticator apps and WebAuthn security keys (YubiKey and other FIDO2/U2F keys), implemented in the new `apb.farm.mfa` module (`pyotp`, `fido2` and `segno` are new dependencies)
+- Farm 2FA JSON endpoints: `POST /auth/login/2fa`, `POST /auth/login/2fa/webauthn-options`, `GET /auth/my/2fa`, `POST /auth/my/2fa/totp`, `POST /auth/my/2fa/totp/confirm`, `DELETE /auth/my/2fa/totp`, `POST /auth/my/2fa/webauthn/register-options`, `POST /auth/my/2fa/webauthn`, `DELETE /auth/my/2fa/webauthn/{credential_id}` and `POST /auth/my/2fa/recovery-codes`
+- Ten single-use recovery codes, shown once when the first second factor is enrolled and regenerable with the account password
+- Admin endpoint `DELETE /auth/users/{user_id}/2fa` and a "Reset 2FA" button in the admin panel to remove a user's second factors, plus a 2FA column in the admin user list and `mfa_enabled` in user responses
+- Farm web pages `GET`/`POST /login/2fa` (authenticator code, recovery code or security key) and `/account/2fa` (QR code enrollment, security key registration and removal, recovery code regeneration); `/static/webauthn.js` drives the browser security key prompts
+- `apb --farm --login` asks for the authenticator or recovery code, or uses a connected FIDO2 security key through `python-fido2`; `--2fa-method totp|key|recovery` overrides the automatic choice
+- `apb --2fa-setup totp|key` enrolls a second factor from the command line: `totp` prints the QR code in the terminal and asks for a code to confirm it, `key` registers a connected FIDO2 security key; combined with `--login` it also finishes the forced enrollment of admins without 2FA. `--login` reminds users without a second factor that they can add one, and the account page links to the setup directly
+- `nginx-apb-farm.conf` passes the new 2FA endpoints and pages through to the farm with their allowed methods
+- `tests/test_farm_mfa.py` covering TOTP, recovery codes, security keys, pending login limits, forced admin enrollment and admin reset
+- Farm `apb.json` option `totp_keys_file` (default `~/.apb/farm-totp.keys`): TOTP encryption keyring, one `<key_id> <base64url key>` per line with the last line active; generated with mode 0600 on first start. Appending a key and restarting rotates all secrets to it. New module `apb.farm.secret_store`; `cryptography` is now a direct dependency
+- Unit tests for TOTP secret encryption, migration, key rotation and the missing-key fallback
 
 ### Changed
+
+- Auth client errors for an unreachable farm (`--login`, `--logout`, `--auth-status`, `--2fa-setup`) name the URL that was tried and where it came from (`--server`, the `apb.json` file that was used, or the built-in default), instead of only showing e.g. `[Errno 111] Connection refused`
+- Config files that exist but cannot be read or parsed are skipped with a warning instead of silently; `apb.config.load_config_with_source` also returns the file that was used
+- All farm and server HTML pages (dashboard, build status, download error, admin, login and account on the farm; build details, cancel confirmation, file view and cleanup on the server) are rendered from autoescaped Jinja templates in `apb.web` with one shared layout and stylesheet instead of inline f-strings with per-page CSS; emoji icons replaced by text labels and status badges
+- Dashboard tabs are plain links to `/dashboard`, `/dashboard/builds/{page}` and `/dashboard/statistics`; only the requested tab's data is queried, builds are shown in a table, "Next" only appears when another page exists, and server info lookups run concurrently
+- The 6 build status page variants (not found, queued, submission failed, server unavailable with and without cached status, connection failed, live) are one template
+- Admin panel sections are reachable through in-page links instead of JS tabs; `/static/admin.js` is ES5 (`XMLHttpRequest`, event delegation, `textContent`) and authenticates with the session cookie plus CSRF header
+- Web login sets the `authToken` cookie server-side with `HttpOnly`, `SameSite=Lax` and `Secure` on HTTPS
+- `PUT /auth/change-password` and `POST /account/password` share one `core.change_user_password` helper
+- **Breaking:** `POST /auth/login` returns `{"mfa_required": true, "mfa_token": ...}` instead of a session token for users with 2FA, and `{"mfa_setup_required": true, "setup_token": ...}` for admins without 2FA. Users without 2FA get the same response as before
+- **Breaking:** admins must use two-factor authentication. An admin without a second factor (including the default `admin` account) only gets a 15-minute enrollment session after the password step, and promoting a user without 2FA to admin ends all of their sessions
+- Farm tokens have a `scope` (`full`, `mfa_pending` or `mfa_setup`); only `full` tokens authenticate normal requests and get the sliding 10-day renewal
 
 - Farm default host, port and config search paths now come from `apb.constants` (`FARM_DEFAULT_HOST`, `FARM_DEFAULT_PORT`, `DEFAULT_CONFIG_PATHS`) instead of duplicated definitions in `farm/core.py`
 - Build timeout bounds and default (300, 14400 and 7200 seconds) come from `BUILD_TIMEOUT_MIN`, `BUILD_TIMEOUT_MAX` and `BUILD_TIMEOUT_DEFAULT` in `apb.constants` on server, farm and client
@@ -56,9 +86,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Duplicate `load_config` in `apb.client.api` (use `apb.config.load_config`) and the unimplemented `APBotClient.get_latest_successful_build_id` stub
 - `requirements.txt`; dependencies are declared only in `pyproject.toml` (install with `pip install -e .` or `pip install -e '.[dev]'`)
 - `submit_build_to_farm` and `monitor_farm_builds` in `apb.client.cli` (use `submit_build` and `monitor_builds`), and the unused `allow_toggle`, `status_callback` and `pkgname` parameters of `monitor_build`
+- Dashboard JavaScript login and password dialogs, `localStorage` token storage, client-side `authToken` cookie writes and the global `window.fetch` monkeypatch that added the token to every request
 
 ### Fixed
 
+- `/account` showed `none` as email and always showed notifications as enabled, and `GET /auth/me` returned `email: null`: users loaded from a session or API token were missing `email` and `email_notifications_enabled`
+- Build completion emails were only sent when the 2-minute status poller noticed the final status itself. Whenever the APB client or the build status page fetched it first, the build was already stored as finished and no email went out. Cancellations, submission failures, rejected builds and builds lost on unavailable servers never sent one. Every path now goes through `core.finish_build`, which emails exactly once, on the actual transition to `completed`, `failed` or `cancelled`
+- Sending email no longer blocks the farm's event loop: SMTP delivery for build notifications runs in a worker thread with a 30 second timeout, and notification tasks are kept referenced until they finish
+- `nginx-apb-farm.conf` lets `/static/`, `/login`, `/logout`, `/account` and `/account/password` through to the farm. They used to hit the catch-all redirect to `/dashboard`, so pages loaded without stylesheet and scripts and the login form could not be reached
+- `GET /farm` used to fail with a `NameError` (`running_builds_by_server`) when listing running builds per server
 - Client `get_build_status` queries `/build/{build_id}/status-api`, which both server and farm serve. It used to query `/build/{build_id}/status?format=json`, which only the farm implements, so status calls against a server directly returned 404
 - Farm build list timestamps are real UTC; they used to be local time with a `UTC` suffix
 - Farm build discovery parses server build lists with `BuildListResponse` and stores epoch timestamps. It used to write the server's ISO strings into numeric columns, and gave unstarted builds a fake `start_time`
@@ -75,10 +111,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Client build tarballs no longer include the output directory, build artifacts (`.pkg.tar.*`, `.sig`, `.log`), or common non-source paths (`pkg/`, `.git/`, etc.)
 - PKGBUILD parser now collects multi-line bash arrays (`apb_extra_repos=(...)`, `arch=(...)`, `pkgname=(...)`) instead of treating a lone `(` as a repository name and rejecting farm submissions
 - `apb_extra_repos` URLs preserve pacman `$arch` / `$repo` placeholders so they match admin-configured repository URLs and expand at pacman runtime; other `${var}` references in those URLs still expand normally
+- Admin user list shows each user's real email notification setting (it always showed "Enabled")
+- `src/apb/web` templates and `style.css` are actually used; `/static` was never mounted, so the stylesheet was never served
 
 ### Security
 
 - Farm strips directory components from legacy individual-file source filenames before writing them, and the client strips them from download filenames, so crafted names such as `../x` cannot write outside the target directory
+- HTML pages escape all dynamic values. Usernames, package names, versions, repository data, file contents and the build ID from the URL were inserted unescaped (including into inline `onclick` handlers), which allowed stored and reflected XSS
+- Cookie-authenticated state-changing requests require a CSRF token, and the session cookie is `HttpOnly`, so page scripts can no longer read the token
+- Second-factor logins are limited to 5 attempts per 5-minute pending login, TOTP codes cannot be replayed, and security key sign counters are checked to detect cloned keys
+- TOTP secrets in `user_totp.secret` are encrypted at rest with AES-256-GCM (bound to the user ID) using a key file kept outside `farm.db`; existing plaintext secrets are encrypted, and secrets of older keys re-encrypted with the active key, on farm startup. Without a usable key the farm still starts, but authenticator app logins and enrollment fail while security keys and recovery codes keep working
 
 ## 2026.08.06
 

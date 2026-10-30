@@ -1,0 +1,16 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import messages %}
+{% block content %}
+{{ messages(error, success) }}
+<form class="form card" method="post" action="/login">
+<div class="field">
+<label for="username">Username</label>
+<input type="text" id="username" name="username" value="{{ username or '' }}" autocomplete="username" autocapitalize="none" required autofocus>
+</div>
+<div class="field">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit" class="button-primary">Log in</button>
+</form>
+{% endblock %}

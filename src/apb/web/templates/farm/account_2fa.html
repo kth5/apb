@@ -1,0 +1,115 @@
+{% extends "farm/layout.html" %}
+{% from "macros.html" import csrf_field, details, messages, status_badge %}
+{% block content %}
+{{ messages(error, success) }}
+{% if is_setup %}
+<p class="alert alert-warning" role="status">Administrators must use two-factor authentication. Set up an authenticator app or a security key to finish logging in.</p>
+{% endif %}
+{% if recovery_codes %}
+<section class="card">
+<h2>Your recovery codes</h2>
+<p>Store these codes somewhere safe. Each one logs you in once if you lose your authenticator app or security key. They are shown only now.</p>
+<ul class="recovery-codes">
+{% for code in recovery_codes %}
+<li><code>{{ code }}</code></li>
+{% endfor %}
+</ul>
+{% if not is_setup %}<p><a href="/dashboard">Continue to the dashboard</a></p>{% endif %}
+</section>
+{% endif %}
+<section class="card">
+<h2>Status</h2>
+{{ details([
+  ("Two-factor authentication", status_badge("enabled" if status.enabled else "disabled")),
+  ("Required for your account", "yes" if status.required else "no"),
+  ("Recovery codes left", status.recovery_codes_remaining if status.enabled else none),
+]) }}
+</section>
+<section class="card">
+<h2>Authenticator app</h2>
+{% if status.totp_enabled %}
+<p>An authenticator app is set up.</p>
+<form class="form" method="post" action="/account/2fa/totp/delete">
+{{ csrf_field(csrf_token) }}
+<div class="field">
+<label for="totp-password">Password</label>
+<input type="password" id="totp-password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit" class="button-danger">Remove authenticator app</button>
+</form>
+{% else %}
+<p class="muted">Use an app such as FreeOTP, Aegis, Google Authenticator or 1Password to generate login codes.</p>
+<form class="form" method="post" action="/account/2fa/totp">
+{{ csrf_field(csrf_token) }}
+<button type="submit" class="button-primary">Set up authenticator app</button>
+</form>
+{% endif %}
+</section>
+<section class="card">
+<h2>Security keys</h2>
+{% if status.security_keys %}
+<div class="table-scroll">
+<table class="data-table stack">
+<thead>
+<tr>
+<th scope="col">Name</th>
+<th scope="col">Added</th>
+<th scope="col">Last used</th>
+<th scope="col">Remove</th>
+</tr>
+</thead>
+<tbody>
+{% for key in status.security_keys %}
+<tr>
+<td data-label="Name">{{ key.name }}</td>
+<td data-label="Added">{{ key.created_at | timestamp }}</td>
+<td data-label="Last used">{{ key.last_used_at | timestamp if key.last_used_at else "never" }}</td>
+<td data-label="Remove">
+<form class="inline" method="post" action="/account/2fa/webauthn/{{ key.id }}/delete">
+{{ csrf_field(csrf_token) }}
+<label for="key-password-{{ key.id }}" class="visually-hidden">Password</label>
+<input type="password" id="key-password-{{ key.id }}" name="password" placeholder="Password" autocomplete="current-password" required>
+<button type="submit" class="button-small button-danger">Remove</button>
+</form>
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">No security keys registered.</p>
+{% endif %}
+<div class="js-only hidden">
+<form class="form" method="post" action="/account/2fa/webauthn" data-webauthn="create">
+{{ csrf_field(csrf_token) }}
+<input type="hidden" name="credential" value="">
+<script type="application/json" class="webauthn-options">{{ webauthn_options | tojson }}</script>
+<div class="field">
+<label for="key-name">Key name</label>
+<input type="text" id="key-name" name="name" maxlength="64" placeholder="YubiKey 5C" required>
+</div>
+<p class="message" aria-live="polite"></p>
+<button type="submit">Register security key</button>
+</form>
+</div>
+<noscript><p class="muted">Registering and using security keys in the browser needs JavaScript.</p></noscript>
+</section>
+{% if status.enabled %}
+<section class="card">
+<h2>Recovery codes</h2>
+<p class="muted">Generating new recovery codes invalidates all old ones.</p>
+<form class="form" method="post" action="/account/2fa/recovery-codes">
+{{ csrf_field(csrf_token) }}
+<div class="field">
+<label for="recovery-password">Password</label>
+<input type="password" id="recovery-password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit">Generate new recovery codes</button>
+</form>
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="{{ static_url('webauthn.js') }}"></script>
+{% endblock %}
