@@ -452,7 +452,7 @@ apb --farm --cancel 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 #Include = /etc/pacman.d/mirrorlist
 ```
 
-The server enables them in front of `[base]` for that build only and lists the levels it supports in `repo_levels` of `GET /`. The farm rejects the submission when an architecture has no such server.
+The server builds testing and stage packages in separate chroots (`<buildroot>/testing/root` and `<buildroot>/stage/root`), copied from the base chroot on first use with these sections enabled in front of the base repositories, and lists the levels it supports in `repo_levels` of `GET /`. Buildroot recreation removes the level chroots; they are recreated on the next build that needs them. The farm rejects the submission when an architecture has no such server.
 
 #### Monitoring Options
 

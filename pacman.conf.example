@@ -3,8 +3,10 @@
 #
 # apb-server copies this file into its buildroot. Builds use [base] and
 # [base-any] by default. The [stage*] and [testing*] sections below stay
-# commented out; apb-server enables them only for builds submitted with
-# `apb --testing` or `apb --stage`, placing them in front of [base]:
+# commented out; for builds submitted with `apb --testing` or `apb --stage`
+# apb-server uses a separate chroot (<buildroot>/testing/root or
+# <buildroot>/stage/root) whose pacman.conf has them enabled in front of the
+# base repositories:
 #
 #   --testing  enables [testing-any] and [testing]
 #   --stage    enables [stage-any], [stage], [testing-any] and [testing]

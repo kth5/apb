@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - `queue_status.buildroot_recreation_state` (`idle`, `draining`, or `recreating`) on apb-server status
 - `apb --testing` and `apb --stage` build against the ArchPOWER `[testing]`/`[testing-any]` repositories, or additionally `[stage]`/`[stage-any]` (`--stage` implies `--testing`)
-- `repo_level` form field (`base`, `testing` or `stage`) on farm `POST /build/submit` and server `POST /build`; the server enables the matching sections that are commented out in its host `pacman.conf`, in front of `[base]`, for that build only
+- `repo_level` form field (`base`, `testing` or `stage`) on farm `POST /build/submit` and server `POST /build`; testing and stage builds run in their own chroots (`<buildroot>/testing/root`, `<buildroot>/stage/root`), created from the base root on first use with the sections that are commented out in the host `pacman.conf` enabled in front of the base repositories, so `makechrootpkg -u` syncs their databases. Buildroot recreation removes them; they are recreated on the next build that needs them
 - `repo_levels` in apb-server `GET /` lists the levels the server can build against; the farm only dispatches testing/stage builds to such servers and rejects submissions with `"error": "Unsupported repository level"` when an architecture has none
 - `repo_level` in build status responses and a `repo_level` column in the farm `builds` table
 - `pacman.conf.example`: ArchPOWER host `pacman.conf` with the commented `[stage-any]`, `[stage]`, `[testing-any]` and `[testing]` sections apb-server needs for `--testing` and `--stage`

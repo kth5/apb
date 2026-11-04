@@ -404,7 +404,7 @@ Submit a new build request with support for both tarball and individual file upl
 
 **Repository Levels:**
 
-ArchPOWER builds use `[base]` and `[base-any]` by default. For `repo_level=testing` or `repo_level=stage`, the server copies its chroot `pacman.conf` into the build directory, uncomments the level's sections and moves them in front of the first active section (normally `[base]`), highest priority first:
+ArchPOWER builds use `[base]` and `[base-any]` by default. Builds with `repo_level=testing` or `repo_level=stage` run in a separate chroot per level, `<buildroot>/testing/root` or `<buildroot>/stage/root`, passed to `makechrootpkg -r`. Its `pacman.conf` is the buildroot's `pacman.conf` with the level's sections uncommented and moved in front of the first active repository section (the base repositories), highest priority first:
 
 | `repo_level` | Enabled sections |
 |---|---|
@@ -418,7 +418,16 @@ The sections must be present but commented out in the host `/etc/pacman.conf` (c
 #Include = /etc/pacman.d/mirrorlist
 ```
 
-A level is listed in `repo_levels` only when all of its sections and those of the levels below it are found. Custom repositories (`extra_repos`) are still inserted in front of all other sections. The shared buildroot is not modified; the generated `pacman.conf` is bind-mounted into the per-build chroot copy.
+A level is listed in `repo_levels` only when all of its sections and those of the levels below it are found.
+
+**Level chroots:**
+- Created on the first build that needs them by copying `<buildroot>/root` (`cp -a --reflink=auto`) and running `arch-nspawn -C <composed pacman.conf> <level root> pacman -Syuu`
+- `makechrootpkg -cuT` then copies the level chroot for each build, and its `-u` step syncs the level's repository databases from the chroot's own `pacman.conf`
+- Updated the same way when the commented sections in the buildroot's `pacman.conf` change
+- Removed by buildroot recreation (`--buildroot-autorecreate`) together with `<buildroot>/root`, and recreated by the next build that needs them
+- If preparing a level chroot fails, the build fails with `Failed to prepare chroot for repository level '<level>'` and the partial chroot is removed
+
+Custom repositories (`extra_repos`) are inserted in front of all other sections of the build's chroot (base or level) through a `pacman.conf` bind-mounted into the per-build chroot copy.
 
 **Error Responses:**
 ```json

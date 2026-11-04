@@ -59,6 +59,7 @@ FAILED_BUILD_RETAINED_FILES = {"build.log"}
 ACTIVE_SECTION_RE = re.compile(r"^\[([^\]]+)\]$")
 COMMENTED_SECTION_RE = re.compile(r"^#\s*\[([^\]]+)\]$")
 COMMENTED_OPTION_RE = re.compile(r"^#\s*((?:Include|Server|SigLevel|Usage|CacheServer)\s*=.*)$")
+LEVEL_APPLIED_CONF_NAME = ".apb-pacman.conf"
 REPO_LEVEL_SECTION_NAMES = frozenset(section for sections in REPO_LEVEL_SECTIONS.values() for section in sections)
 
 # Global state
@@ -79,6 +80,7 @@ BUILDROOT_STATE_DRAINING = "draining"
 BUILDROOT_STATE_RECREATING = "recreating"
 
 buildroot_state_lock = threading.Lock()
+level_buildroot_lock = threading.Lock()
 finished_build_counter = 0
 buildroot_state = BUILDROOT_STATE_IDLE
 in_flight_builds = 0
@@ -661,12 +663,14 @@ def register_finished_build() -> None:
 
 
 def _remove_buildroot_paths(buildroot_path: Path) -> None:
-    """Remove root and per-slot chroot copies under the buildroot."""
+    """Remove root, per-slot chroot copies and repo-level chroots under the buildroot."""
     paths_to_remove = [buildroot_path / "root"]
     for slot_path in buildroot_path.glob("apb-slot-*"):
         paths_to_remove.append(slot_path)
     for lock_path in buildroot_path.glob("apb-slot-*.lock"):
         paths_to_remove.append(lock_path)
+    for level in REPO_LEVEL_ORDER[1:]:
+        paths_to_remove.append(get_level_buildroot(buildroot_path, level))
 
     for path in paths_to_remove:
         if not path.exists():
@@ -875,14 +879,107 @@ def get_repo_levels() -> List[RepoLevel]:
         return []
 
 
+def chroot_arch_prefix(server_arch: str) -> List[str]:
+    """Personality wrapper so chroot tools detect 32-bit PowerPC."""
+    return ["ppc32"] if server_arch in ("powerpc", "espresso") else []
+
+
+def get_level_buildroot(buildroot_path: Path, repo_level: RepoLevel) -> Path:
+    """makechrootpkg -r directory for ``repo_level``; BASE uses the buildroot itself."""
+    return buildroot_path if repo_level == RepoLevel.BASE else buildroot_path / repo_level.value
+
+
+def _run_chroot_command(cmd: List[str], log_output_func, timeout: int) -> bool:
+    log_output_func(f"Running: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log_output_func(f"Command timed out after {timeout} seconds")
+        return False
+    if result.returncode != 0:
+        log_output_func(f"Command failed with exit code {result.returncode}: {result.stderr.strip()}")
+        return False
+    return True
+
+
+def ensure_level_buildroot(buildroot_path: Path, repo_level: RepoLevel, log_output_func) -> Optional[Path]:
+    """Return the makechrootpkg -r directory for ``repo_level``, preparing its chroot when needed.
+
+    Testing and stage builds use their own chroot, copied from the base root on first use,
+    whose pacman.conf has the level's sections enabled; makechrootpkg -u then syncs their
+    databases into every build copy. The chroot is updated again when the host sections change.
+    """
+    if repo_level == RepoLevel.BASE:
+        return buildroot_path
+
+    level_buildroot = get_level_buildroot(buildroot_path, repo_level)
+    level_root = level_buildroot / "root"
+    base_root = buildroot_path / "root"
+
+    with level_buildroot_lock:
+        try:
+            composed = compose_pacman_conf((base_root / "etc" / "pacman.conf").read_text(), [], repo_level)
+        except (OSError, ValueError) as e:
+            log_output_func(f"Cannot prepare pacman.conf for repository level '{repo_level.value}': {e}")
+            return None
+
+        # arch-nspawn rewrites CacheDir in the chroot's copy, so compare against the last applied input
+        applied_conf = level_buildroot / LEVEL_APPLIED_CONF_NAME
+        if level_root.exists() and applied_conf.exists() and applied_conf.read_text() == composed:
+            return level_buildroot
+
+        level_buildroot.mkdir(parents=True, exist_ok=True)
+        applied_conf.unlink(missing_ok=True)
+        if not level_root.exists():
+            log_output_func(f"Creating {repo_level.value} chroot {level_root} from {base_root}")
+            if not _run_chroot_command(
+                ["sudo", "cp", "-a", "--reflink=auto", str(base_root), str(level_root)],
+                log_output_func,
+                timeout=1800,
+            ):
+                subprocess.run(["sudo", "rm", "-rf", str(level_root)], capture_output=True, text=True)
+                return None
+        else:
+            log_output_func(f"Updating pacman.conf of {repo_level.value} chroot {level_root}")
+
+        staged_conf = level_buildroot / ".pacman.conf.apb"
+        staged_conf.write_text(composed)
+        try:
+            is_synced = _run_chroot_command(
+                [
+                    "sudo",
+                    *chroot_arch_prefix(get_server_architecture()),
+                    "arch-nspawn",
+                    "-C",
+                    str(staged_conf),
+                    str(level_root),
+                    "pacman",
+                    "-Syuu",
+                    "--noconfirm",
+                ],
+                log_output_func,
+                timeout=3600,
+            )
+        finally:
+            staged_conf.unlink(missing_ok=True)
+
+        if not is_synced:
+            # A partially prepared chroot would be reused as-is; start over on the next build
+            subprocess.run(["sudo", "rm", "-rf", str(level_root)], capture_output=True, text=True)
+            return None
+
+        applied_conf.write_text(composed)
+        log_output_func(f"{repo_level.value} chroot ready: {', '.join(sections_for_level(repo_level))} enabled")
+        return level_buildroot
+
+
 def create_custom_pacman_conf(
     buildroot_path: Path,
     build_dir: Path,
     extra_repos: List[Dict],
-    repo_level: RepoLevel,
     log_output_func,
 ) -> Optional[Path]:
-    """Write build_dir/pacman.conf with custom repositories and the repo level's sections enabled."""
+    """Write build_dir/pacman.conf: the buildroot's pacman.conf with custom repositories in front."""
     try:
         chroot_pacman_conf = buildroot_path / "root" / "etc" / "pacman.conf"
 
@@ -890,14 +987,11 @@ def create_custom_pacman_conf(
             log_output_func("Warning: pacman.conf not found in buildroot")
             return None
 
-        composed = compose_pacman_conf(chroot_pacman_conf.read_text(), extra_repos, repo_level)
+        composed = compose_pacman_conf(chroot_pacman_conf.read_text(), extra_repos, RepoLevel.BASE)
         custom_pacman_conf = build_dir / "pacman.conf"
         custom_pacman_conf.write_text(composed)
 
-        log_output_func(
-            f"Created custom pacman.conf with {len(extra_repos)} custom repositories "
-            f"and repository level '{repo_level.value}'"
-        )
+        log_output_func(f"Created custom pacman.conf with {len(extra_repos)} custom repositories")
         return custom_pacman_conf
 
     except Exception as e:
@@ -1042,27 +1136,16 @@ def build_makechrootpkg_command(
     server_arch: str,
 ) -> List[str]:
     """Assemble the makechrootpkg command for a build."""
-    if server_arch in ("powerpc", "espresso"):
-        cmd = [
-            "sudo",
-            "ppc32",
-            "makechrootpkg",
-            "-cuT",
-            "-l",
-            chroot_copy,
-            "-r",
-            str(buildroot_path),
-        ]
-    else:
-        cmd = [
-            "sudo",
-            "makechrootpkg",
-            "-cuT",
-            "-l",
-            chroot_copy,
-            "-r",
-            str(buildroot_path),
-        ]
+    cmd = [
+        "sudo",
+        *chroot_arch_prefix(server_arch),
+        "makechrootpkg",
+        "-cuT",
+        "-l",
+        chroot_copy,
+        "-r",
+        str(buildroot_path),
+    ]
 
     if "CCACHE_DIR" in makepkg_config:
         cmd.extend(["-d", makepkg_config["CCACHE_DIR"]])
@@ -1299,11 +1382,19 @@ def build_package(
                     f"Enabling repository level '{repo_level.value}': "
                     f"{', '.join(sections_for_level(repo_level))}"
                 )
-
-            if extra_repos or repo_level != RepoLevel.BASE:
-                custom_pacman_conf = create_custom_pacman_conf(
-                    buildroot_path, build_dir, extra_repos or [], repo_level, log_output
+            level_buildroot = ensure_level_buildroot(buildroot_path, repo_level, log_output)
+            if level_buildroot is None:
+                log_output(f"ERROR: Failed to prepare chroot for repository level '{repo_level.value}'")
+                if srcdest_lock:
+                    unlock_srcdest(srcdest_lock)
+                finalize_failed_build(
+                    build_id, build_dir, f"Failed to prepare chroot for repository level '{repo_level.value}'"
                 )
+                should_cleanup_failed_dir = True
+                return
+
+            if extra_repos:
+                custom_pacman_conf = create_custom_pacman_conf(level_buildroot, build_dir, extra_repos, log_output)
                 if custom_pacman_conf is None:
                     log_output("ERROR: Failed to create custom pacman.conf")
                     if srcdest_lock:
@@ -1319,7 +1410,7 @@ def build_package(
                     f"Using ppc32 prefix for {server_arch} architecture to ensure 32-bit detection"
                 )
             cmd = build_makechrootpkg_command(
-                buildroot_path,
+                level_buildroot,
                 chroot_copy,
                 makepkg_config,
                 custom_pacman_conf,

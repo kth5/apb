@@ -150,19 +150,132 @@ def test_compose_pacman_conf_rejects_missing_sections() -> None:
         engine.compose_pacman_conf(TESTING_ONLY_CONF, [], RepoLevel.STAGE)
 
 
-def test_create_custom_pacman_conf_writes_build_dir(tmp_path: Path) -> None:
-    chroot_etc = tmp_path / "buildroot" / "root" / "etc"
+def test_create_custom_pacman_conf_adds_custom_repos_to_level_conf(tmp_path: Path) -> None:
+    level_conf = engine.compose_pacman_conf(PACMAN_CONF, [], RepoLevel.STAGE)
+    chroot_etc = tmp_path / "stage" / "root" / "etc"
     chroot_etc.mkdir(parents=True)
-    (chroot_etc / "pacman.conf").write_text(PACMAN_CONF)
+    (chroot_etc / "pacman.conf").write_text(level_conf)
     build_dir = tmp_path / "build"
     build_dir.mkdir()
-    messages: list[str] = []
+    extra_repos = [{"name": "custom", "url": "https://repo.example.com"}]
 
-    result = engine.create_custom_pacman_conf(tmp_path / "buildroot", build_dir, [], RepoLevel.STAGE, messages.append)
+    result = engine.create_custom_pacman_conf(tmp_path / "stage", build_dir, extra_repos, lambda _: None)
 
     assert result == build_dir / "pacman.conf"
-    assert _section_order(result.read_text())[1:5] == ["stage-any", "stage", "testing-any", "testing"]
-    assert (chroot_etc / "pacman.conf").read_text() == PACMAN_CONF
+    assert _section_order(result.read_text())[1:6] == ["custom", "stage-any", "stage", "testing-any", "testing"]
+    assert (chroot_etc / "pacman.conf").read_text() == level_conf
+
+
+# Level chroots
+
+class _FakeChrootCommands:
+    """Records sudo commands; `cp -a` creates the target directory like the real copy would."""
+
+    def __init__(self, failing_tool: str | None = None) -> None:
+        self.commands: list[list[str]] = []
+        self.failing_tool = failing_tool
+
+    def __call__(self, cmd: list[str], **kwargs) -> SimpleNamespace:
+        self.commands.append(cmd)
+        if self.failing_tool in cmd:
+            return SimpleNamespace(returncode=1, stderr="boom")
+        if cmd[1] == "cp":
+            Path(cmd[-1], "etc").mkdir(parents=True)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    def tools(self) -> list[str]:
+        return [next(part for part in cmd[1:] if part != "ppc32") for cmd in self.commands]
+
+
+@pytest.fixture
+def base_buildroot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    buildroot = tmp_path / "buildroot"
+    (buildroot / "root" / "etc").mkdir(parents=True)
+    (buildroot / "root" / "etc" / "pacman.conf").write_text(PACMAN_CONF)
+    monkeypatch.setattr(engine, "get_server_architecture", lambda: "x86_64")
+    return buildroot
+
+
+def test_get_level_buildroot(tmp_path: Path) -> None:
+    assert engine.get_level_buildroot(tmp_path, RepoLevel.BASE) == tmp_path
+    assert engine.get_level_buildroot(tmp_path, RepoLevel.STAGE) == tmp_path / "stage"
+
+
+def test_ensure_level_buildroot_base_uses_buildroot(base_buildroot: Path) -> None:
+    fake = _FakeChrootCommands()
+    with patch.object(engine.subprocess, "run", side_effect=fake):
+        assert engine.ensure_level_buildroot(base_buildroot, RepoLevel.BASE, lambda _: None) == base_buildroot
+    assert fake.commands == []
+
+
+def test_ensure_level_buildroot_creates_level_chroot_once(base_buildroot: Path) -> None:
+    fake = _FakeChrootCommands()
+    level_root = base_buildroot / "testing" / "root"
+
+    with patch.object(engine.subprocess, "run", side_effect=fake):
+        assert engine.ensure_level_buildroot(base_buildroot, RepoLevel.TESTING, lambda _: None) == base_buildroot / "testing"
+        assert engine.ensure_level_buildroot(base_buildroot, RepoLevel.TESTING, lambda _: None) == base_buildroot / "testing"
+
+    assert fake.commands[0] == ["sudo", "cp", "-a", "--reflink=auto", str(base_buildroot / "root"), str(level_root)]
+    staged_conf = str(base_buildroot / "testing" / ".pacman.conf.apb")
+    assert fake.commands[1] == ["sudo", "arch-nspawn", "-C", staged_conf, str(level_root), "pacman", "-Syuu", "--noconfirm"]
+    assert len(fake.commands) == 2
+    applied = (base_buildroot / "testing" / engine.LEVEL_APPLIED_CONF_NAME).read_text()
+    assert _section_order(applied) == ["options", "testing-any", "testing", "base", "base-any"]
+    assert not Path(staged_conf).exists()
+
+
+def test_ensure_level_buildroot_resyncs_when_host_sections_change(base_buildroot: Path) -> None:
+    fake = _FakeChrootCommands()
+    with patch.object(engine.subprocess, "run", side_effect=fake):
+        engine.ensure_level_buildroot(base_buildroot, RepoLevel.TESTING, lambda _: None)
+        (base_buildroot / "root" / "etc" / "pacman.conf").write_text(PACMAN_CONF.replace("mirrorlist", "mirrorlist-new"))
+        engine.ensure_level_buildroot(base_buildroot, RepoLevel.TESTING, lambda _: None)
+
+    assert fake.tools() == ["cp", "arch-nspawn", "arch-nspawn"]
+    assert "mirrorlist-new" in (base_buildroot / "testing" / engine.LEVEL_APPLIED_CONF_NAME).read_text()
+
+
+def test_ensure_level_buildroot_uses_ppc32_prefix(base_buildroot: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engine, "get_server_architecture", lambda: "powerpc")
+    fake = _FakeChrootCommands()
+    with patch.object(engine.subprocess, "run", side_effect=fake):
+        engine.ensure_level_buildroot(base_buildroot, RepoLevel.STAGE, lambda _: None)
+
+    assert fake.commands[1][:3] == ["sudo", "ppc32", "arch-nspawn"]
+
+
+def test_ensure_level_buildroot_removes_chroot_after_failed_sync(base_buildroot: Path) -> None:
+    fake = _FakeChrootCommands(failing_tool="arch-nspawn")
+    messages: list[str] = []
+    level_root = base_buildroot / "stage" / "root"
+
+    with patch.object(engine.subprocess, "run", side_effect=fake):
+        assert engine.ensure_level_buildroot(base_buildroot, RepoLevel.STAGE, messages.append) is None
+
+    assert fake.commands[-1] == ["sudo", "rm", "-rf", str(level_root)]
+    assert not (base_buildroot / "stage" / engine.LEVEL_APPLIED_CONF_NAME).exists()
+    assert any("exit code 1" in message for message in messages)
+
+
+def test_ensure_level_buildroot_fails_without_level_sections(base_buildroot: Path) -> None:
+    (base_buildroot / "root" / "etc" / "pacman.conf").write_text(TESTING_ONLY_CONF)
+    fake = _FakeChrootCommands()
+    with patch.object(engine.subprocess, "run", side_effect=fake):
+        assert engine.ensure_level_buildroot(base_buildroot, RepoLevel.STAGE, lambda _: None) is None
+    assert fake.commands == []
+
+
+def test_remove_buildroot_paths_includes_level_chroots(tmp_path: Path) -> None:
+    for path in ("root", "testing/root", "stage/root"):
+        (tmp_path / path).mkdir(parents=True)
+    fake = _FakeChrootCommands()
+
+    with patch.object(engine.subprocess, "run", side_effect=fake):
+        engine._remove_buildroot_paths(tmp_path)
+
+    removed = [cmd[-1] for cmd in fake.commands]
+    assert removed == [str(tmp_path / "root"), str(tmp_path / "testing"), str(tmp_path / "stage")]
 
 
 def test_get_repo_levels_reads_buildroot_conf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
