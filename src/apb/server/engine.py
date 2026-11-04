@@ -65,9 +65,16 @@ build_streams: Dict[str, List] = {}
 build_log_handles: Dict[str, Any] = {}  # build_id -> open file handle for build.log
 server_config = {}
 shutdown_event = threading.Event()
-build_counter = 0  # Counter for buildroot recreation
 running_processes: Dict[str, subprocess.Popen] = {}  # Track running build processes
-buildroot_recreation_builds: Dict[str, bool] = {}  # Track builds doing buildroot recreation
+
+BUILDROOT_STATE_IDLE = "idle"
+BUILDROOT_STATE_DRAINING = "draining"
+BUILDROOT_STATE_RECREATING = "recreating"
+
+buildroot_state_lock = threading.Lock()
+finished_build_counter = 0
+buildroot_state = BUILDROOT_STATE_IDLE
+in_flight_builds = 0
 
 
 def init_chroot_slots(count: int) -> None:
@@ -361,31 +368,17 @@ def terminate_build(build_id: str):
         if build_id in running_processes:
             process = running_processes[build_id]
 
-            # Check if this build is doing buildroot recreation
-            is_buildroot_recreation = buildroot_recreation_builds.get(build_id, False)
-
-            # Use longer timeout for buildroot recreation (5 minutes vs 10 seconds)
-            termination_timeout = 300 if is_buildroot_recreation else 10
-
             process.terminate()
             try:
-                process.wait(timeout=termination_timeout)
-                if is_buildroot_recreation:
-                    logger.info(f"Build {build_id} (buildroot recreation) terminated gracefully after SIGTERM")
-                else:
-                    logger.info(f"Build {build_id} terminated gracefully after SIGTERM")
+                process.wait(timeout=10)
+                logger.info(f"Build {build_id} terminated gracefully after SIGTERM")
             except subprocess.TimeoutExpired:
-                # For buildroot recreation, this is somewhat expected and shouldn't be an ERROR
-                if is_buildroot_recreation:
-                    logger.warning(f"Build {build_id} (buildroot recreation) did not respond to SIGTERM within {termination_timeout}s, sending SIGKILL")
-                else:
-                    logger.warning(f"Build {build_id} did not respond to SIGTERM within {termination_timeout}s, sending SIGKILL")
+                logger.warning(
+                    f"Build {build_id} did not respond to SIGTERM within 10s, sending SIGKILL"
+                )
                 process.kill()
 
             del running_processes[build_id]
-            # Clean up buildroot recreation tracking
-            if build_id in buildroot_recreation_builds:
-                del buildroot_recreation_builds[build_id]
 
         if build_id in active_builds:
             active_builds[build_id]["status"] = BuildStatus.CANCELLED
@@ -402,15 +395,7 @@ def terminate_build(build_id: str):
         logger.info(f"Build {build_id} terminated successfully")
 
     except Exception as e:
-        # Use appropriate log level based on the type of error
-        if "timed out" in str(e).lower() and buildroot_recreation_builds.get(build_id, False):
-            logger.warning(f"Expected timeout during buildroot recreation for build {build_id}: {e}")
-        else:
-            logger.error(f"Error terminating build {build_id}: {e}")
-
-        # Clean up tracking even on error
-        if build_id in buildroot_recreation_builds:
-            del buildroot_recreation_builds[build_id]
+        logger.error(f"Error terminating build {build_id}: {e}")
 
 
 def get_system_info() -> Dict[str, Any]:
@@ -483,29 +468,28 @@ def get_queue_status() -> Dict[str, Any]:
     current_builds = len([b for b in active_builds.values() if b["status"] == BuildStatus.BUILDING])
     queued_builds = len([b for b in active_builds.values() if b["status"] == BuildStatus.QUEUED])
 
-    # Count builds doing buildroot recreation
-    buildroot_recreation_count = len(buildroot_recreation_builds)
+    with buildroot_state_lock:
+        recreation_state = buildroot_state
+        buildroot_recreation_count = 1 if recreation_state == BUILDROOT_STATE_RECREATING else 0
+        server_busy_with_buildroot = recreation_state in (
+            BUILDROOT_STATE_DRAINING,
+            BUILDROOT_STATE_RECREATING,
+        )
 
-    # Get current build info
     current_build = None
-    buildroot_recreation_builds_info = []
 
     for build_id, build_info in active_builds.items():
         if build_info["status"] == BuildStatus.BUILDING:
-            is_buildroot_recreation = build_id in buildroot_recreation_builds
             build_details = {
                 "build_id": build_id,
                 "pkgname": build_info.get("pkgname", "unknown"),
                 "status": "building",
                 "start_time": build_info.get("start_time", time.time()),
-                "buildroot_recreation": is_buildroot_recreation
+                "buildroot_recreation": False,
             }
 
             if not current_build:
                 current_build = build_details
-
-            if is_buildroot_recreation:
-                buildroot_recreation_builds_info.append(build_details)
 
     return {
         "current_builds_count": current_builds,
@@ -515,8 +499,9 @@ def get_queue_status() -> Dict[str, Any]:
         "total_active_builds": len(active_builds),
         "build_history_count": len(build_history),
         "buildroot_recreation_count": buildroot_recreation_count,
-        "buildroot_recreation_builds": buildroot_recreation_builds_info,
-        "server_busy_with_buildroot": buildroot_recreation_count > 0
+        "buildroot_recreation_builds": [],
+        "buildroot_recreation_state": recreation_state,
+        "server_busy_with_buildroot": server_busy_with_buildroot,
     }
 
 
@@ -648,6 +633,72 @@ def setup_buildroot(buildroot_path: Path) -> bool:
     except Exception as e:
         logger.error(f"Error setting up buildroot: {e}")
         return False
+
+
+def register_finished_build() -> None:
+    """Count a finished build toward buildroot auto-recreation."""
+    threshold = server_config.get("buildroot_autorecreate")
+    if not threshold:
+        return
+
+    global finished_build_counter, buildroot_state
+    with buildroot_state_lock:
+        finished_build_counter += 1
+        if finished_build_counter >= threshold and buildroot_state == BUILDROOT_STATE_IDLE:
+            buildroot_state = BUILDROOT_STATE_DRAINING
+            logger.info(
+                "Buildroot recreation scheduled after %s finished builds (threshold %s)",
+                finished_build_counter,
+                threshold,
+            )
+
+
+def _remove_buildroot_paths(buildroot_path: Path) -> None:
+    """Remove root and per-slot chroot copies under the buildroot."""
+    paths_to_remove = [buildroot_path / "root"]
+    for slot_path in buildroot_path.glob("apb-slot-*"):
+        paths_to_remove.append(slot_path)
+    for lock_path in buildroot_path.glob("apb-slot-*.lock"):
+        paths_to_remove.append(lock_path)
+
+    for path in paths_to_remove:
+        if not path.exists():
+            continue
+        logger.info("Removing buildroot path: %s", path)
+        result = subprocess.run(
+            ["sudo", "rm", "-rf", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Could not remove {path}: {result.stderr}")
+
+
+def recreate_buildroot(buildroot_path: Path) -> bool:
+    """Remove and recreate the buildroot after all in-flight builds have finished."""
+    global finished_build_counter, buildroot_state
+
+    with buildroot_state_lock:
+        buildroot_state = BUILDROOT_STATE_RECREATING
+
+    success = False
+    try:
+        logger.info("Recreating buildroot at %s", buildroot_path)
+        _remove_buildroot_paths(buildroot_path)
+        success = setup_buildroot(buildroot_path)
+        if success:
+            logger.info("Buildroot recreation completed successfully")
+        else:
+            logger.warning("Failed to recreate buildroot; continuing with existing buildroot if present")
+    except Exception as exc:
+        logger.warning("Could not recreate buildroot: %s", exc)
+    finally:
+        with buildroot_state_lock:
+            finished_build_counter = 0
+            buildroot_state = BUILDROOT_STATE_IDLE
+
+    return success
 
 
 def get_makepkg_conf_path() -> Path:
@@ -1086,8 +1137,6 @@ def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code
 
 def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any], build_timeout: int = BUILD_TIMEOUT, extra_repos: List[Dict] = None):
     """Build package using makechrootpkg"""
-    global build_counter
-
     logger.info(f"build_package called for build {build_id}")
     should_cleanup_failed_dir = False
     srcdest_lock = None
@@ -1117,49 +1166,7 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         log_output(f"Starting build for {pkgbuild_info['pkgname']}")
         logger.info(f"Build {build_id} status updated to BUILDING")
 
-        # Check if buildroot needs recreation
         buildroot_path = Path(server_config["buildroot"])
-        should_recreate = False
-
-        if server_config.get("buildroot_autorecreate"):
-            build_counter += 1
-            if build_counter >= server_config["buildroot_autorecreate"]:
-                should_recreate = True
-                build_counter = 0
-                log_output(f"Recreating buildroot after {server_config['buildroot_autorecreate']} builds")
-
-        # Recreate buildroot if needed
-        if should_recreate:
-            # Mark this build as doing buildroot recreation
-            buildroot_recreation_builds[build_id] = True
-            log_output("Removing existing buildroot for recreation")
-            try:
-                root_path = buildroot_path / "root"
-                if root_path.exists():
-                    log_output("Removing existing buildroot directory...")
-                    # Use subprocess to avoid blocking the main thread
-                    result = subprocess.run(['sudo', 'rm', '-rf', str(root_path)],
-                                          capture_output=True, text=True, timeout=300)
-                    if result.returncode != 0:
-                        log_output(f"Warning: Could not remove buildroot: {result.stderr}")
-                        # Continue anyway - mkarchroot might handle it
-
-                log_output("Setting up new buildroot...")
-                if not setup_buildroot(buildroot_path):
-                    # Don't fail the build - just log the warning and continue
-                    log_output("Warning: Failed to recreate buildroot, continuing with existing buildroot")
-                    build_counter = 0  # Reset counter to avoid immediate retry
-                else:
-                    log_output("Buildroot recreation completed successfully")
-            except Exception as e:
-                log_output(f"Warning: Could not recreate buildroot: {e}")
-                log_output("Continuing with existing buildroot")
-                build_counter = 0  # Reset counter to avoid immediate retry
-            finally:
-                # Clear buildroot recreation flag
-                if build_id in buildroot_recreation_builds:
-                    del buildroot_recreation_builds[build_id]
-                log_output("Buildroot recreation phase completed, proceeding with package build")
 
         # Get makepkg config
         makepkg_config = get_makepkg_config()
@@ -1404,6 +1411,31 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         close_build_log(build_id)
         if should_cleanup_failed_dir:
             cleanup_failed_build_dir(build_id, build_dir)
+        register_finished_build()
+
+
+def _wait_for_buildroot_drain() -> bool:
+    """Wait until in-flight builds finish while draining. Returns False if shutting down."""
+    while not shutdown_event.is_set():
+        with buildroot_state_lock:
+            if buildroot_state != BUILDROOT_STATE_DRAINING:
+                return True
+            if in_flight_builds == 0:
+                return True
+        time.sleep(1)
+    return False
+
+
+def _increment_in_flight_builds() -> None:
+    global in_flight_builds
+    with buildroot_state_lock:
+        in_flight_builds += 1
+
+
+def _decrement_in_flight_builds(_future) -> None:
+    global in_flight_builds
+    with buildroot_state_lock:
+        in_flight_builds = max(0, in_flight_builds - 1)
 
 
 def process_build_queue():
@@ -1411,7 +1443,25 @@ def process_build_queue():
     logger.info("Build queue processor thread started")
     while not shutdown_event.is_set():
         try:
-            # Get build from queue
+            with buildroot_state_lock:
+                state = buildroot_state
+
+            if state == BUILDROOT_STATE_DRAINING:
+                if not _wait_for_buildroot_drain():
+                    break
+                with buildroot_state_lock:
+                    should_recreate = (
+                        buildroot_state == BUILDROOT_STATE_DRAINING
+                        and in_flight_builds == 0
+                    )
+                if should_recreate:
+                    recreate_buildroot(Path(server_config["buildroot"]))
+                continue
+
+            if state == BUILDROOT_STATE_RECREATING:
+                time.sleep(1)
+                continue
+
             if logger.level <= logging.DEBUG:
                 logger.debug(f"Checking queue for builds (queue size: {build_queue.qsize()})")
             build_data = build_queue.get(timeout=1)
@@ -1419,24 +1469,29 @@ def process_build_queue():
             build_id = build_data["build_id"]
             logger.info(f"Processing build {build_id} from queue")
 
-            # Submit to executor
-            if logger.level <= logging.DEBUG:
-                logger.debug(f"Executor state - max_workers: {build_executor._max_workers}, active threads: {len(build_executor._threads)}")
-            future = build_executor.submit(
-                build_package,
-                build_data["build_id"],
-                build_data["build_dir"],
-                build_data["pkgbuild_info"],
-                build_data.get("build_timeout", BUILD_TIMEOUT),
-                build_data.get("extra_repos", [])
-            )
+            _increment_in_flight_builds()
+
+            try:
+                if logger.level <= logging.DEBUG:
+                    logger.debug(f"Executor state - max_workers: {build_executor._max_workers}, active threads: {len(build_executor._threads)}")
+                future = build_executor.submit(
+                    build_package,
+                    build_data["build_id"],
+                    build_data["build_dir"],
+                    build_data["pkgbuild_info"],
+                    build_data.get("build_timeout", BUILD_TIMEOUT),
+                    build_data.get("extra_repos", [])
+                )
+                future.add_done_callback(_decrement_in_flight_builds)
+            except Exception:
+                _decrement_in_flight_builds(None)
+                raise
             logger.info(f"Build {build_id} submitted to executor")
 
         except queue.Empty:
             continue
         except Exception as e:
             logger.error(f"Error processing build queue: {e}")
-            # Log more details about the error
             import traceback
             logger.error(f"Queue processor traceback: {traceback.format_exc()}")
 

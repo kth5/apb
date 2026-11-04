@@ -57,10 +57,8 @@ async def lifespan(app: FastAPI):
 
     for build_id, process in engine.running_processes.items():
         try:
-            is_buildroot_recreation = engine.buildroot_recreation_builds.get(build_id, False)
-            termination_timeout = 300 if is_buildroot_recreation else 10
             process.terminate()
-            process.wait(timeout=termination_timeout)
+            process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             try:
                 process.kill()

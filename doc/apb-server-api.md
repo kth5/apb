@@ -274,6 +274,7 @@ Get comprehensive server information and status.
     "build_history_count": 25,
     "buildroot_recreation_count": 0,
     "buildroot_recreation_builds": [],
+    "buildroot_recreation_state": "idle",
     "server_busy_with_buildroot": false
   }
 }
@@ -937,11 +938,12 @@ apb-server --srcdest /data/sources
 Enhanced buildroot management with automatic recreation:
 
 #### Buildroot Recreation
-- **Automatic Triggers**: Configurable recreation after N builds
-- **Safe Recreation**: Special handling during buildroot recreation builds
-- **Extended Timeouts**: 5-minute timeout for buildroot recreation vs 10 seconds for normal builds
-- **Process Tracking**: Tracks builds performing buildroot recreation
-- **Failure Handling**: Continues with existing buildroot if recreation fails
+- **Automatic Triggers**: Configurable recreation after N finished builds
+- **Drain Before Recreate**: Stops dequeuing new builds until in-flight work completes
+- **Queue Dispatcher**: Recreation runs from the build queue thread, not inside a package build
+- **Slot Cleanup**: Removes `root` and all `apb-slot-*` copies (including `.lock` files) before `mkarchroot`
+- **Status Fields**: `buildroot_recreation_state` (`idle`, `draining`, `recreating`); `server_busy_with_buildroot` while draining or recreating
+- **Failure Handling**: Logs a warning and resets state; if removal succeeded but setup failed, the next build may recreate via startup `setup_buildroot`
 
 #### Buildroot Configuration
 ```bash
@@ -1084,7 +1086,7 @@ Server behavior can be configured via command line arguments and environment var
 
 #### Build Management
 - `--max-concurrent`: Maximum concurrent builds (default: 3)
-- `--buildroot-autorecreate`: Auto-recreate buildroot after N builds
+- `--buildroot-autorecreate`: Auto-recreate buildroot after N **finished** builds. When the threshold is reached the server stops dequeuing new work (`buildroot_recreation_state`: `draining`), waits for in-flight builds to finish, removes `root` and all `apb-slot-*` copies, runs `mkarchroot`, then resumes (`recreating` → `idle`). `server_busy_with_buildroot` is true while draining or recreating. Deprecated: `buildroot_recreation_builds` and per-build `buildroot_recreation` (always empty/false); use `buildroot_recreation_state`.
 - `--build-timeout`: Maximum build time in seconds (default: 7200)
 
 #### Architecture and Platform

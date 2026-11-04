@@ -305,7 +305,7 @@ apb-server --debug
 | `--buildroot` | `~/.apb/buildroot` | Directory for the build chroot |
 | `--builds-dir` | `~/.apb/builds` | Directory to store build results |
 | `--max-concurrent` | `3` | Maximum number of concurrent builds |
-| `--buildroot-autorecreate` | *disabled* | Recreate buildroot after N builds |
+| `--buildroot-autorecreate` | *disabled* | Recreate buildroot after N finished builds (drain in-flight work first; removes slot copies) |
 | `--architecture` | *auto-detect* | Override detected architecture |
 | `--max-file-size` | `100MB` | Maximum individual upload file size |
 | `--max-request-size` | `500MB` | Maximum total request size |
