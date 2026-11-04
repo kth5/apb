@@ -20,7 +20,7 @@ from apb.models import BuildListResponse, BuildStatusResponse, BuildSummary
 from apb.server import engine
 from apb.tarball import InvalidBuildTarball, extract_build_tarball
 from apb.upstream import build_download_path
-from apb.validation import validate_build_timeout
+from apb.validation import RepoLevel, validate_build_timeout, validate_repo_level
 from apb.web import render_page
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,7 @@ async def get_server_info():
             "status": "running",
             "version": VERSION,
             "supported_architecture": engine.get_server_architecture(),
+            "repo_levels": [level.value for level in engine.get_repo_levels()],
             "system_info": engine.get_system_info(),
             "queue_status": engine.get_queue_status()
         }
@@ -185,7 +186,8 @@ async def submit_build(
     build_id: str = Form(...),
     sources: List[UploadFile] = File(default=[]),
     build_timeout: Optional[int] = Form(None),
-    extra_repos: Optional[str] = Form(None)
+    extra_repos: Optional[str] = Form(None),
+    repo_level: Optional[str] = Form(None),
 ):
     """Submit a new build request (supports both tarball and individual file uploads)"""
     try:
@@ -202,6 +204,21 @@ async def submit_build(
             raise HTTPException(status_code=400, detail={"error": "Invalid timeout", "detail": str(exc)})
         if build_timeout is not None:
             logger.info(f"Build {build_id} using custom timeout: {timeout_seconds} seconds")
+
+        try:
+            requested_level = validate_repo_level(repo_level)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": "Invalid repository level", "detail": str(exc)})
+        available_levels = engine.get_repo_levels()
+        if requested_level != RepoLevel.BASE and requested_level not in available_levels:
+            available = ", ".join(level.value for level in available_levels) or "none"
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Unsupported repository level",
+                    "detail": f"Repository level '{requested_level.value}' is not available on this server (available: {available})",
+                },
+            )
 
         # Create build directory
         builds_dir = Path(engine.server_config["builds_dir"])
@@ -382,7 +399,8 @@ async def submit_build(
             "packages": [],
             "logs": [],
             "build_timeout": timeout_seconds,
-            "extra_repos": extra_repos_list
+            "extra_repos": extra_repos_list,
+            "repo_level": requested_level.value,
         }
 
         # Add to queue
@@ -391,7 +409,8 @@ async def submit_build(
             "build_dir": build_dir,
             "pkgbuild_info": pkgbuild_info,
             "build_timeout": timeout_seconds,
-            "extra_repos": extra_repos_list
+            "extra_repos": extra_repos_list,
+            "repo_level": requested_level,
         })
 
         logger.info(f"Build {build_id} added to queue (queue size now: {engine.build_queue.qsize()})")

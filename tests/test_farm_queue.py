@@ -12,6 +12,7 @@ import pytest
 
 from apb.constants import BuildStatus
 from apb.farm import core
+from apb.validation import RepoLevel
 
 pytestmark = pytest.mark.anyio
 
@@ -152,7 +153,7 @@ async def test_process_build_queue_skips_blocked_architecture(
     _insert_build(farm_queue_state, "ready-aarch64", server_arch="aarch64")
     core.build_queue.extend([blocked, ready])
 
-    async def pick_server(architectures: list[str]) -> str | None:
+    async def pick_server(architectures: list[str], repo_level: RepoLevel = RepoLevel.BASE) -> str | None:
         if architectures == ["x86_64"]:
             return None
         if architectures == ["aarch64"]:

@@ -37,6 +37,9 @@
 <dt>Status</dt><dd>{{ status_badge(status) }}{% if state == "unavailable" %} <span class="muted">(last known)</span>{% endif %}</dd>
 <dt>Build ID</dt><dd><code class="build-id">{{ build_id }}</code></dd>
 <dt>Architecture</dt><dd>{{ record.server_arch or ("pending assignment" if state == "queued" else "unknown") }}</dd>
+{% if record.repo_level and record.repo_level != "base" %}
+<dt>Repository level</dt><dd>{{ record.repo_level }}</dd>
+{% endif %}
 {% if record.server %}
 <dt>Server</dt><dd>{{ record.server }}{% if state in ("cached", "unavailable") %} (unavailable){% elif state in ("connection_failed", "unreachable") %} (connection failed){% endif %}</dd>
 {% endif %}

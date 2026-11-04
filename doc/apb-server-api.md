@@ -231,6 +231,7 @@ Get comprehensive server information and status.
   "status": "running",
   "version": "2026.10.30",
   "supported_architecture": "x86_64",
+  "repo_levels": ["testing", "stage"],
   "system_info": {
     "architecture": "x86_64",
     "cpu": {
@@ -279,6 +280,8 @@ Get comprehensive server information and status.
   }
 }
 ```
+
+`repo_levels` lists the repository levels besides `base` that builds on this server can use (see "Repository Levels" under `POST /build`); it is empty when the host `pacman.conf` has none of the required commented sections.
 
 #### GET /health
 Enhanced health check endpoint that performs comprehensive system testing.
@@ -359,6 +362,7 @@ Submit a new build request with support for both tarball and individual file upl
   - `build_tarball` (file, required): Compressed tarball containing PKGBUILD and sources
   - `build_id` (string, required): Build UUID (provided by APB Farm)
   - `build_timeout` (integer, optional): Build timeout in seconds (300-14400)
+  - `repo_level` (string, optional): `base` (default), `testing` or `stage`
 
 **Method 2: Individual File Upload (Legacy)**
 - **Content-Type:** `multipart/form-data`
@@ -367,6 +371,7 @@ Submit a new build request with support for both tarball and individual file upl
   - `sources` (file[], optional): Additional source files
   - `build_id` (string, required): Build UUID (provided by APB Farm)
   - `build_timeout` (integer, optional): Build timeout in seconds (300-14400)
+  - `repo_level` (string, optional): `base` (default), `testing` or `stage`
 
 **Response:**
 ```json
@@ -397,6 +402,24 @@ Submit a new build request with support for both tarball and individual file upl
 - **Per-Build**: Each build can have a custom timeout
 - **Enforcement**: Automatic termination after timeout
 
+**Repository Levels:**
+
+ArchPOWER builds use `[base]` and `[base-any]` by default. For `repo_level=testing` or `repo_level=stage`, the server copies its chroot `pacman.conf` into the build directory, uncomments the level's sections and moves them in front of the first active section (normally `[base]`), highest priority first:
+
+| `repo_level` | Enabled sections |
+|---|---|
+| `testing` | `[testing-any]`, `[testing]` |
+| `stage` | `[stage-any]`, `[stage]`, `[testing-any]`, `[testing]` |
+
+The sections must be present but commented out in the host `/etc/pacman.conf` (copied into the buildroot), each followed by its commented `Include`, `Server` or `SigLevel` lines:
+
+```ini
+#[testing]
+#Include = /etc/pacman.d/mirrorlist
+```
+
+A level is listed in `repo_levels` only when all of its sections and those of the levels below it are found. Custom repositories (`extra_repos`) are still inserted in front of all other sections. The shared buildroot is not modified; the generated `pacman.conf` is bind-mounted into the per-build chroot copy.
+
 **Error Responses:**
 ```json
 {
@@ -409,6 +432,13 @@ Submit a new build request with support for both tarball and individual file upl
 {
   "error": "File too large",
   "detail": "Tarball exceeds 500000000 bytes"
+}
+```
+
+```json
+{
+  "error": "Unsupported repository level",
+  "detail": "Repository level 'stage' is not available on this server (available: testing)"
 }
 ```
 
@@ -437,6 +467,7 @@ Get build status as JSON.
   "duration": 100.0,
   "exit_code": 0,
   "build_timeout": 7200,
+  "repo_level": "base",
   "arch": ["x86_64"],
   "packages": [
     {

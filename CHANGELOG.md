@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Custom repositories (`apb_extra_repos`) were inserted in front of `[options]` instead of the first repository section of the build's `pacman.conf`
 - Concurrent server builds were serialized by a shared SRCDEST lock (package name was not hashed into the lock filename) and by all builds using the same makechrootpkg chroot copy
 - A held SRCDEST lock could be unlinked after five minutes when `lsof` was not installed, breaking mutual exclusion
 - Buildroot auto-recreation could remove the chroot while other builds were still running
@@ -15,6 +16,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - `queue_status.buildroot_recreation_state` (`idle`, `draining`, or `recreating`) on apb-server status
+- `apb --testing` and `apb --stage` build against the ArchPOWER `[testing]`/`[testing-any]` repositories, or additionally `[stage]`/`[stage-any]` (`--stage` implies `--testing`)
+- `repo_level` form field (`base`, `testing` or `stage`) on farm `POST /build/submit` and server `POST /build`; the server enables the matching sections that are commented out in its host `pacman.conf`, in front of `[base]`, for that build only
+- `repo_levels` in apb-server `GET /` lists the levels the server can build against; the farm only dispatches testing/stage builds to such servers and rejects submissions with `"error": "Unsupported repository level"` when an architecture has none
+- `repo_level` in build status responses and a `repo_level` column in the farm `builds` table
+- `pacman.conf.example`: ArchPOWER host `pacman.conf` with the commented `[stage-any]`, `[stage]`, `[testing-any]` and `[testing]` sections apb-server needs for `--testing` and `--stage`
+- `tests/test_repo_levels.py` covering section detection and ordering, server and farm validation, dispatch filtering, forwarding and the CLI flags
 
 ### Changed
 

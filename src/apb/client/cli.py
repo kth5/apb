@@ -21,6 +21,7 @@ from apb.constants import (
 )
 from apb.models import BuildStatusResponse, BuildSubmitResponse, FarmBuildSubmitResponse
 from apb.upstream import upstream_url
+from apb.validation import RepoLevel
 
 from apb.client.api import APBotClient, BuildRejectedError
 from apb.client.auth import CLI_MFA_METHODS, CLI_SETUP_METHODS, APBAuthClient
@@ -263,6 +264,7 @@ def _print_build_rejected(exc: BuildRejectedError) -> None:
         ("target_architectures", "Requested architectures"),
         ("pkgbuild_architectures", "PKGBUILD architectures"),
         ("invalid_repositories", "Invalid repositories"),
+        ("unsupported_architectures", "Architectures without a server for this repository level"),
     ):
         if exc.detail.get(key):
             print(f"{label}: {', '.join(exc.detail[key])}")
@@ -275,6 +277,7 @@ def submit_build(
     exclude_paths: Optional[List[Path]] = None,
     architectures: Optional[List[str]] = None,
     build_timeout: Optional[int] = None,
+    repo_level: RepoLevel = RepoLevel.BASE,
 ) -> Optional[BuildSubmitResponse]:
     """
     Submit a tarball of the build directory to a server or farm.
@@ -286,6 +289,7 @@ def submit_build(
         exclude_paths: Paths left out of the tarball
         architectures: PKGBUILD architectures the farm should queue (farm only)
         build_timeout: Optional build timeout in seconds (admin only on the farm)
+        repo_level: Repository level to build against (--testing / --stage)
 
     Returns:
         Submit response (FarmBuildSubmitResponse for farms), or None after printing the error
@@ -297,6 +301,7 @@ def submit_build(
             exclude_paths=exclude_paths,
             architectures=architectures,
             build_timeout=build_timeout,
+            repo_level=repo_level,
         )
     except BuildRejectedError as exc:
         _print_build_rejected(exc)
@@ -631,6 +636,7 @@ def _submit_config_build(
     output_dir: Path,
     auth_client: Optional[APBAuthClient],
     build_timeout: Optional[int],
+    repo_level: RepoLevel,
     force: bool,
     verbose: bool,
 ) -> ArchSubmission:
@@ -649,7 +655,12 @@ def _submit_config_build(
         if verbose:
             print(f"{arch_prefix}Submitting build to {server_url}...")
         response = submit_build(
-            server_url, build_path, auth_client, exclude_paths=[output_dir], build_timeout=build_timeout
+            server_url,
+            build_path,
+            auth_client,
+            exclude_paths=[output_dir],
+            build_timeout=build_timeout,
+            repo_level=repo_level,
         )
         if response:
             print(f"{arch_prefix}Build submitted: {response.build_id}")
@@ -664,7 +675,8 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                               specific_arch: Optional[str] = None, force: bool = False,
                               auth_client: Optional[APBAuthClient] = None,
                               build_timeout: Optional[int] = None,
-                              download: bool = True) -> bool:
+                              download: bool = True,
+                              repo_level: RepoLevel = RepoLevel.BASE) -> bool:
     """
     Build a package for multiple architectures using the servers in the configuration.
 
@@ -679,6 +691,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
         auth_client: Optional authentication client
         build_timeout: Optional build timeout in seconds
         download: Download build results into output_dir/<arch>
+        repo_level: Repository level to build against (--testing / --stage)
 
     Returns:
         True if all builds were submitted (detach) or completed successfully
@@ -704,6 +717,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
             output_dir=output_dir,
             auth_client=auth_client,
             build_timeout=build_timeout,
+            repo_level=repo_level,
             force=force,
             verbose=verbose,
         )
@@ -748,6 +762,15 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
     return all(row[3] for row in rows)
 
 
+def resolve_repo_level(args: argparse.Namespace) -> RepoLevel:
+    """Repository level from --testing / --stage; --stage wins and implies testing."""
+    if getattr(args, "stage", False):
+        return RepoLevel.STAGE
+    if getattr(args, "testing", False):
+        return RepoLevel.TESTING
+    return RepoLevel.BASE
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Parse the apb command line."""
     parser = argparse.ArgumentParser(description="APB Client - Build packages using APB servers")
@@ -787,6 +810,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                        help="Force rebuild even if package exists")
     parser.add_argument("--build-timeout", type=int,
                        help=f"Build timeout in seconds ({BUILD_TIMEOUT_MIN}-{BUILD_TIMEOUT_MAX}, admin only)")
+    parser.add_argument("--testing", action="store_true",
+                       help="Also use the [testing] and [testing-any] repositories")
+    parser.add_argument("--stage", action="store_true",
+                       help="Also use the [stage] and [stage-any] repositories (implies --testing)")
 
     # Monitoring options
     parser.add_argument("--monitor", type=str, help="Monitor existing build")
@@ -1059,6 +1086,7 @@ def _submit_and_monitor(
         exclude_paths=[args.output_dir],
         architectures=architectures,
         build_timeout=args.build_timeout,
+        repo_level=resolve_repo_level(args),
     )
     if not response:
         print("Failed to submit build")
@@ -1143,6 +1171,7 @@ def run_config_build(ctx: CliContext, build_path: Path) -> int:
             auth_client=ctx.auth_client,
             build_timeout=args.build_timeout,
             download=not args.no_download,
+            repo_level=resolve_repo_level(args),
         )
     except KeyboardInterrupt:
         print("\nBuilds interrupted by user")

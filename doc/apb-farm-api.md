@@ -386,6 +386,7 @@ Submit a build request to the farm (Authentication Required).
   - `build_tarball` (file, required): Compressed tarball containing PKGBUILD and sources
   - `architectures` (string, optional): Comma-separated list of target architectures
   - `build_timeout` (integer, optional): Build timeout in seconds (300-14400, admin only)
+  - `repo_level` (string, optional): `base` (default), `testing` or `stage`; see [Repository Levels](#repository-levels)
 
 **Method 2: Individual File Upload (Legacy)**
 - **Content-Type:** `multipart/form-data`
@@ -394,6 +395,7 @@ Submit a build request to the farm (Authentication Required).
   - `sources` (file[], optional): Additional source files
   - `architectures` (string, optional): Comma-separated list of target architectures
   - `build_timeout` (integer, optional): Build timeout in seconds (300-14400, admin only)
+  - `repo_level` (string, optional): `base` (default), `testing` or `stage`
 
 **Enhanced Response:**
 ```json
@@ -411,6 +413,7 @@ Submit a build request to the farm (Authentication Required).
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0,
+      "repo_level": "base",
       "queue_state": "farm",
       "queue_position": 1,
       "jobs_ahead": 0,
@@ -423,6 +426,7 @@ Submit a build request to the farm (Authentication Required).
       "pkgname": "example-package",
       "submission_group": "25733701-5546-41bc-957d-d76bbaa09f15",
       "created_at": 1642694400.0,
+      "repo_level": "base",
       "queue_state": "farm",
       "queue_position": 2,
       "jobs_ahead": 1,
@@ -484,6 +488,18 @@ When no servers are available for the requested architectures:
 }
 ```
 
+**Unsupported Repository Level Error:**
+When `repo_level` is `testing` or `stage` and a target architecture has no server that lists that level in its `repo_levels`, nothing is queued:
+```json
+{
+  "error": "Unsupported repository level",
+  "message": "No server supports repository level 'stage' for: powerpc",
+  "pkgname": "example-package",
+  "repo_level": "stage",
+  "unsupported_architectures": ["powerpc"]
+}
+```
+
 #### GET /build/{build_id}/status
 Get build status. Returns HTML page by default, JSON if `format=json` is specified.
 
@@ -500,7 +516,7 @@ One build status page covers every state: not found (404), waiting in the farm q
 
 **Enhanced JSON Response:**
 
-The JSON response is the shared `BuildStatusResponse` model (`apb.models`). It has the build server's status fields plus optional farm extras: `server_url`, `server_arch`, `artifacts_ready`, `queue_state`, `queue_position`, `jobs_ahead`, `farm_queue_size`, `server_unavailable`, `last_status_update` and `error_message`. Fields without a value are omitted. Times are epoch seconds.
+The JSON response is the shared `BuildStatusResponse` model (`apb.models`). It has the build server's status fields plus optional farm extras: `server_url`, `server_arch`, `repo_level`, `artifacts_ready`, `queue_state`, `queue_position`, `jobs_ahead`, `farm_queue_size`, `server_unavailable`, `last_status_update` and `error_message`. Fields without a value are omitted. Times are epoch seconds.
 
 ```json
 {
@@ -708,6 +724,23 @@ Download a build artifact from the farm's local artifact cache.
 **Error Responses:**
 - **404 Not Found**: File not found in the farm cache
 - **403 Forbidden**: Insufficient permissions to access build
+
+---
+
+### Repository Levels
+
+Builds use the ArchPOWER `[base]` and `[base-any]` repositories by default. The `repo_level` submit parameter (`apb --testing` / `apb --stage`) adds newer repositories in front of them:
+
+| `repo_level` | Additional repositories, highest priority first |
+|---|---|
+| `base` | none |
+| `testing` | `[testing-any]`, `[testing]` |
+| `stage` | `[stage-any]`, `[stage]`, `[testing-any]`, `[testing]` |
+
+- Any authenticated user may request `testing` or `stage`
+- Each server lists the levels it supports in `repo_levels` of its `GET /` response; the farm reads it from its cached server info and sends testing/stage builds only to those servers
+- When a target architecture has no such server, the submission is rejected with `"error": "Unsupported repository level"` and nothing is queued
+- Custom repositories from `apb_extra_repos` still take priority over the level's repositories
 
 ---
 
@@ -1824,6 +1857,7 @@ CREATE TABLE builds (
     user_id INTEGER,                   -- User who submitted the build
     build_timeout INTEGER DEFAULT 7200, -- Custom build timeout in seconds
     first_missing_at REAL,             -- When build was first detected as missing from server
+    repo_level TEXT DEFAULT 'base',    -- Repository level: base, testing or stage
     FOREIGN KEY (user_id) REFERENCES users (id)
 );
 

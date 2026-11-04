@@ -12,6 +12,7 @@ import logging
 import os
 import platform
 import queue
+import re
 import resource
 import select
 import shutil
@@ -38,6 +39,7 @@ from apb.constants import (
 )
 from apb.pkgbuild import parse_pkgbuild_file, pkgbuild_info_to_dict
 from apb.upstream import build_download_path
+from apb.validation import REPO_LEVEL_ORDER, REPO_LEVEL_SECTIONS, RepoLevel, sections_for_level
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,11 @@ HOST_CONF_DIR = Path("/etc")
 
 # Kept on disk after a failed build so the farm and clients can still download it
 FAILED_BUILD_RETAINED_FILES = {"build.log"}
+
+ACTIVE_SECTION_RE = re.compile(r"^\[([^\]]+)\]$")
+COMMENTED_SECTION_RE = re.compile(r"^#\s*\[([^\]]+)\]$")
+COMMENTED_OPTION_RE = re.compile(r"^#\s*((?:Include|Server|SigLevel|Usage|CacheServer)\s*=.*)$")
+REPO_LEVEL_SECTION_NAMES = frozenset(section for sections in REPO_LEVEL_SECTIONS.values() for section in sections)
 
 # Global state
 build_queue = queue.Queue()
@@ -771,58 +778,126 @@ def stage_makepkg_conf_override(host_conf: Path, staging_dir: Path, srcdest: str
     return staged_conf
 
 
-def create_custom_pacman_conf(buildroot_path: Path, build_dir: Path, extra_repos: List[Dict], log_output_func) -> Optional[Path]:
-    """Create a modified pacman.conf with custom repositories in the build directory"""
-    try:
-        if not extra_repos:
-            return None
+def _commented_level_sections(lines: List[str]) -> Dict[str, Tuple[range, List[str]]]:
+    """Map commented-out repo-level sections to their line range and uncommented lines.
 
+    A section counts only when its header is followed directly by at least one
+    commented Include/Server/SigLevel/Usage/CacheServer line.
+    """
+    sections: Dict[str, Tuple[range, List[str]]] = {}
+    index = 0
+    while index < len(lines):
+        header = COMMENTED_SECTION_RE.match(lines[index].strip())
+        name = header.group(1) if header else None
+        if name not in REPO_LEVEL_SECTION_NAMES or name in sections:
+            index += 1
+            continue
+        end = index + 1
+        options = []
+        while end < len(lines) and (option := COMMENTED_OPTION_RE.match(lines[end].strip())):
+            options.append(option.group(1))
+            end += 1
+        if options:
+            sections[name] = (range(index, end), [f"[{name}]", *options])
+        index = end
+    return sections
+
+
+def find_repo_level_blocks(pacman_conf_text: str) -> Dict[str, List[str]]:
+    """Commented-out repo-level sections in a pacman.conf, as uncommented lines."""
+    return {name: block for name, (_, block) in _commented_level_sections(pacman_conf_text.splitlines()).items()}
+
+
+def available_repo_levels(pacman_conf_text: str) -> List[RepoLevel]:
+    """Levels above BASE whose sections, and those of every level below, can be enabled."""
+    blocks = find_repo_level_blocks(pacman_conf_text)
+    levels = []
+    for level in REPO_LEVEL_ORDER[1:]:
+        if not all(section in blocks for section in REPO_LEVEL_SECTIONS[level]):
+            break
+        levels.append(level)
+    return levels
+
+
+def compose_pacman_conf(pacman_conf_text: str, extra_repos: List[Dict], repo_level: RepoLevel) -> str:
+    """Return pacman.conf with custom repos and the level's sections in front of the first repository.
+
+    Raises ValueError when a section required by ``repo_level`` is not commented out in the input.
+    """
+    lines = pacman_conf_text.splitlines()
+    level_sections = _commented_level_sections(lines)
+    enabled_sections = sections_for_level(repo_level)
+    missing_sections = [section for section in enabled_sections if section not in level_sections]
+    if missing_sections:
+        raise ValueError(f"pacman.conf has no commented-out sections for: {', '.join(missing_sections)}")
+
+    removed_lines = {index for section in enabled_sections for index in level_sections[section][0]}
+    kept_lines = [line for index, line in enumerate(lines) if index not in removed_lines]
+
+    inserted_lines: List[str] = []
+    for repo in extra_repos:
+        inserted_lines += [
+            f"# Custom repository: {repo['name']}",
+            f"[{repo['name']}]",
+            "SigLevel = Required",
+            f"Server = {repo['url']}",
+            "",
+        ]
+    for section in enabled_sections:
+        inserted_lines += [*level_sections[section][1], ""]
+
+    first_repo_index = next(
+        (
+            index for index, line in enumerate(kept_lines)
+            if (section := ACTIVE_SECTION_RE.match(line.strip())) and section.group(1) != "options"
+        ),
+        None,
+    )
+    if first_repo_index is None:
+        new_lines = kept_lines + [""] + inserted_lines
+    else:
+        new_lines = kept_lines[:first_repo_index] + inserted_lines + kept_lines[first_repo_index:]
+    return "\n".join(new_lines).rstrip("\n") + "\n"
+
+
+def get_buildroot_pacman_conf_path() -> Path:
+    """pacman.conf builds start from: the buildroot copy, or the host file before the buildroot exists."""
+    buildroot_conf = Path(server_config.get("buildroot", DEFAULT_BUILDROOT)) / "root" / "etc" / "pacman.conf"
+    return buildroot_conf if buildroot_conf.exists() else HOST_CONF_DIR / "pacman.conf"
+
+
+def get_repo_levels() -> List[RepoLevel]:
+    """Repository levels above BASE this server can build against."""
+    try:
+        return available_repo_levels(get_buildroot_pacman_conf_path().read_text())
+    except OSError as e:
+        logger.warning(f"Cannot read pacman.conf for repository levels: {e}")
+        return []
+
+
+def create_custom_pacman_conf(
+    buildroot_path: Path,
+    build_dir: Path,
+    extra_repos: List[Dict],
+    repo_level: RepoLevel,
+    log_output_func,
+) -> Optional[Path]:
+    """Write build_dir/pacman.conf with custom repositories and the repo level's sections enabled."""
+    try:
         chroot_pacman_conf = buildroot_path / "root" / "etc" / "pacman.conf"
 
         if not chroot_pacman_conf.exists():
             log_output_func("Warning: pacman.conf not found in buildroot")
             return None
 
-        # Read current pacman.conf
-        with open(chroot_pacman_conf, 'r') as f:
-            lines = f.readlines()
-
-        # Find the [core] section and insert custom repos before it
-        new_lines = []
-        inserted_repos = False
-
-        for line in lines:
-            # Insert custom repos before the first [section] (usually [core])
-            if line.strip().startswith('[') and not inserted_repos:
-                # Add custom repositories as highest priority
-                for repo in extra_repos:
-                    repo_name = repo['name']
-                    repo_url = repo['url']
-                    new_lines.append(f"\n# Custom repository: {repo_name}\n")
-                    new_lines.append(f"[{repo_name}]\n")
-                    new_lines.append(f"SigLevel = Required\n")
-                    new_lines.append(f"Server = {repo_url}\n")
-
-                inserted_repos = True
-
-            new_lines.append(line)
-
-        # If no sections found, append at the end
-        if not inserted_repos:
-            new_lines.append("\n# Custom repositories\n")
-            for repo in extra_repos:
-                repo_name = repo['name']
-                repo_url = repo['url']
-                new_lines.append(f"[{repo_name}]\n")
-                new_lines.append(f"SigLevel = Required\n")
-                new_lines.append(f"Server = {repo_url}\n")
-
-        # Write modified pacman.conf to build directory
+        composed = compose_pacman_conf(chroot_pacman_conf.read_text(), extra_repos, repo_level)
         custom_pacman_conf = build_dir / "pacman.conf"
-        with open(custom_pacman_conf, 'w') as f:
-            f.writelines(new_lines)
+        custom_pacman_conf.write_text(composed)
 
-        log_output_func(f"Created custom pacman.conf with {len(extra_repos)} custom repositories")
+        log_output_func(
+            f"Created custom pacman.conf with {len(extra_repos)} custom repositories "
+            f"and repository level '{repo_level.value}'"
+        )
         return custom_pacman_conf
 
     except Exception as e:
@@ -1135,7 +1210,14 @@ def finalize_failed_build(build_id: str, build_dir: Path, reason: str, exit_code
         close_build_log(build_id)
 
 
-def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any], build_timeout: int = BUILD_TIMEOUT, extra_repos: List[Dict] = None):
+def build_package(
+    build_id: str,
+    build_dir: Path,
+    pkgbuild_info: Dict[str, Any],
+    build_timeout: int = BUILD_TIMEOUT,
+    extra_repos: List[Dict] = None,
+    repo_level: RepoLevel = RepoLevel.BASE,
+):
     """Build package using makechrootpkg"""
     logger.info(f"build_package called for build {build_id}")
     should_cleanup_failed_dir = False
@@ -1212,13 +1294,21 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     should_cleanup_failed_dir = True
                     return
 
-                # Create custom pacman.conf with custom repositories
-                custom_pacman_conf = create_custom_pacman_conf(buildroot_path, build_dir, extra_repos, log_output)
+            if repo_level != RepoLevel.BASE:
+                log_output(
+                    f"Enabling repository level '{repo_level.value}': "
+                    f"{', '.join(sections_for_level(repo_level))}"
+                )
+
+            if extra_repos or repo_level != RepoLevel.BASE:
+                custom_pacman_conf = create_custom_pacman_conf(
+                    buildroot_path, build_dir, extra_repos or [], repo_level, log_output
+                )
                 if custom_pacman_conf is None:
-                    log_output("ERROR: Failed to create custom pacman.conf for custom repositories")
+                    log_output("ERROR: Failed to create custom pacman.conf")
                     if srcdest_lock:
                         unlock_srcdest(srcdest_lock)
-                    finalize_failed_build(build_id, build_dir, "Failed to create custom pacman.conf for custom repositories")
+                    finalize_failed_build(build_id, build_dir, "Failed to create custom pacman.conf")
                     should_cleanup_failed_dir = True
                     return
 
@@ -1480,7 +1570,8 @@ def process_build_queue():
                     build_data["build_dir"],
                     build_data["pkgbuild_info"],
                     build_data.get("build_timeout", BUILD_TIMEOUT),
-                    build_data.get("extra_repos", [])
+                    build_data.get("extra_repos", []),
+                    build_data.get("repo_level", RepoLevel.BASE),
                 )
                 future.add_done_callback(_decrement_in_flight_builds)
             except Exception:

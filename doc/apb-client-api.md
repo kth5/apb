@@ -158,6 +158,8 @@ client.download_file(response.build_id, "package.pkg.tar.xz", Path("./downloads/
 - `--detach`: Submit build and exit (don't wait for completion)
 - `--no-download`: Don't download build results
 - `--force`: Force rebuild even if package exists
+- `--testing`: Build against the ArchPOWER `[testing]` and `[testing-any]` repositories in addition to `[base]`/`[base-any]` (sends `repo_level=testing`)
+- `--stage`: Build against `[stage]`/`[stage-any]` as well; implies `--testing` (sends `repo_level=stage`). Farm submissions are rejected when an architecture has no server supporting the level
 
 ### PKGBUILD variables (client / farm)
 
@@ -416,7 +418,8 @@ Submit a build to a server or farm. The build directory is packed into one tarba
 def build_package(self, build_path: Path,
                   exclude_paths: Optional[Iterable[Path]] = None,
                   architectures: Optional[List[str]] = None,
-                  build_timeout: Optional[int] = None) -> BuildSubmitResponse
+                  build_timeout: Optional[int] = None,
+                  repo_level: RepoLevel = RepoLevel.BASE) -> BuildSubmitResponse
 ```
 
 **Parameters:**
@@ -424,6 +427,7 @@ def build_package(self, build_path: Path,
 - `exclude_paths` (Iterable[Path], optional): Paths left out of the tarball, such as the output directory
 - `architectures` (List[str], optional): PKGBUILD `arch=()` entries the farm should queue (sent as the `architectures` form field)
 - `build_timeout` (int, optional): Build timeout in seconds (`BUILD_TIMEOUT_MIN` to `BUILD_TIMEOUT_MAX`; admin only on the farm)
+- `repo_level` (`apb.validation.RepoLevel`): `BASE`, `TESTING` or `STAGE`; sent as the `repo_level` form field unless it is `BASE`
 
 **Returns:**
 - `FarmBuildSubmitResponse` when the farm queued per-architecture builds (`builds`, `queue_status`, ...)
@@ -732,7 +736,8 @@ def submit_build(server_url: str, build_path: Path,
                  auth_client: Optional[APBAuthClient] = None,
                  exclude_paths: Optional[List[Path]] = None,
                  architectures: Optional[List[str]] = None,
-                 build_timeout: Optional[int] = None) -> Optional[BuildSubmitResponse]
+                 build_timeout: Optional[int] = None,
+                 repo_level: RepoLevel = RepoLevel.BASE) -> Optional[BuildSubmitResponse]
 ```
 
 **Parameters:**
@@ -742,6 +747,7 @@ def submit_build(server_url: str, build_path: Path,
 - `exclude_paths` (List[Path], optional): Paths left out of the tarball
 - `architectures` (List[str], optional): PKGBUILD architectures the farm should queue
 - `build_timeout` (int, optional): Build timeout in seconds (admin only on the farm)
+- `repo_level` (RepoLevel): Repository level (`apb --testing` / `--stage`)
 
 **Returns:**
 - `FarmBuildSubmitResponse` or `BuildSubmitResponse` (see `build_package()`), or `None` when the submission failed. Authentication (401), permission (403) and farm rejection details are printed
@@ -813,7 +819,8 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
                               specific_arch: Optional[str] = None, force: bool = False,
                               auth_client: Optional[APBAuthClient] = None,
                               build_timeout: Optional[int] = None,
-                              download: bool = True) -> bool
+                              download: bool = True,
+                              repo_level: RepoLevel = RepoLevel.BASE) -> bool
 ```
 
 **Parameters:**
@@ -827,6 +834,7 @@ def build_for_multiple_arches(build_path: Path, output_dir: Path, config: Dict,
 - `auth_client` (APBAuthClient, optional): Authentication client
 - `build_timeout` (int, optional): Build timeout in seconds
 - `download` (bool): Download build results after completion
+- `repo_level` (RepoLevel): Repository level (`apb --testing` / `--stage`)
 
 **Returns:**
 - `bool`: True if every architecture was built (or, with `detach`, submitted) successfully or skipped because its package already exists. Architectures without configured servers count as failed.

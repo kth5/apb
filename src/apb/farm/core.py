@@ -63,6 +63,7 @@ from apb.upstream import (
     download_async,
     upstream_url,
 )
+from apb.validation import RepoLevel
 
 logger = logging.getLogger(__name__)
 
@@ -1299,6 +1300,7 @@ BUILD_COLUMN_MIGRATIONS = (
     ("pkgrel", "TEXT"),
     ("first_missing_at", "REAL"),
     ("user_id", "INTEGER"),
+    ("repo_level", f"TEXT DEFAULT '{RepoLevel.BASE.value}'"),
 )
 
 
@@ -2189,10 +2191,50 @@ async def get_available_architectures() -> Dict[str, List[str]]:
     return available_archs
 
 
-async def get_best_server_for_arch(target_archs: List[str]) -> Optional[str]:
+def server_supports_repo_level(server_url: str, repo_level: RepoLevel) -> bool:
+    """Whether the server's last GET / response lists ``repo_level`` in repo_levels."""
+    if repo_level == RepoLevel.BASE:
+        return True
+    status = server_status_tracker.get(server_url)
+    last_response = status.last_response if status else None
+    return bool(last_response) and repo_level.value in last_response.get("repo_levels", [])
+
+
+def filter_archs_by_repo_level(available_archs: Dict[str, List[str]], repo_level: RepoLevel) -> Dict[str, List[str]]:
+    """Drop servers (and architectures left without servers) that cannot build ``repo_level``."""
+    if repo_level == RepoLevel.BASE:
+        return available_archs
+    filtered = {
+        arch: [server_url for server_url in server_urls if server_supports_repo_level(server_url, repo_level)]
+        for arch, server_urls in available_archs.items()
+    }
+    return {arch: server_urls for arch, server_urls in filtered.items() if server_urls}
+
+
+async def find_repo_level_unsupported_archs(
+    target_archs: List[str], repo_level: RepoLevel, any_arch_hint: Optional[str] = None
+) -> List[str]:
+    """Target architectures with servers but none of them supporting ``repo_level``."""
+    if repo_level == RepoLevel.BASE:
+        return []
+    available_archs = await get_available_architectures()
+    capable_archs = filter_archs_by_repo_level(available_archs, repo_level)
+    unsupported = []
+    for arch in target_archs:
+        if arch == "any":
+            has_servers = bool(available_archs.get(any_arch_hint)) if any_arch_hint else any(available_archs.values())
+            has_capable = bool(capable_archs.get(any_arch_hint)) if any_arch_hint else bool(capable_archs)
+            if has_servers and not has_capable:
+                unsupported.append(arch)
+        elif available_archs.get(arch) and arch not in capable_archs:
+            unsupported.append(arch)
+    return unsupported
+
+
+async def get_best_server_for_arch(target_archs: List[str], repo_level: RepoLevel = RepoLevel.BASE) -> Optional[str]:
     """Find the best available server for the given architectures"""
     # Get actual available architectures from servers
-    available_archs = await get_available_architectures()
+    available_archs = filter_archs_by_repo_level(await get_available_architectures(), repo_level)
 
     suitable_servers = []
 
@@ -2348,7 +2390,7 @@ async def _select_server_arch_for_any_package(
     return selected, load
 
 
-async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = BUILD_TIMEOUT_DEFAULT, original_tarball: Optional[bytes] = None, extra_repos: List[Dict] = None) -> List[Dict]:
+async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, target_archs: List[str], source_files: List[Dict] = None, user_id: Optional[int] = None, build_timeout: int = BUILD_TIMEOUT_DEFAULT, original_tarball: Optional[bytes] = None, extra_repos: List[Dict] = None, repo_level: RepoLevel = RepoLevel.BASE) -> List[Dict]:
     """
     Queue builds for each architecture that has available servers.
 
@@ -2370,8 +2412,8 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
     pkgrel = version_info.get('pkgrel')
 
     # Get actual available architectures from servers
-    available_archs = await get_available_architectures()
-    logger.info(f"Available server architectures: {list(available_archs.keys())}")
+    available_archs = filter_archs_by_repo_level(await get_available_architectures(), repo_level)
+    logger.info(f"Available server architectures for repository level '{repo_level.value}': {list(available_archs.keys())}")
 
     pkgbuild_info = parse_pkgbuild(pkgbuild_content)
     any_arch_hint: Optional[str] = None
@@ -2465,7 +2507,8 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             "arch": arch,
             "build_timeout": build_timeout,
             "original_tarball": original_tarball,
-            "extra_repos": extra_repos or []
+            "extra_repos": extra_repos or [],
+            "repo_level": repo_level,
         }
 
         build_queue.append(build_info)
@@ -2474,11 +2517,12 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
         cursor = build_database.cursor()
         cursor.execute('''
             INSERT OR REPLACE INTO builds
-            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id, build_timeout, epoch, pkgver, pkgrel)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, server_url, server_arch, pkgname, status, start_time, end_time, created_at, queue_position, submission_group, user_id, build_timeout, epoch, pkgver, pkgrel, repo_level)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             build_id, None, arch, pkgname, BuildStatus.QUEUED,
-            None, None, time.time(), len(build_queue), submission_group, user_id, build_timeout, epoch, pkgver, pkgrel
+            None, None, time.time(), len(build_queue), submission_group, user_id, build_timeout, epoch, pkgver, pkgrel,
+            repo_level.value,
         ))
         build_database.commit()
 
@@ -2490,6 +2534,7 @@ async def queue_builds_for_architectures(pkgbuild_content: str, pkgname: str, ta
             "pkgname": pkgname,
             "submission_group": submission_group,
             "created_at": time.time(),
+            "repo_level": repo_level.value,
             "queue_state": "farm",
             "queue_position": queue_position,
             "jobs_ahead": queue_position - 1,
@@ -2604,21 +2649,23 @@ async def process_build_queue():
                 build_info = build_queue[index]
                 build_id = build_info["build_id"]
                 target_arch = build_info["target_architectures"][0]
+                repo_level = build_info.get("repo_level", RepoLevel.BASE)
 
                 if await is_build_cancelled(build_id):
                     build_queue.pop(index)
                     continue
 
-                available_archs = await get_available_architectures()
+                available_archs = filter_archs_by_repo_level(await get_available_architectures(), repo_level)
                 if target_arch not in available_archs or not available_archs[target_arch]:
                     await _mark_build_failed(
                         build_id,
-                        f"No available servers for architecture {target_arch}, build {build_id}",
+                        f"No available servers for architecture {target_arch} with repository level "
+                        f"'{repo_level.value}', build {build_id}",
                     )
                     build_queue.pop(index)
                     continue
 
-                server_url = await get_best_server_for_arch([target_arch])
+                server_url = await get_best_server_for_arch([target_arch], repo_level)
                 if not server_url:
                     index += 1
                     continue
@@ -2673,6 +2720,9 @@ async def forward_build_to_server(build_info: Dict, server_url: str):
             form_data["build_timeout"] = str(build_info["build_timeout"])
         if "extra_repos" in build_info and build_info["extra_repos"]:
             form_data["extra_repos"] = json.dumps(build_info["extra_repos"])
+        repo_level = build_info.get("repo_level", RepoLevel.BASE)
+        if repo_level != RepoLevel.BASE:
+            form_data["repo_level"] = repo_level.value
 
         timeout = httpx.Timeout(120.0, connect=15.0)
         logger.info(f"Forwarding build {build_id} to {server_url}")

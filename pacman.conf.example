@@ -1,0 +1,44 @@
+#
+# /etc/pacman.conf example for an ArchPOWER apb-server host
+#
+# apb-server copies this file into its buildroot. Builds use [base] and
+# [base-any] by default. The [stage*] and [testing*] sections below stay
+# commented out; apb-server enables them only for builds submitted with
+# `apb --testing` or `apb --stage`, placing them in front of [base]:
+#
+#   --testing  enables [testing-any] and [testing]
+#   --stage    enables [stage-any], [stage], [testing-any] and [testing]
+#
+# Keep each section header directly followed by its commented Include,
+# Server or SigLevel lines; a header without them is ignored. A server only
+# advertises a level in `repo_levels` (GET /) when all sections for it and
+# the levels below it are present.
+#
+
+[options]
+HoldPkg     = pacman glibc
+Architecture = auto
+CheckSpace
+ParallelDownloads = 5
+SigLevel    = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+# Repositories are searched in the order listed here; the first match wins.
+
+#[stage-any]
+#Server = https://repo-mirrors.archlinuxpower.org/stage/any
+
+#[stage]
+#Server = https://repo-mirrors.archlinuxpower.org/stage/$arch
+
+#[testing-any]
+#Server = https://repo-mirrors.archlinuxpower.org/testing/any
+
+#[testing]
+#Server = https://repo-mirrors.archlinuxpower.org/testing/$arch
+
+[base-any]
+Server = https://repo-mirrors.archlinuxpower.org/base/any
+
+[base]
+Server = https://repo-mirrors.archlinuxpower.org/base/$arch

@@ -169,6 +169,7 @@ class BuildStatusResponse(BaseModel):
     exit_code: Optional[int] = None
     arch: Optional[List[str]] = None
     build_timeout: Optional[int] = None
+    repo_level: Optional[str] = None
     packages: List[BuildArtifact] = Field(default_factory=list)
     logs: List[BuildArtifact] = Field(default_factory=list)
     server_arch: Optional[str] = None
@@ -196,6 +197,7 @@ class QueuedBuildInfo(BaseModel):
     pkgname: str
     submission_group: str
     created_at: float
+    repo_level: Optional[str] = None
     queue_state: Optional[str] = None
     queue_position: Optional[int] = None
     jobs_ahead: Optional[int] = None

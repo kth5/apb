@@ -19,7 +19,7 @@ from apb.models import (
     FarmBuildSubmitResponse,
 )
 from apb.tarball import create_build_tarball
-from apb.validation import validate_build_timeout
+from apb.validation import RepoLevel, validate_build_timeout
 from apb.upstream import (
     ADMIN_CLEANUP_PATH,
     BUILD_SUBMIT_PATH,
@@ -69,6 +69,7 @@ class APBotClient:
         exclude_paths: Optional[Iterable[Path]] = None,
         architectures: Optional[List[str]] = None,
         build_timeout: Optional[int] = None,
+        repo_level: RepoLevel = RepoLevel.BASE,
     ) -> BuildSubmitResponse:
         """
         Submit a tarball of the build directory to a server or farm.
@@ -78,6 +79,7 @@ class APBotClient:
             exclude_paths: Paths left out of the tarball (e.g. the output directory)
             architectures: PKGBUILD architectures the farm should queue (farm only)
             build_timeout: Build timeout in seconds (admin only on the farm)
+            repo_level: Repository level to build against (testing/stage)
 
         Returns:
             FarmBuildSubmitResponse when the farm queued per-architecture builds,
@@ -96,6 +98,8 @@ class APBotClient:
             form_data['architectures'] = ','.join(architectures)
         if build_timeout is not None:
             form_data['build_timeout'] = str(validate_build_timeout(build_timeout))
+        if repo_level != RepoLevel.BASE:
+            form_data['repo_level'] = repo_level.value
 
         url = upstream_url(self.server_url, BUILD_SUBMIT_PATH)
         with tempfile.TemporaryDirectory() as temp_dir:

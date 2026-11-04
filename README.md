@@ -433,6 +433,26 @@ apb --farm --cancel 48ea1df5-f7f3-477e-a7a7-36e526ea7cd3
 | `--no-download` | `false` | Don't download build results |
 | `--force` | `false` | Force rebuild even if package exists |
 | `--build-timeout SECS` | *server default* | Build timeout in seconds, 300–14400 (admin only) |
+| `--testing` | `false` | Also use the `[testing]` and `[testing-any]` repositories |
+| `--stage` | `false` | Also use `[stage]` and `[stage-any]`; implies `--testing` |
+
+`--testing` and `--stage` only work on servers whose host `/etc/pacman.conf` contains the matching sections commented out (see [`pacman.conf.example`](pacman.conf.example) for a complete file), for example:
+
+```ini
+#[stage-any]
+#Include = /etc/pacman.d/mirrorlist
+
+#[stage]
+#Include = /etc/pacman.d/mirrorlist
+
+#[testing-any]
+#Include = /etc/pacman.d/mirrorlist
+
+#[testing]
+#Include = /etc/pacman.d/mirrorlist
+```
+
+The server enables them in front of `[base]` for that build only and lists the levels it supports in `repo_levels` of `GET /`. The farm rejects the submission when an architecture has no such server.
 
 #### Monitoring Options
 

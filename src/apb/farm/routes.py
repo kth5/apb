@@ -49,7 +49,7 @@ from apb.upstream import (
     build_stream_path,
     upstream_url,
 )
-from apb.validation import validate_build_timeout
+from apb.validation import validate_build_timeout, validate_repo_level
 from apb.web import render_page
 
 logger = logging.getLogger(__name__)
@@ -1454,6 +1454,7 @@ async def submit_build(
     sources: List[UploadFile] = File(default=[]),
     architectures: str = Form(None),
     build_timeout: Optional[int] = Form(None),
+    repo_level: Optional[str] = Form(None),
     current_user: core.User = Depends(core.require_auth)  # Require authentication
 ):
     """Submit a build request (authenticated users only, supports both tarball and individual file uploads)"""
@@ -1465,6 +1466,7 @@ async def submit_build(
             )
         try:
             timeout_seconds = validate_build_timeout(build_timeout)
+            requested_level = validate_repo_level(repo_level)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1543,8 +1545,24 @@ async def submit_build(
                 "requested_architectures": architectures.split(',') if architectures else []
             }
 
+        pkgbuild_info = core.parse_pkgbuild(pkgbuild_content)
+        any_arch_hint = pkgbuild_info.apb_arch_hint if core.pkgbuild_arch_is_any_only(pkgbuild_info.arch) else None
+        unsupported_archs = await core.find_repo_level_unsupported_archs(target_archs, requested_level, any_arch_hint)
+        if unsupported_archs:
+            return {
+                "error": "Unsupported repository level",
+                "message": (
+                    f"No server supports repository level '{requested_level.value}' for: "
+                    f"{', '.join(unsupported_archs)}"
+                ),
+                "pkgname": pkgname,
+                "repo_level": requested_level.value,
+                "unsupported_architectures": unsupported_archs,
+            }
+
         queued_builds = await core.queue_builds_for_architectures(
-            pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds, original_tarball, valid_repos
+            pkgbuild_content, pkgname, target_archs, source_files, current_user.id, timeout_seconds, original_tarball, valid_repos,
+            requested_level,
         )
 
         if not queued_builds:
@@ -1628,7 +1646,7 @@ async def _load_build_status(build_id: str) -> Dict[str, Any]:
     cursor.execute('''
         SELECT b.server_url, b.server_arch, b.pkgname, b.status, b.last_known_status,
                b.server_available, b.cached_response, b.last_status_update, b.created_at, u.username,
-               b.epoch, b.pkgver, b.pkgrel
+               b.epoch, b.pkgver, b.pkgrel, b.repo_level
         FROM builds b
         LEFT JOIN users u ON b.user_id = u.id
         WHERE b.id = ?
@@ -1648,7 +1666,7 @@ async def _load_build_status(build_id: str) -> Dict[str, Any]:
         }
 
     (server_url, server_arch, pkgname, status, last_known_status, server_available, cached_response,
-     last_status_update, created_at, username, epoch, pkgver, pkgrel) = row
+     last_status_update, created_at, username, epoch, pkgver, pkgrel, repo_level) = row
     record = {
         "server_arch": server_arch,
         "pkgname": pkgname,
@@ -1659,6 +1677,7 @@ async def _load_build_status(build_id: str) -> Dict[str, Any]:
         "username": username or "#anon#",
         "display_name": core.format_package_name_with_version(pkgname, epoch, pkgver, pkgrel),
         "server": core.obfuscate_server_url(server_url) if server_url else None,
+        "repo_level": repo_level,
     }
 
     # Builds waiting in the farm queue have no server assignment yet
@@ -1672,6 +1691,7 @@ async def _load_build_status(build_id: str) -> Dict[str, Any]:
                 "status": status,
                 "server_arch": server_arch,
                 "created_at": created_at,
+                "repo_level": repo_level,
                 "packages": [],
                 "logs": [],
                 "artifacts_ready": False,
