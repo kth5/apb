@@ -28,8 +28,10 @@ async def lifespan(app: FastAPI):
         engine.build_executor.shutdown(wait=False)
         from concurrent.futures import ThreadPoolExecutor
 
-        engine.build_executor = ThreadPoolExecutor(max_workers=engine.server_config["max_concurrent"])
-        logger.info("Build executor updated with %s max workers", engine.server_config["max_concurrent"])
+        max_concurrent = engine.server_config["max_concurrent"]
+        engine.build_executor = ThreadPoolExecutor(max_workers=max_concurrent)
+        engine.init_chroot_slots(max_concurrent)
+        logger.info("Build executor updated with %s max workers", max_concurrent)
 
     resource_monitor_thread = threading.Thread(target=engine.monitor_resources, daemon=True)
     resource_monitor_thread.start()

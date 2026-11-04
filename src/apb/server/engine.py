@@ -56,6 +56,7 @@ FAILED_BUILD_RETAINED_FILES = {"build.log"}
 
 # Global state
 build_queue = queue.Queue()
+chroot_slots: queue.Queue = queue.Queue()
 active_builds: Dict[str, Dict] = {}
 build_history: Dict[str, Dict] = {}
 build_executor = ThreadPoolExecutor(max_workers=DEFAULT_MAX_CONCURRENT)
@@ -67,6 +68,17 @@ shutdown_event = threading.Event()
 build_counter = 0  # Counter for buildroot recreation
 running_processes: Dict[str, subprocess.Popen] = {}  # Track running build processes
 buildroot_recreation_builds: Dict[str, bool] = {}  # Track builds doing buildroot recreation
+
+
+def init_chroot_slots(count: int) -> None:
+    """Reset the pool of makechrootpkg copy names (one per concurrent build slot)."""
+    global chroot_slots
+    chroot_slots = queue.Queue()
+    for index in range(count):
+        chroot_slots.put(f"apb-slot-{index}")
+
+
+init_chroot_slots(DEFAULT_MAX_CONCURRENT)
 
 OUTPUT_READ_CHUNK = 65536
 LOG_FLUSH_INTERVAL_SECONDS = 0.5
@@ -813,147 +825,129 @@ def download_repo_gpg_keys(extra_repos: List[Dict], log_output_func) -> bool:
         return False
 
 
-def lock_srcdest(srcdest_path: str, pkgname: str) -> Optional[int]:
-    """Lock SRCDEST directory with package-specific lock file"""
-    try:
-        pkgname_hash = hashlib.md5(b'{pkgname}').hexdigest()
-        lock_file = os.path.join(srcdest_path, f'.apb-{pkgname_hash}.lock')
+def srcdest_lock_path(srcdest_path: str, pkgname: str) -> str:
+    """Path to the package-specific SRCDEST lock file."""
+    pkgname_hash = hashlib.md5(pkgname.encode()).hexdigest()
+    return os.path.join(srcdest_path, f".apb-{pkgname_hash}.lock")
 
-        # Try to acquire lock
-        fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+
+def lock_srcdest(srcdest_path: str, pkgname: str) -> Optional[int]:
+    """Lock SRCDEST for one package (exclusive per pkgname, shared across different packages)."""
+    lock_file = srcdest_lock_path(srcdest_path, pkgname)
+    try:
+        fd = os.open(lock_file, os.O_CREAT | os.O_RDWR)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except (OSError, IOError) as e:
-            # Lock failed - check if it's an orphaned lock
+        except (OSError, IOError):
             os.close(fd)
+            return None
 
-            # Check if any process is actually holding the lock file
-            try:
-                import subprocess
-                result = subprocess.run(['lsof', lock_file],
-                                      capture_output=True, text=True, timeout=5)
-                if result.returncode != 0:
-                    # No process is holding the lock - it's orphaned
-                    logger.warning(f"Detected orphaned SRCDEST lock file {lock_file}, removing it")
-                    try:
-                        os.unlink(lock_file)
-                        # Try to acquire lock again after cleanup
-                        fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        logger.info(f"Successfully acquired SRCDEST lock after cleanup")
-                        return fd
-                    except Exception as cleanup_error:
-                        logger.error(f"Failed to clean up orphaned lock: {cleanup_error}")
-                        if 'fd' in locals():
-                            try:
-                                os.close(fd)
-                            except:
-                                pass
-                        return None
-                else:
-                    # A process is actually holding the lock
-                    logger.debug(f"SRCDEST lock is held by another process")
-                    return None
-            except FileNotFoundError:
-                # lsof not available - use file age as fallback
-                try:
-                    stat_info = os.stat(lock_file)
-                    age_seconds = time.time() - stat_info.st_mtime
-                    # If lock file is older than 5 minutes, consider it orphaned
-                    if age_seconds > 300:
-                        logger.warning(f"SRCDEST lock file is {age_seconds:.0f}s old, considering it orphaned")
-                        try:
-                            os.unlink(lock_file)
-                            # Try to acquire lock again after cleanup
-                            fd = os.open(lock_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
-                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            logger.info(f"Successfully acquired SRCDEST lock after age-based cleanup")
-                            return fd
-                        except Exception as cleanup_error:
-                            logger.error(f"Failed to clean up old lock: {cleanup_error}")
-                            return None
-                    else:
-                        logger.debug(f"SRCDEST lock file is recent ({age_seconds:.0f}s old), assuming it's valid")
-                        return None
-                except Exception as stat_error:
-                    logger.debug(f"Could not check lock file age: {stat_error}")
-                    return None
-            except Exception as lsof_error:
-                logger.debug(f"Could not check lock file status: {lsof_error}")
+        try:
+            if os.fstat(fd).st_ino != os.stat(lock_file).st_ino:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
                 return None
+        except OSError:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            return None
 
-    except (OSError, IOError) as e:
-        logger.error(f"Error accessing SRCDEST lock file: {e}")
+        return fd
+    except (OSError, IOError) as exc:
+        logger.error("Error accessing SRCDEST lock file %s: %s", lock_file, exc)
         return None
 
 
 def cleanup_orphaned_srcdest_locks():
-    """Clean up orphaned SRCDEST lock files during server startup"""
+    """Remove SRCDEST lock files that are not held by any process."""
     try:
         makepkg_config = get_makepkg_config()
-        if 'SRCDEST' not in makepkg_config:
+        if "SRCDEST" not in makepkg_config:
             return
 
-        srcdest_path = makepkg_config['SRCDEST']
-
-        # Find all APB lock files with the pattern .apb-*.lock
-        import glob
-        lock_pattern = os.path.join(srcdest_path, '.apb-*.lock')
+        srcdest_path = makepkg_config["SRCDEST"]
+        lock_pattern = os.path.join(srcdest_path, ".apb-*.lock")
         lock_files = glob.glob(lock_pattern)
 
         if not lock_files:
             return
 
-        logger.info(f"Found {len(lock_files)} existing SRCDEST lock files: {[os.path.basename(f) for f in lock_files]}")
+        logger.info(
+            "Found %s existing SRCDEST lock files: %s",
+            len(lock_files),
+            [os.path.basename(path) for path in lock_files],
+        )
 
         cleaned_count = 0
         for lock_file in lock_files:
             try:
-                # Check if any process is holding the lock
+                fd = os.open(lock_file, os.O_RDWR)
                 try:
-                    import subprocess
-                    result = subprocess.run(['lsof', lock_file],
-                                          capture_output=True, text=True, timeout=5)
-                    if result.returncode != 0:
-                        # No process is holding the lock - it's orphaned
-                        logger.warning(f"Removing orphaned SRCDEST lock file {os.path.basename(lock_file)} from previous session")
-                        os.unlink(lock_file)
-                        cleaned_count += 1
-                        logger.info(f"Orphaned SRCDEST lock {os.path.basename(lock_file)} cleaned up successfully")
-                    else:
-                        logger.warning(f"SRCDEST lock {os.path.basename(lock_file)} is held by another process - not removing")
-                        # Log which process is holding it
-                        for line in result.stdout.split('\n'):
-                            if line.strip():
-                                logger.info(f"Lock held by: {line.strip()}")
-                except FileNotFoundError:
-                    # lsof not available - use file age as fallback
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.unlink(lock_file)
+                    cleaned_count += 1
+                    logger.info("Removed unheld SRCDEST lock %s", os.path.basename(lock_file))
+                except (OSError, IOError):
+                    logger.debug(
+                        "SRCDEST lock %s is held by a running build, leaving in place",
+                        os.path.basename(lock_file),
+                    )
+                finally:
                     try:
-                        stat_info = os.stat(lock_file)
-                        age_seconds = time.time() - stat_info.st_mtime
-                        # If lock file is older than 5 minutes, consider it orphaned
-                        if age_seconds > 300:
-                            logger.warning(f"SRCDEST lock file {os.path.basename(lock_file)} is {age_seconds:.0f}s old, removing orphaned lock from previous session")
-                            os.unlink(lock_file)
-                            cleaned_count += 1
-                            logger.info(f"Old SRCDEST lock {os.path.basename(lock_file)} cleaned up successfully")
-                        else:
-                            logger.info(f"SRCDEST lock file {os.path.basename(lock_file)} is recent ({age_seconds:.0f}s old), leaving in place")
-                    except Exception as stat_error:
-                        logger.warning(f"Could not check lock file {os.path.basename(lock_file)} age: {stat_error}")
-                        logger.info(f"Leaving lock file {os.path.basename(lock_file)} in place to be safe")
-                except Exception as e:
-                    logger.warning(f"Could not check SRCDEST lock {os.path.basename(lock_file)} status during startup: {e}")
-                    logger.info(f"Leaving lock file {os.path.basename(lock_file)} in place to be safe")
-            except Exception as lock_error:
-                logger.error(f"Error processing lock file {lock_file}: {lock_error}")
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    os.close(fd)
+            except OSError as lock_error:
+                logger.error("Error processing lock file %s: %s", lock_file, lock_error)
 
         if cleaned_count > 0:
-            logger.info(f"SRCDEST lock cleanup completed: removed {cleaned_count} orphaned lock files")
+            logger.info("SRCDEST lock cleanup completed: removed %s unheld lock files", cleaned_count)
 
-    except Exception as e:
-        logger.error(f"Error during SRCDEST lock cleanup: {e}")
+    except Exception as exc:
+        logger.error("Error during SRCDEST lock cleanup: %s", exc)
+
+
+def build_makechrootpkg_command(
+    buildroot_path: Path,
+    chroot_copy: str,
+    makepkg_config: Dict[str, Any],
+    custom_pacman_conf: Optional[str],
+    server_arch: str,
+) -> List[str]:
+    """Assemble the makechrootpkg command for a build."""
+    if server_arch in ("powerpc", "espresso"):
+        cmd = [
+            "sudo",
+            "ppc32",
+            "makechrootpkg",
+            "-cuT",
+            "-l",
+            chroot_copy,
+            "-r",
+            str(buildroot_path),
+        ]
+    else:
+        cmd = [
+            "sudo",
+            "makechrootpkg",
+            "-cuT",
+            "-l",
+            chroot_copy,
+            "-r",
+            str(buildroot_path),
+        ]
+
+    if "CCACHE_DIR" in makepkg_config:
+        cmd.extend(["-d", makepkg_config["CCACHE_DIR"]])
+    if "SRCDEST" in makepkg_config:
+        cmd.extend(["-d", makepkg_config["SRCDEST"]])
+
+    if custom_pacman_conf:
+        cmd.extend(["-D", f"{custom_pacman_conf}:/etc/pacman.conf"])
+        cmd.extend(["-D", "/etc/pacman.d/gnupg:/etc/pacman.d/gnupg"])
+
+    return cmd
 
 
 def _has_active_builds() -> bool:
@@ -1096,6 +1090,8 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
     logger.info(f"build_package called for build {build_id}")
     should_cleanup_failed_dir = False
+    srcdest_lock = None
+    chroot_copy = None
 
     try:
         # Update build status
@@ -1169,7 +1165,6 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
         makepkg_config = get_makepkg_config()
 
         # Lock SRCDEST if it exists with timeout
-        srcdest_lock = None
         if 'SRCDEST' in makepkg_config:
             log_output(f"Attempting to acquire SRCDEST lock for {makepkg_config['SRCDEST']} (package: {pkgbuild_info['pkgname']})")
             srcdest_lock = lock_srcdest(makepkg_config['SRCDEST'], pkgbuild_info['pkgname'])
@@ -1220,26 +1215,20 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
                     should_cleanup_failed_dir = True
                     return
 
-            # Build makechrootpkg command with correct flags
-            # Check if we need to prefix with ppc32 for PowerPC architectures
+            chroot_copy = chroot_slots.get()
             server_arch = get_server_architecture()
-            if server_arch in ["powerpc", "espresso"]:
-                cmd = ["sudo", "ppc32", "makechrootpkg", "-cuT", "-r", str(buildroot_path)]
-                log_output(f"Using ppc32 prefix for {server_arch} architecture to ensure 32-bit detection")
-            else:
-                cmd = ["sudo", "makechrootpkg", "-cuT", "-r", str(buildroot_path)]
-
-            # Add bind mounts
-            if 'CCACHE_DIR' in makepkg_config:
-                cmd.extend(["-d", makepkg_config['CCACHE_DIR']])
-            if 'SRCDEST' in makepkg_config:
-                cmd.extend(["-d", makepkg_config['SRCDEST']])
-
-            # Add custom pacman.conf and gpgdir if we have custom repositories
-            if custom_pacman_conf:
-                cmd.extend(["-D", f"{custom_pacman_conf}:/etc/pacman.conf"])
-                cmd.extend(["-D", "/etc/pacman.d/gnupg:/etc/pacman.d/gnupg"])
-
+            if server_arch in ("powerpc", "espresso"):
+                log_output(
+                    f"Using ppc32 prefix for {server_arch} architecture to ensure 32-bit detection"
+                )
+            cmd = build_makechrootpkg_command(
+                buildroot_path,
+                chroot_copy,
+                makepkg_config,
+                custom_pacman_conf,
+                server_arch,
+            )
+            log_output(f"Using chroot copy {chroot_copy}")
             log_output(f"Running: {' '.join(cmd)}")
 
             # Execute build with timeout management (binary stdout so select/os.read drain the pipe fast)
@@ -1359,6 +1348,9 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
             stop_tracked_build_process(build_id)
             if srcdest_lock:
                 unlock_srcdest(srcdest_lock)
+            if chroot_copy is not None:
+                chroot_slots.put(chroot_copy)
+                chroot_copy = None
 
         # Finalize build
         active_builds[build_id]["end_time"] = time.time()
@@ -1387,9 +1379,10 @@ def build_package(build_id: str, build_dir: Path, pkgbuild_info: Dict[str, Any],
 
     except Exception as e:
         logger.error(f"Build error: {e}")
-        # Release SRCDEST lock if it was acquired
-        if 'srcdest_lock' in locals() and srcdest_lock:
+        if srcdest_lock:
             unlock_srcdest(srcdest_lock)
+        if chroot_copy is not None:
+            chroot_slots.put(chroot_copy)
         active_builds[build_id]["status"] = BuildStatus.FAILED
         active_builds[build_id]["end_time"] = time.time()
         active_builds[build_id]["duration"] = active_builds[build_id]["end_time"] - active_builds[build_id]["start_time"]

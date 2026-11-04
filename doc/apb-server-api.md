@@ -874,21 +874,24 @@ apb_output_timeout=300   # 5 minutes for simple packages
 
 ### SRCDEST Locking
 
-The server implements sophisticated SRCDEST directory locking for concurrent builds:
+The server implements SRCDEST directory locking for concurrent builds:
 
 #### Locking Mechanism
-- **Package-specific Locks**: Each package uses a separate lock file (`.apb-{pkgname}.lock`)
-- **Exclusive Access**: Prevents concurrent source downloads for the same package in shared SRCDEST
-- **Orphan Detection**: Automatically detects and cleans up orphaned locks
-- **Timeout Handling**: 10-minute timeout prevents infinite waiting
-- **Lock File Management**: Uses fcntl for atomic lock operations
+- **Package-specific Locks**: Each package uses a separate lock file (`.apb-<md5(pkgname)>.lock`)
+- **Exclusive Access**: Prevents concurrent source downloads for the same package in shared SRCDEST; different packages can lock in parallel
+- **Timeout Handling**: 10-minute wait per build, then the build continues without a lock
+- **Lock File Management**: Uses `fcntl.flock` for atomic lock operations
 
 #### Orphan Lock Cleanup
-- **Startup Cleanup**: Removes orphaned locks from previous server sessions
+- **Startup Cleanup**: Removes lock files that are not held by any process
 - **Periodic Cleanup**: Re-runs orphan lock cleanup on the configured interval when `SRCDEST` is set
-- **Process Detection**: Uses `lsof` to verify if locks are actually held
-- **Age-based Cleanup**: Removes locks older than 5 minutes if lsof unavailable
+- **flock-based Detection**: A lock file is removed only after the server acquires a non-blocking exclusive flock on it; locks held by active builds are left in place
 - **Graceful Degradation**: Continues build even if locking fails
+
+#### Concurrent Chroot Copies
+- **Per-slot Copies**: Each concurrent build uses a dedicated makechrootpkg copy name (`apb-slot-0` … `apb-slot-{N-1}` where `N` is `--max-concurrent`)
+- **Disk Usage**: At most `--max-concurrent` working copies under `<buildroot>/` (for example `<buildroot>/apb-slot-0`)
+- **Isolation**: Avoids serializing builds on makechrootpkg’s default single copy lock (`<buildroot>/<user>`)
 
 #### Periodic Source Cleanup
 When `SRCDEST` is configured, the server can periodically prune cached source files and directories:

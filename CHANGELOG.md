@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [ 2026.11.04 ]
+
+### Fixed
+
+- Concurrent server builds were serialized by a shared SRCDEST lock (package name was not hashed into the lock filename) and by all builds using the same makechrootpkg chroot copy
+- A held SRCDEST lock could be unlinked after five minutes when `lsof` was not installed, breaking mutual exclusion
+
+### Changed
+
+- Concurrent builds use per-slot chroot copies (`apb-slot-N`, at most `--max-concurrent` copies on disk)
+- SRCDEST orphan lock cleanup uses `flock` only; `lsof` is no longer required
+
 ## [ 2026.10.30 ]
 
 ### Added
